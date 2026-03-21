@@ -1,0 +1,161 @@
+<!--
+  Grabia - Internet Archive Download Manager
+  Copyright (C) 2026 Sharkcheese
+
+  This program is free software; you can redistribute it and/or modify
+  it under the terms of the GNU General Public License as published by
+  the Free Software Foundation; either version 2 of the License, or
+  (at your option) any later version.
+
+  This program is distributed in the hope that it will be useful,
+  but WITHOUT ANY WARRANTY; without even the implied warranty of
+  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+  GNU General Public License for more details.
+
+  You should have received a copy of the GNU General Public License along
+  with this program; if not, write to the Free Software Foundation, Inc.,
+  51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+-->
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Grabia - Setup</title>
+    <link rel="icon" href="/static/favicon.ico" type="image/x-icon">
+    <link rel="apple-touch-icon" href="/static/apple-touch-icon.png">
+    <link rel="stylesheet" href="{{ static_url('css/style.css') }}">
+    <style>
+        .auth-page {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            min-height: 100vh;
+            padding: 20px;
+        }
+        .auth-card {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 32px;
+            width: 100%;
+            max-width: 380px;
+            box-shadow: var(--shadow);
+        }
+        .auth-logo {
+            width: 72px;
+            height: 72px;
+            display: block;
+            margin: 0 auto 12px;
+        }
+        .auth-card h1 {
+            font-size: 24px;
+            margin-bottom: 4px;
+            text-align: center;
+        }
+        .auth-card p {
+            color: var(--text-secondary);
+            font-size: 14px;
+            margin-bottom: 24px;
+        }
+        .auth-card label {
+            display: block;
+            font-size: 13px;
+            color: var(--text-secondary);
+            margin-bottom: 16px;
+        }
+        .auth-card input {
+            width: 100%;
+            padding: 10px 12px;
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            background: var(--bg-tertiary);
+            color: var(--text-primary);
+            font-size: 14px;
+            margin-top: 4px;
+        }
+        .auth-card input:focus { outline: none; border-color: var(--accent); }
+        .auth-error {
+            color: var(--danger);
+            font-size: 13px;
+            min-height: 20px;
+            margin-bottom: 8px;
+        }
+        .auth-card button {
+            width: 100%;
+            padding: 10px;
+            border: none;
+            border-radius: 6px;
+            background: var(--accent);
+            color: #fff;
+            font-size: 14px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: background 0.15s;
+        }
+        .auth-card button:hover { background: var(--accent-hover); }
+        .auth-card button:disabled { opacity: 0.5; cursor: default; }
+        .auth-card small { color: var(--text-muted); font-size: 12px; }
+    </style>
+</head>
+<body>
+    <div class="auth-page">
+        <div class="auth-card">
+            <img src="{{ static_url('grabia_icon.png') }}" alt="Grabia" class="auth-logo">
+            <h1>Grab<span class="logo-ia">ia</span></h1>
+            <p>Create your login credentials to get started.</p>
+            <form id="setup-form">
+                <label>Username
+                    <input type="text" id="username" autocomplete="username" required autofocus>
+                </label>
+                <label>Password
+                    <input type="password" id="password" autocomplete="new-password" required minlength="4">
+                    <small>Minimum 4 characters</small>
+                </label>
+                <label>Confirm Password
+                    <input type="password" id="password2" autocomplete="new-password" required>
+                </label>
+                <div class="auth-error" id="error"></div>
+                <button type="submit" id="submit-btn">Create Account</button>
+            </form>
+        </div>
+    </div>
+    <script>
+        document.getElementById("setup-form").addEventListener("submit", async (e) => {
+            e.preventDefault();
+            const btn = document.getElementById("submit-btn");
+            const err = document.getElementById("error");
+            const pw1 = document.getElementById("password").value;
+            const pw2 = document.getElementById("password2").value;
+            err.textContent = "";
+
+            if (pw1 !== pw2) {
+                err.textContent = "Passwords do not match";
+                return;
+            }
+
+            btn.disabled = true;
+            try {
+                const resp = await fetch("/setup", {
+                    method: "POST",
+                    headers: {"Content-Type": "application/json"},
+                    body: JSON.stringify({
+                        username: document.getElementById("username").value,
+                        password: pw1,
+                    }),
+                });
+                const data = await resp.json();
+                if (resp.ok) {
+                    window.location.href = "/";
+                } else {
+                    err.textContent = data.error || "Setup failed";
+                }
+            } catch (ex) {
+                err.textContent = "Connection error";
+            } finally {
+                btn.disabled = false;
+            }
+        });
+    </script>
+</body>
+</html>

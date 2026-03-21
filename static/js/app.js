@@ -1,0 +1,1350 @@
+/*
+ * Grabia - Internet Archive Download Manager
+ * Copyright (C) 2026 Sharkcheese
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License along
+ * with this program; if not, write to the Free Software Foundation, Inc.,
+ * 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+ */
+
+/* ===== Grabia - Frontend ===== */
+
+(function () {
+    "use strict";
+
+    // --- State ---
+    let archives = [];
+    let currentArchiveId = null;
+    let currentPage = 1;
+    let currentSort = "priority";
+    let fileSearchQuery = "";
+    let fileSearchTimer = null;
+    let dlState = "stopped";
+    let dragSrcId = null;
+    let realBandwidth = -1; // tracks the actual backend bandwidth setting
+    let lastProgressRefresh = 0; // timestamp of last throttled progress refresh
+
+    // --- DOM refs ---
+    const $ = (sel) => document.querySelector(sel);
+    const $$ = (sel) => document.querySelectorAll(sel);
+
+    const pageHome = $("#page-home");
+    const pageDetail = $("#page-detail");
+    const archiveListEl = $("#archive-list");
+    const emptyState = $("#empty-state");
+    const fileListEl = $("#file-list");
+    const paginationEl = $("#pagination");
+    const statusIndicator = $("#status-indicator");
+    const speedDisplay = $("#speed-display");
+    const sparkCanvas = $("#speed-sparkline");
+    const sparkCtx = sparkCanvas.getContext("2d");
+    const globalProgress = $("#global-progress");
+    const progressFill = $("#progress-fill");
+    const progressText = $("#progress-text");
+
+    // --- Speed sparkline ---
+
+    const SPARK_MAX_POINTS = 30;
+    const speedHistory = [];
+
+    function pushSpeed(bps) {
+        speedHistory.push(bps || 0);
+        if (speedHistory.length > SPARK_MAX_POINTS) speedHistory.shift();
+        drawSparkline();
+    }
+
+    function clearSparkline() {
+        speedHistory.length = 0;
+        sparkCtx.clearRect(0, 0, sparkCanvas.width, sparkCanvas.height);
+        sparkCanvas.classList.remove("active");
+    }
+
+    function drawSparkline() {
+        const w = sparkCanvas.width;
+        const h = sparkCanvas.height;
+        const pts = speedHistory;
+        const len = pts.length;
+
+        sparkCtx.clearRect(0, 0, w, h);
+
+        if (len < 2) {
+            sparkCanvas.classList.remove("active");
+            return;
+        }
+        sparkCanvas.classList.add("active");
+
+        const max = Math.max(...pts) || 1;
+        const pad = 2;
+        const plotH = h - pad * 2;
+        const step = w / (SPARK_MAX_POINTS - 1);
+        const offset = (SPARK_MAX_POINTS - len) * step;
+
+        // Fill
+        sparkCtx.beginPath();
+        sparkCtx.moveTo(offset, h - pad);
+        for (let i = 0; i < len; i++) {
+            sparkCtx.lineTo(offset + i * step, h - pad - (pts[i] / max) * plotH);
+        }
+        sparkCtx.lineTo(offset + (len - 1) * step, h - pad);
+        sparkCtx.closePath();
+        const accentStyle = getComputedStyle(document.documentElement).getPropertyValue("--accent").trim() || "#5b9bf7";
+        sparkCtx.fillStyle = accentStyle + "30";
+        sparkCtx.fill();
+
+        // Line
+        sparkCtx.beginPath();
+        for (let i = 0; i < len; i++) {
+            const x = offset + i * step;
+            const y = h - pad - (pts[i] / max) * plotH;
+            if (i === 0) sparkCtx.moveTo(x, y);
+            else sparkCtx.lineTo(x, y);
+        }
+        sparkCtx.strokeStyle = accentStyle;
+        sparkCtx.lineWidth = 1.5;
+        sparkCtx.lineJoin = "round";
+        sparkCtx.stroke();
+    }
+
+    // --- Utility ---
+
+    function formatBytes(bytes) {
+        if (!bytes || bytes === 0) return "0 B";
+        const k = 1024;
+        const sizes = ["B", "KB", "MB", "GB", "TB"];
+        const i = Math.floor(Math.log(bytes) / Math.log(k));
+        return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + " " + sizes[i];
+    }
+
+    function formatSpeed(bps) {
+        if (!bps || bps <= 0) return "";
+        return formatBytes(bps) + "/s";
+    }
+
+    function formatDate(mtime) {
+        if (!mtime) return "-";
+        const d = new Date(parseInt(mtime) * 1000);
+        if (isNaN(d.getTime())) return mtime;
+        return d.toLocaleDateString() + " " + d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    }
+
+    async function api(method, path, body) {
+        const opts = { method, headers: {} };
+        if (body !== undefined) {
+            opts.headers["Content-Type"] = "application/json";
+            opts.body = JSON.stringify(body);
+        }
+        const resp = await fetch(path, opts);
+        const data = await resp.json();
+        if (!resp.ok) throw new Error(data.error || "Request failed");
+        return data;
+    }
+
+    // --- Theme ---
+
+    function applyTheme(theme) {
+        document.documentElement.setAttribute("data-theme", theme);
+    }
+
+    // --- SSE ---
+
+    function connectSSE() {
+        const es = new EventSource("/api/events");
+
+        es.addEventListener("status", (e) => {
+            const data = JSON.parse(e.data);
+            updateStatus(data);
+        });
+
+        es.addEventListener("state", (e) => {
+            const data = JSON.parse(e.data);
+            dlState = data;
+            updateControlButtons();
+            updateStatusIndicator();
+            syncBandwidthToState();
+            if (dlState !== "running") {
+                speedDisplay.textContent = "";
+                clearSparkline();
+            }
+        });
+
+        es.addEventListener("file_progress", (e) => {
+            const data = JSON.parse(e.data);
+            updateFileRow(data.file_id, { download_status: "downloading", downloaded_bytes: data.downloaded, size: data.size });
+            speedDisplay.textContent = formatSpeed(data.speed);
+            pushSpeed(data.speed || 0);
+            throttledProgressRefresh();
+        });
+
+        es.addEventListener("file_complete", (e) => {
+            const data = JSON.parse(e.data);
+            updateFileRow(data.file_id, { download_status: "completed" });
+            lastProgressRefresh = 0; // force immediate refresh
+            throttledProgressRefresh();
+        });
+
+        es.addEventListener("file_failed", (e) => {
+            const data = JSON.parse(e.data);
+            updateFileRow(data.file_id, { download_status: "failed" });
+            lastProgressRefresh = 0;
+            throttledProgressRefresh();
+        });
+
+        es.addEventListener("file_start", () => {
+            refreshStatus();
+        });
+
+        es.addEventListener("archive_added", () => refreshArchives());
+        es.addEventListener("archive_updated", () => refreshArchives());
+        es.addEventListener("archive_removed", () => refreshArchives());
+        es.addEventListener("archives_reordered", () => refreshArchives());
+        es.addEventListener("settings_updated", (e) => {
+            const s = JSON.parse(e.data);
+            if (s.theme) applyTheme(s.theme);
+            updateLockIndicator(s.use_http === "1");
+        });
+
+        es.addEventListener("bandwidth_update", (e) => {
+            const data = JSON.parse(e.data);
+            // Schedule-driven bandwidth change: update the UI to reflect it
+            updateBandwidthUI(data.limit);
+        });
+
+        es.onerror = () => {
+            setTimeout(connectSSE, 3000);
+            es.close();
+        };
+    }
+
+    function updateStatus(data) {
+        dlState = data.state;
+        updateControlButtons();
+        updateStatusIndicator();
+        syncBandwidthToState();
+        if (dlState === "running" && data.current_file && data.current_speed) {
+            speedDisplay.textContent = formatSpeed(data.current_speed);
+        } else {
+            speedDisplay.textContent = "";
+        }
+        updateGlobalProgress(data.progress);
+    }
+
+    function updateStatusIndicator() {
+        statusIndicator.className = "status-indicator " + dlState;
+        const text = statusIndicator.querySelector(".status-text");
+        text.textContent = dlState.charAt(0).toUpperCase() + dlState.slice(1);
+    }
+
+    function updateLockIndicator(insecure) {
+        const el = $("#lock-indicator");
+        el.classList.toggle("lock-secure", !insecure);
+        el.classList.toggle("lock-insecure", !!insecure);
+        el.title = insecure ? "Downloads use unencrypted HTTP" : "Downloads use HTTPS";
+    }
+
+    function updateControlButtons() {
+        const play = $("#btn-play");
+        const pause = $("#btn-pause");
+        const stop = $("#btn-stop");
+        play.classList.toggle("active", dlState === "running");
+        pause.classList.toggle("active", dlState === "paused");
+        play.disabled = dlState === "running";
+        pause.disabled = dlState !== "running";
+        stop.disabled = dlState === "stopped";
+    }
+
+    function updateGlobalProgress(progress) {
+        if (!progress || progress.total_files === 0) {
+            globalProgress.style.display = "none";
+            return;
+        }
+        globalProgress.style.display = "flex";
+        const pct = progress.total_size > 0
+            ? Math.min(100, (progress.downloaded_bytes / progress.total_size) * 100)
+            : 0;
+        progressFill.style.width = pct.toFixed(1) + "%";
+        progressText.textContent =
+            `${progress.completed_files}/${progress.total_files} files \u2022 ` +
+            `${formatBytes(progress.downloaded_bytes)} / ${formatBytes(progress.total_size)} \u2022 ` +
+            `${pct.toFixed(1)}%`;
+    }
+
+    async function refreshStatus() {
+        try {
+            const data = await api("GET", "/api/download/status");
+            updateStatus(data);
+        } catch (e) { /* ignore */ }
+    }
+
+    async function throttledProgressRefresh() {
+        const now = Date.now();
+        if (now - lastProgressRefresh < 2000) return;
+        lastProgressRefresh = now;
+        refreshStatus();           // updates global progress bar + text
+        refreshArchives();         // updates archive-progress-meta (and detail via updateDetailProgress)
+        if (currentArchiveId) {
+            try {
+                const p = await api("GET", `/api/archives/${currentArchiveId}/progress`);
+                updateDetailProgressFromData(p);
+            } catch (_) {}
+        }
+    }
+
+    // --- Archives ---
+
+    async function refreshArchives() {
+        try {
+            archives = await api("GET", "/api/archives");
+            renderArchiveList();
+            updateDetailProgress();
+        } catch (e) { /* ignore */ }
+    }
+
+    function updateDetailProgressFromData(p) {
+        const prog = $("#detail-progress-meta");
+        if (p.downloaded_bytes > 0 || p.completed_files > 0 || p.selected_files > 0) {
+            const pct = p.selected_size > 0 ? ` \u2022 ${((p.downloaded_bytes / p.selected_size) * 100).toFixed(1)}%` : "";
+            prog.textContent = `${p.completed_files}/${p.selected_files} files \u2022 ${formatBytes(p.downloaded_bytes)} / ${formatBytes(p.selected_size)}${pct}`;
+            prog.style.display = "";
+        } else {
+            prog.style.display = "none";
+        }
+    }
+
+    function updateDetailProgress() {
+        if (!currentArchiveId) return;
+        const archive = archives.find((a) => a.id === currentArchiveId);
+        if (!archive) return;
+        updateDetailProgressFromData(archive);
+    }
+
+
+    function renderArchiveList() {
+        if (archives.length === 0) {
+            emptyState.style.display = "flex";
+            archiveListEl.style.display = "none";
+            return;
+        }
+        emptyState.style.display = "none";
+        archiveListEl.style.display = "flex";
+        archiveListEl.innerHTML = "";
+
+        archives.forEach((a, idx) => {
+            const li = document.createElement("li");
+            li.className = "archive-item";
+            li.dataset.id = a.id;
+            li.draggable = true;
+            li.innerHTML = `
+                <div class="archive-grip" title="Drag to reorder">
+                    <div class="grip-dots"><span></span><span></span></div>
+                    <div class="grip-dots"><span></span><span></span></div>
+                    <div class="grip-dots"><span></span><span></span></div>
+                </div>
+                <div class="archive-checkbox" title="Enable download">
+                    <input type="checkbox" ${a.download_enabled ? "checked" : ""} data-action="toggle-dl">
+                </div>
+                <div class="archive-info" data-action="open">
+                    <div class="archive-title">${escapeHtml(a.title || a.identifier)}</div>
+                    <div class="archive-meta">
+                        <span>${a.files_count} files</span>
+                        <span>${formatBytes(a.total_size)}</span>
+                        <span>${a.identifier}</span>
+                    </div>
+                    ${a.selected_files > 0 ? `<div class="archive-progress-meta">${a.completed_files}/${a.selected_files} files \u2022 ${formatBytes(a.downloaded_bytes)} / ${formatBytes(a.selected_size)}${a.selected_size > 0 ? ` \u2022 ${((a.downloaded_bytes / a.selected_size) * 100).toFixed(1)}%` : ""}</div>` : ""}
+                </div>
+                <span class="archive-status ${a.status}">${a.status}</span>
+                <div class="archive-actions">
+                    <button data-action="retry" title="Retry failed files" class="retry" style="display:${a.status === 'partial' || a.status === 'failed' ? 'flex' : 'none'}">
+                        <svg viewBox="0 0 24 24" width="16" height="16"><path d="M17.65 6.35A7.958 7.958 0 0012 4c-4.42 0-7.99 3.58-7.99 8s3.57 8 7.99 8c3.73 0 6.84-2.55 7.73-6h-2.08A5.99 5.99 0 0112 18c-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z" fill="currentColor"/></svg>
+                    </button>
+                    <button data-action="move-up" title="Move up" ${idx === 0 || archives[idx - 1].download_enabled !== a.download_enabled ? "disabled" : ""}>
+                        <svg viewBox="0 0 24 24" width="16" height="16"><path d="M7.41 15.41L12 10.83l4.59 4.58L18 14l-6-6-6 6z" fill="currentColor"/></svg>
+                    </button>
+                    <button data-action="move-down" title="Move down" ${idx === archives.length - 1 || archives[idx + 1].download_enabled !== a.download_enabled ? "disabled" : ""}>
+                        <svg viewBox="0 0 24 24" width="16" height="16"><path d="M7.41 8.59L12 13.17l4.59-4.58L18 10l-6 6-6-6z" fill="currentColor"/></svg>
+                    </button>
+                    <button data-action="delete" class="delete" title="Remove">
+                        <svg viewBox="0 0 24 24" width="16" height="16"><path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z" fill="currentColor"/></svg>
+                    </button>
+                </div>
+            `;
+
+            // Event delegation
+            li.addEventListener("click", (e) => {
+                const action = e.target.closest("[data-action]")?.dataset.action;
+                if (action === "toggle-dl") {
+                    toggleArchiveDownload(a.id, e.target.checked);
+                } else if (action === "open") {
+                    openArchiveDetail(a.id);
+                } else if (action === "move-up") {
+                    moveArchive(idx, idx - 1);
+                } else if (action === "move-down") {
+                    moveArchive(idx, idx + 1);
+                } else if (action === "retry") {
+                    retryArchive(a.id);
+                } else if (action === "delete") {
+                    confirmDelete(a);
+                }
+            });
+
+            // Drag and drop
+            li.addEventListener("dragstart", (e) => {
+                dragSrcId = a.id;
+                li.classList.add("dragging");
+                e.dataTransfer.effectAllowed = "move";
+            });
+            li.addEventListener("dragend", () => {
+                li.classList.remove("dragging");
+                $$(".archive-item").forEach((el) => el.classList.remove("drag-over"));
+            });
+            li.addEventListener("dragover", (e) => {
+                e.preventDefault();
+                e.dataTransfer.dropEffect = "move";
+                li.classList.add("drag-over");
+            });
+            li.addEventListener("dragleave", () => li.classList.remove("drag-over"));
+            li.addEventListener("drop", (e) => {
+                e.preventDefault();
+                li.classList.remove("drag-over");
+                if (dragSrcId !== null && dragSrcId !== a.id) {
+                    const src = archives.find((x) => x.id === dragSrcId);
+                    // Only allow reorder within the same enabled/disabled group
+                    if (src && src.download_enabled === a.download_enabled) {
+                        const order = archives.map((x) => x.id);
+                        const fromIdx = order.indexOf(dragSrcId);
+                        const toIdx = order.indexOf(a.id);
+                        order.splice(fromIdx, 1);
+                        order.splice(toIdx, 0, dragSrcId);
+                        api("POST", "/api/archives/reorder", { order });
+                    }
+                    dragSrcId = null;
+                }
+            });
+
+            archiveListEl.appendChild(li);
+        });
+    }
+
+    async function toggleArchiveDownload(id, enabled) {
+        await api("POST", `/api/archives/${id}/download`, { enabled });
+        await refreshArchives();
+        refreshStatus();
+    }
+
+    async function moveArchive(fromIdx, toIdx) {
+        if (toIdx < 0 || toIdx >= archives.length) return;
+        // Only allow reorder within the same enabled/disabled group
+        if (archives[fromIdx].download_enabled !== archives[toIdx].download_enabled) return;
+        const order = archives.map((x) => x.id);
+        const [moved] = order.splice(fromIdx, 1);
+        order.splice(toIdx, 0, moved);
+        await api("POST", "/api/archives/reorder", { order });
+    }
+
+    async function retryArchive(id) {
+        await api("POST", `/api/archives/${id}/retry`);
+        await refreshArchives();
+        if (currentArchiveId === id) loadFiles();
+    }
+
+    async function retryFile(fileId) {
+        await api("POST", `/api/files/${fileId}/retry`);
+        loadFiles();
+    }
+
+    // --- Refresh Metadata ---
+
+    async function refreshMetadata() {
+        if (!currentArchiveId) return;
+        const btn = $("#btn-refresh-meta");
+        const summaryEl = $("#refresh-summary");
+        btn.disabled = true;
+        btn.textContent = "Checking...";
+        summaryEl.style.display = "none";
+
+        try {
+            const result = await api("POST", `/api/archives/${currentArchiveId}/refresh`);
+            const s = result.summary;
+            const parts = [];
+            if (s.new > 0) parts.push(`${s.new} new`);
+            if (s.removed > 0) parts.push(`${s.removed} removed`);
+            if (s.changed > 0) parts.push(`${s.changed} changed`);
+            if (parts.length === 0) {
+                summaryEl.textContent = "No changes detected";
+            } else {
+                summaryEl.textContent = parts.join(", ");
+            }
+            summaryEl.style.display = "";
+            await loadFiles();
+            await refreshArchives();
+        } catch (e) {
+            summaryEl.textContent = "Error: " + e.message;
+            summaryEl.style.display = "";
+        } finally {
+            btn.disabled = false;
+            btn.innerHTML = '<svg viewBox="0 0 24 24" width="16" height="16"><path d="M12 4V1L8 5l4 4V6c3.31 0 6 2.69 6 6 0 1.01-.25 1.97-.7 2.8l1.46 1.46A7.93 7.93 0 0020 12c0-4.42-3.58-8-8-8zm0 14c-3.31 0-6-2.69-6-6 0-1.01.25-1.97.7-2.8L5.24 7.74A7.93 7.93 0 004 12c0 4.42 3.58 8 8 8v3l4-4-4-4v3z" fill="currentColor"></path></svg> Refresh Metadata';
+        }
+    }
+
+    async function clearChanges() {
+        if (!currentArchiveId) return;
+        await api("POST", `/api/archives/${currentArchiveId}/clear-changes`);
+        $("#refresh-summary").style.display = "none";
+        await loadFiles();
+    }
+
+    // --- Archive Detail ---
+
+    async function openArchiveDetail(id) {
+        currentArchiveId = id;
+        currentPage = 1;
+        currentSort = "priority";
+        fileSearchQuery = "";
+        $("#file-sort").value = "priority";
+        $("#file-search").value = "";
+        pageHome.classList.remove("active");
+        pageDetail.classList.add("active");
+
+        const archive = archives.find((a) => a.id === id);
+        if (archive) {
+            $("#detail-title").textContent = archive.title || archive.identifier;
+            $("#detail-meta").textContent = `${archive.files_count} files \u2022 ${formatBytes(archive.total_size)} \u2022 ${archive.identifier}`;
+            updateDetailProgress();
+        }
+        $("#refresh-summary").style.display = "none";
+
+        await loadFiles();
+    }
+
+    function closeDetail() {
+        currentArchiveId = null;
+        pageDetail.classList.remove("active");
+        pageHome.classList.add("active");
+        refreshArchives();
+    }
+
+    async function loadFiles() {
+        if (!currentArchiveId) return;
+        try {
+            const searchParam = fileSearchQuery ? `&search=${encodeURIComponent(fileSearchQuery)}` : "";
+            const data = await api("GET", `/api/archives/${currentArchiveId}/files?page=${currentPage}&sort=${currentSort}${searchParam}`);
+            renderFiles(data);
+            if (data.progress) updateDetailProgressFromData(data.progress);
+        } catch (e) {
+            fileListEl.innerHTML = `<tr><td colspan="5" style="text-align:center;padding:20px;color:var(--danger)">${escapeHtml(e.message)}</td></tr>`;
+        }
+    }
+
+    function syncSelectAll() {
+        const boxes = fileListEl.querySelectorAll("input[type=checkbox]");
+        const all = boxes.length > 0 && Array.from(boxes).every((cb) => cb.checked);
+        $("#select-all-files").checked = all;
+    }
+
+    // --- File table header (dynamic based on sort mode) ---
+
+    function rebuildTableHeader() {
+        const isPriority = currentSort === "priority";
+        const thead = fileListEl.closest("table").querySelector("thead tr");
+        thead.innerHTML = "";
+        if (isPriority) {
+            thead.innerHTML += '<th class="col-grip">' +
+                '<button class="btn-reset-order" id="btn-reset-order" title="Reset download order to alphabetical">' +
+                '<svg viewBox="0 0 24 24" width="14" height="14"><path d="M17.65 6.35A7.958 7.958 0 0012 4c-4.42 0-7.99 3.58-7.99 8s3.57 8 7.99 8c3.73 0 6.84-2.55 7.73-6h-2.08A5.99 5.99 0 0112 18c-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z" fill="currentColor"/></svg>' +
+                '</button></th>';
+        }
+        thead.innerHTML += '<th class="col-check"><input type="checkbox" id="select-all-files" title="Select / deselect all files"></th>';
+        thead.innerHTML += '<th class="col-name">Name</th>';
+        thead.innerHTML += '<th class="col-size">Size</th>';
+        thead.innerHTML += '<th class="col-modified">Modified</th>';
+        thead.innerHTML += '<th class="col-status">Status</th>';
+        if (isPriority) {
+            thead.innerHTML += '<th class="col-priority"></th>';
+        }
+        // Re-attach handlers
+        $("#select-all-files").addEventListener("change", (e) => toggleSelectAll(e.target.checked));
+        const resetBtn = document.getElementById("btn-reset-order");
+        if (resetBtn) resetBtn.addEventListener("click", confirmResetOrder);
+    }
+
+    function getColspan() {
+        return currentSort === "priority" ? 7 : 5;
+    }
+
+    // --- File drag-and-drop for priority mode ---
+
+    let fileDragSrcId = null;
+
+    function buildGripCell() {
+        return `<td class="col-grip"><div class="file-grip" title="Drag to reorder">` +
+            `<div class="grip-dots"><span></span><span></span></div>` +
+            `<div class="grip-dots"><span></span><span></span></div>` +
+            `<div class="grip-dots"><span></span><span></span></div></div></td>`;
+    }
+
+    function buildPriorityCell(fileId, isFirst, isLast) {
+        return `<td class="col-priority"><div class="file-priority-btns">` +
+            `<button data-move-up="${fileId}" title="Move up" ${isFirst ? "disabled" : ""}>` +
+            `<svg viewBox="0 0 24 24" width="16" height="16"><path d="M7.41 15.41L12 10.83l4.59 4.58L18 14l-6-6-6 6z" fill="currentColor"/></svg></button>` +
+            `<button data-move-down="${fileId}" title="Move down" ${isLast ? "disabled" : ""}>` +
+            `<svg viewBox="0 0 24 24" width="16" height="16"><path d="M7.41 8.59L12 13.17l4.59-4.58L18 10l-6 6-6-6z" fill="currentColor"/></svg></button>` +
+            `</div></td>`;
+    }
+
+    async function moveFile(fileId, direction) {
+        // Swap this file with its neighbour in the visible list
+        const rows = Array.from(fileListEl.querySelectorAll("tr[data-file-id]"));
+        const idx = rows.findIndex((r) => r.dataset.fileId == fileId);
+        const swapIdx = idx + direction;
+        if (swapIdx < 0 || swapIdx >= rows.length) return;
+
+        // Only allow reorder among selected files (the top group in priority mode)
+        const thisSelected = rows[idx].querySelector("input[type=checkbox]").checked;
+        const swapSelected = rows[swapIdx].querySelector("input[type=checkbox]").checked;
+        if (!thisSelected || !swapSelected) return;
+
+        // Build new order of all file IDs from the current page rows
+        const order = rows.map((r) => parseInt(r.dataset.fileId));
+        const [moved] = order.splice(idx, 1);
+        order.splice(swapIdx, 0, moved);
+        await api("POST", `/api/archives/${currentArchiveId}/files/reorder`, { order });
+        await loadFiles();
+    }
+
+    function attachPriorityDrag(tr, fileId) {
+        tr.draggable = true;
+        tr.addEventListener("dragstart", (e) => {
+            fileDragSrcId = fileId;
+            tr.classList.add("file-row-dragging");
+            e.dataTransfer.effectAllowed = "move";
+        });
+        tr.addEventListener("dragend", () => {
+            fileDragSrcId = null;
+            tr.classList.remove("file-row-dragging");
+            fileListEl.querySelectorAll(".file-row-drag-over").forEach((r) => r.classList.remove("file-row-drag-over"));
+        });
+        tr.addEventListener("dragover", (e) => {
+            e.preventDefault();
+            e.dataTransfer.dropEffect = "move";
+            tr.classList.add("file-row-drag-over");
+        });
+        tr.addEventListener("dragleave", () => tr.classList.remove("file-row-drag-over"));
+        tr.addEventListener("drop", async (e) => {
+            e.preventDefault();
+            tr.classList.remove("file-row-drag-over");
+            if (fileDragSrcId === null || fileDragSrcId === fileId) return;
+
+            // Only rearrange among selected rows
+            const rows = Array.from(fileListEl.querySelectorAll("tr[data-file-id]"));
+            const selectedRows = rows.filter((r) => r.querySelector("input[type=checkbox]").checked);
+            const fromIdx = selectedRows.findIndex((r) => r.dataset.fileId == fileDragSrcId);
+            const toIdx = selectedRows.findIndex((r) => r.dataset.fileId == fileId);
+            if (fromIdx === -1 || toIdx === -1) return;
+
+            const order = selectedRows.map((r) => parseInt(r.dataset.fileId));
+            const [moved] = order.splice(fromIdx, 1);
+            order.splice(toIdx, 0, moved);
+            await api("POST", `/api/archives/${currentArchiveId}/files/reorder`, { order });
+            fileDragSrcId = null;
+            await loadFiles();
+        });
+    }
+
+    // --- Render file list ---
+
+    function renderFiles(data) {
+        const { files, total, page, per_page, total_pages, all_selected } = data;
+        const isPriority = currentSort === "priority";
+
+        rebuildTableHeader();
+        fileListEl.innerHTML = "";
+
+        // Sync the select-all header checkbox with actual state
+        $("#select-all-files").checked = !!all_selected;
+
+        if (files.length === 0) {
+            fileListEl.innerHTML = `<tr><td colspan="${getColspan()}" style="text-align:center;padding:20px;color:var(--text-muted)">No files found.</td></tr>`;
+            paginationEl.innerHTML = "";
+            return;
+        }
+
+        // In priority mode, identify the boundary between selected and unselected
+        // (server already sorts selected DESC, priority ASC)
+        const selectedFiles = isPriority ? files.filter((f) => f.selected) : [];
+        const lastSelectedIdx = isPriority ? selectedFiles.length - 1 : -1;
+
+        let hasChanges = false;
+        files.forEach((f, idx) => {
+            const tr = document.createElement("tr");
+            tr.dataset.fileId = f.id;
+
+            // Change highlight
+            if (f.change_status) {
+                hasChanges = true;
+                tr.className = "file-row-" + f.change_status;
+            }
+
+            const changeIcon = f.change_status
+                ? `<span class="change-info ${f.change_status}" aria-label="${escapeHtml(f.change_detail)}">` +
+                  `<span class="change-tooltip">${escapeHtml(f.change_detail)}</span>` +
+                  (f.change_status === "new" ? "+" : f.change_status === "removed" ? "\u2212" : "\u0394") +
+                  `</span>`
+                : "";
+
+            let html = "";
+
+            // Grip column (priority mode only, selected files only)
+            if (isPriority) {
+                html += f.selected ? buildGripCell() : '<td class="col-grip"></td>';
+            }
+
+            html += `<td class="col-check"><input type="checkbox" ${f.selected ? "checked" : ""} data-file-id="${f.id}"></td>`;
+            html += `<td class="col-name"><span class="file-name">${escapeHtml(f.name)}</span>${changeIcon}</td>`;
+            html += `<td class="col-size" style="text-align:right">${formatBytes(f.size)}</td>`;
+            html += `<td class="col-modified">${formatDate(f.mtime)}</td>`;
+            const displayStatus = formatFileStatus(f);
+            const statusClass = displayStatus === "skipped" ? "skipped" : f.download_status;
+            html += `<td class="col-status">` +
+                `<span class="file-status ${statusClass}" ${f.download_status === "failed" && f.error_message ? `title="${escapeHtml(f.error_message)}"` : ""}>${displayStatus}</span>` +
+                (f.download_status === "failed" && f.error_message ? `<span class="file-error-hint" title="${escapeHtml(f.error_message)}">&#9432;</span>` : "") +
+                (f.download_status === "failed" ? `<button class="retry-file-btn" data-retry-file="${f.id}" title="Retry this file">&#x21bb;</button>` : "") +
+                `</td>`;
+
+            // Priority buttons (priority mode only, selected files only)
+            if (isPriority) {
+                if (f.selected) {
+                    const selIdx = selectedFiles.indexOf(f);
+                    html += buildPriorityCell(f.id, selIdx === 0, selIdx === lastSelectedIdx);
+                } else {
+                    html += '<td class="col-priority"></td>';
+                }
+            }
+
+            tr.innerHTML = html;
+
+            // Checkbox handler
+            tr.querySelector("input[type=checkbox]").addEventListener("change", (e) => {
+                api("POST", `/api/files/${f.id}/select`, { selected: e.target.checked }).then(() => {
+                    if (isPriority) loadFiles(); // re-sort grouping
+                });
+                syncSelectAll();
+            });
+
+            // Retry handler
+            const retryBtn = tr.querySelector(".retry-file-btn");
+            if (retryBtn) {
+                retryBtn.addEventListener("click", () => retryFile(f.id));
+            }
+
+            // Priority mode: drag & priority button handlers for selected files
+            if (isPriority && f.selected) {
+                attachPriorityDrag(tr, f.id);
+                const upBtn = tr.querySelector(`[data-move-up="${f.id}"]`);
+                const downBtn = tr.querySelector(`[data-move-down="${f.id}"]`);
+                if (upBtn) upBtn.addEventListener("click", () => moveFile(f.id, -1));
+                if (downBtn) downBtn.addEventListener("click", () => moveFile(f.id, 1));
+            }
+
+            fileListEl.appendChild(tr);
+        });
+
+        // Pagination
+        paginationEl.innerHTML = "";
+        if (total_pages > 1) {
+            const prevBtn = document.createElement("button");
+            prevBtn.textContent = "\u2190 Prev";
+            prevBtn.disabled = page <= 1;
+            prevBtn.addEventListener("click", () => { currentPage--; loadFiles(); });
+            paginationEl.appendChild(prevBtn);
+
+            for (let i = 1; i <= total_pages; i++) {
+                if (total_pages > 10 && Math.abs(i - page) > 2 && i !== 1 && i !== total_pages) {
+                    if (i === page - 3 || i === page + 3) {
+                        const dots = document.createElement("button");
+                        dots.textContent = "...";
+                        dots.disabled = true;
+                        paginationEl.appendChild(dots);
+                    }
+                    continue;
+                }
+                const btn = document.createElement("button");
+                btn.textContent = i;
+                btn.className = i === page ? "active" : "";
+                btn.addEventListener("click", () => { currentPage = i; loadFiles(); });
+                paginationEl.appendChild(btn);
+            }
+
+            const nextBtn = document.createElement("button");
+            nextBtn.textContent = "Next \u2192";
+            nextBtn.disabled = page >= total_pages;
+            nextBtn.addEventListener("click", () => { currentPage++; loadFiles(); });
+            paginationEl.appendChild(nextBtn);
+        }
+
+        // Show/hide clear highlights button
+        $("#btn-clear-changes").style.display = hasChanges ? "" : "none";
+    }
+
+    function formatFileStatus(f) {
+        if (!f.selected && f.download_status === "pending") {
+            return "skipped";
+        }
+        if (f.download_status === "downloading" && f.size > 0) {
+            const pct = ((f.downloaded_bytes / f.size) * 100).toFixed(1);
+            return `${pct}%`;
+        }
+        return f.download_status;
+    }
+
+    function updateFileRow(fileId, updates) {
+        const tr = fileListEl.querySelector(`tr[data-file-id="${fileId}"]`);
+        if (!tr) return;
+        const statusCell = tr.querySelector(".file-status");
+        if (statusCell && updates.download_status) {
+            statusCell.className = "file-status " + updates.download_status;
+            if (updates.download_status === "downloading" && updates.size > 0) {
+                const pct = ((updates.downloaded_bytes / updates.size) * 100).toFixed(1);
+                statusCell.textContent = pct + "%";
+            } else {
+                statusCell.textContent = updates.download_status;
+            }
+        }
+    }
+
+    // --- Add Archive ---
+
+    function openAddModal() {
+        $("#modal-add").classList.add("open");
+        const input = $("#input-add-url");
+        input.value = "";
+        input.focus();
+        $("#add-error").textContent = "";
+        $("#add-loading").style.display = "none";
+        // Apply defaults from settings
+        api("GET", "/api/settings").then((s) => {
+            $("#add-enable-archive").checked = s.default_enable_archive === "1";
+            $("#add-select-all-files").checked = s.default_select_all !== "0";
+        }).catch(() => {});
+    }
+
+    function closeAddModal() {
+        $("#modal-add").classList.remove("open");
+    }
+
+    async function addArchive() {
+        const url = $("#input-add-url").value.trim();
+        if (!url) {
+            $("#add-error").textContent = "Please enter a URL or identifier.";
+            return;
+        }
+        $("#add-error").textContent = "";
+        $("#add-loading").style.display = "flex";
+        $("#btn-add-confirm").disabled = true;
+
+        try {
+            await api("POST", "/api/archives", {
+                url,
+                enable: $("#add-enable-archive").checked,
+                select_all: $("#add-select-all-files").checked,
+            });
+            closeAddModal();
+            await refreshArchives();
+        } catch (e) {
+            $("#add-error").textContent = e.message;
+        } finally {
+            $("#add-loading").style.display = "none";
+            $("#btn-add-confirm").disabled = false;
+        }
+    }
+
+    // --- Delete Archive ---
+
+    let deleteTarget = null;
+
+    function confirmDelete(archive) {
+        deleteTarget = archive;
+        $("#delete-name").textContent = archive.title || archive.identifier;
+        $("#modal-delete").classList.add("open");
+    }
+
+    async function doDelete() {
+        if (deleteTarget) {
+            await api("DELETE", `/api/archives/${deleteTarget.id}`);
+            deleteTarget = null;
+            $("#modal-delete").classList.remove("open");
+            await refreshArchives();
+        }
+    }
+
+    // --- Settings (Full-Screen Page) ---
+
+    let scheduleRules = [];
+    let settingsSnapshot = "";
+
+    function getSettingsFingerprint() {
+        return JSON.stringify({
+            ia_email: $("#set-ia-email").value,
+            ia_password: $("#set-ia-password").value,
+            download_dir: $("#set-download-dir").value,
+            max_retries: $("#set-max-retries").value,
+            retry_delay: $("#set-retry-delay").value,
+            files_per_page: $("#set-files-per-page").value,
+            theme: $("#set-theme").value,
+            use_http: $("#set-use-http").checked,
+            confirm_reset_order: $("#set-confirm-reset-order").checked,
+            default_enable_archive: $("#set-default-enable-archive").checked,
+            default_select_all: $("#set-default-select-all").checked,
+            schedule: JSON.stringify(collectScheduleRules()),
+        });
+    }
+
+    function checkSettingsDirty() {
+        const dirty = getSettingsFingerprint() !== settingsSnapshot;
+        $("#btn-settings-save-bottom").disabled = !dirty;
+    }
+
+    async function openSettings() {
+        try {
+            const s = await api("GET", "/api/settings");
+            $("#set-ia-email").value = s.ia_email || "";
+            $("#set-ia-password").value = "";
+            $("#set-ia-pw-hint").textContent = s.ia_password_set ? "(password is set; leave blank to keep)" : "";
+            $("#ia-test-result").textContent = "";
+            $("#set-download-dir").value = s.download_dir || "";
+            $("#set-max-retries").value = s.max_retries || "3";
+            $("#set-retry-delay").value = s.retry_delay || "5";
+            $("#set-files-per-page").value = s.files_per_page || "50";
+            $("#set-theme").value = s.theme || "dark";
+            $("#set-use-http").checked = s.use_http === "1";
+            $("#http-warning").style.display = s.use_http === "1" ? "block" : "none";
+            $("#set-confirm-reset-order").checked = s.confirm_reset_order !== "0";
+            $("#set-default-enable-archive").checked = s.default_enable_archive === "1";
+            $("#set-default-select-all").checked = s.default_select_all !== "0";
+            $("#set-old-password").value = "";
+            $("#set-new-password").value = "";
+            $("#pw-change-error").textContent = "";
+            // Load schedule rules
+            scheduleRules = JSON.parse(s.speed_schedule || "[]");
+            renderScheduleRules();
+            // Snapshot for dirty tracking
+            settingsSnapshot = getSettingsFingerprint();
+            $("#btn-settings-save-bottom").disabled = true;
+            // Show settings page, hide others
+            $$(".page").forEach((p) => p.classList.remove("active"));
+            $("#page-settings").classList.add("active");
+        } catch (e) {
+            alert("Failed to load settings: " + e.message);
+        }
+    }
+
+    function closeSettings() {
+        $("#page-settings").classList.remove("active");
+        if (currentArchiveId) {
+            $("#page-detail").classList.add("active");
+        } else {
+            $("#page-home").classList.add("active");
+        }
+    }
+
+    function switchTab(tabId) {
+        $$(".settings-tab").forEach((t) => t.classList.toggle("active", t.dataset.tab === tabId));
+        $$(".settings-panel").forEach((p) => p.classList.toggle("active", p.id === tabId));
+    }
+
+    async function saveSettings() {
+        const data = {
+            ia_email: $("#set-ia-email").value,
+            ia_password: $("#set-ia-password").value,
+            download_dir: $("#set-download-dir").value,
+            max_retries: $("#set-max-retries").value,
+            retry_delay: $("#set-retry-delay").value,
+            files_per_page: $("#set-files-per-page").value,
+            theme: $("#set-theme").value,
+            use_http: $("#set-use-http").checked ? "1" : "0",
+            confirm_reset_order: $("#set-confirm-reset-order").checked ? "1" : "0",
+            default_enable_archive: $("#set-default-enable-archive").checked ? "1" : "0",
+            default_select_all: $("#set-default-select-all").checked ? "1" : "0",
+            speed_schedule: JSON.stringify(collectScheduleRules()),
+        };
+        try {
+            await api("POST", "/api/settings", data);
+            applyTheme(data.theme);
+            closeSettings();
+        } catch (e) {
+            alert("Failed to save settings: " + e.message);
+        }
+    }
+
+    async function testCredentials() {
+        const resultEl = $("#ia-test-result");
+        resultEl.textContent = "Testing...";
+        resultEl.className = "ia-test-result";
+        try {
+            const email = $("#set-ia-email").value;
+            const pw = $("#set-ia-password").value;
+            if (email || pw) {
+                const saveData = { ia_email: email };
+                if (pw) saveData.ia_password = pw;
+                await api("POST", "/api/settings", saveData);
+            }
+            const res = await api("POST", "/api/settings/test-credentials");
+            resultEl.textContent = res.message || "Success";
+            resultEl.className = "ia-test-result " + (res.ok ? "success" : "error");
+        } catch (e) {
+            resultEl.textContent = e.message || "Test failed";
+            resultEl.className = "ia-test-result error";
+        }
+    }
+
+    // --- Change Password ---
+
+    async function changePassword() {
+        const oldPw = $("#set-old-password").value;
+        const newPw = $("#set-new-password").value;
+        const errEl = $("#pw-change-error");
+        errEl.textContent = "";
+
+        if (!oldPw || !newPw) {
+            errEl.textContent = "Both fields are required";
+            return;
+        }
+        if (newPw.length < 4) {
+            errEl.textContent = "New password must be at least 4 characters";
+            return;
+        }
+
+        try {
+            await api("POST", "/api/auth/change-password", { old_password: oldPw, new_password: newPw });
+            $("#set-old-password").value = "";
+            $("#set-new-password").value = "";
+            errEl.style.color = "var(--success)";
+            errEl.textContent = "Password changed successfully";
+            setTimeout(() => { errEl.textContent = ""; errEl.style.color = ""; }, 3000);
+        } catch (e) {
+            errEl.textContent = e.message;
+        }
+    }
+
+    // --- Speed Schedule ---
+
+    const DAY_LABELS = ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"];
+
+    function renderScheduleRules() {
+        const container = $("#schedule-rules");
+        container.innerHTML = "";
+        if (scheduleRules.length === 0) {
+            container.innerHTML = '<div class="schedule-empty">No rules configured. Downloads run uncapped unless limited manually in the top bar.</div>';
+            return;
+        }
+        scheduleRules.forEach((rule, idx) => {
+            const div = document.createElement("div");
+            div.className = "schedule-rule";
+            div.dataset.idx = idx;
+
+            const daysHtml = DAY_LABELS.map((d, di) => {
+                const active = (rule.days || [0,1,2,3,4,5,6]).includes(di) ? "active" : "";
+                return `<button type="button" class="day-toggle ${active}" data-day="${di}">${d}</button>`;
+            }).join("");
+
+            div.innerHTML = `
+                <label>From <input type="time" class="rule-start" value="${rule.start || '00:00'}"></label>
+                <label>To <input type="time" class="rule-end" value="${rule.end || '23:59'}"></label>
+                <label><input type="number" class="rule-limit" min="0" step="100" value="${rule.limit_kbps || 0}"> <span class="rule-unit">KB/s</span></label>
+                <div class="days-row">${daysHtml}</div>
+                <button type="button" class="btn-remove-rule" title="Remove rule">
+                    <svg viewBox="0 0 24 24" width="14" height="14"><path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z" fill="currentColor"/></svg>
+                </button>
+            `;
+
+            // Day toggles
+            div.querySelectorAll(".day-toggle").forEach((btn) => {
+                btn.addEventListener("click", () => { btn.classList.toggle("active"); checkSettingsDirty(); });
+            });
+            // Schedule inputs dirty tracking
+            div.querySelectorAll("input").forEach((inp) => {
+                inp.addEventListener("input", checkSettingsDirty);
+                inp.addEventListener("change", checkSettingsDirty);
+            });
+            // Remove
+            div.querySelector(".btn-remove-rule").addEventListener("click", () => {
+                scheduleRules = collectScheduleRules();
+                scheduleRules.splice(idx, 1);
+                renderScheduleRules();
+                checkSettingsDirty();
+            });
+
+            container.appendChild(div);
+        });
+    }
+
+    function addScheduleRule() {
+        scheduleRules = collectScheduleRules();
+        scheduleRules.push({ start: "00:00", end: "23:59", limit_kbps: 0, days: [0,1,2,3,4,5,6] });
+        renderScheduleRules();
+        checkSettingsDirty();
+    }
+
+    function collectScheduleRules() {
+        const rules = [];
+        $$(".schedule-rule").forEach((div) => {
+            const start = div.querySelector(".rule-start").value;
+            const end = div.querySelector(".rule-end").value;
+            const limit_kbps = parseInt(div.querySelector(".rule-limit").value) || 0;
+            const days = [];
+            div.querySelectorAll(".day-toggle.active").forEach((btn) => days.push(parseInt(btn.dataset.day)));
+            rules.push({ start, end, limit_kbps, days });
+        });
+        return rules;
+    }
+
+    // --- Select All Files ---
+
+    async function toggleSelectAll(checked) {
+        if (!currentArchiveId) return;
+        await api("POST", `/api/archives/${currentArchiveId}/files/select-all`, { selected: checked });
+        loadFiles();
+    }
+
+    // --- Reset Download Order ---
+
+    let confirmResetSetting = true; // loaded from settings on init
+
+    function confirmResetOrder() {
+        if (!currentArchiveId) return;
+        if (!confirmResetSetting) {
+            doResetOrder();
+            return;
+        }
+        $("#reset-order-suppress").checked = false;
+        $("#modal-reset-order").classList.add("open");
+    }
+
+    async function doResetOrder() {
+        if (!currentArchiveId) return;
+        await api("POST", `/api/archives/${currentArchiveId}/files/reset-order`);
+        await loadFiles();
+    }
+
+    // --- Bandwidth ---
+
+    let bwDebounce = null;
+
+    function showBandwidthUI(limitBytes) {
+        // Render the bandwidth controls for a given limit value
+        // limitBytes: -1 = unlimited, 0 = paused, >0 = throttle
+        const checkbox = $("#bandwidth-enabled");
+        const input = $("#bandwidth-input");
+        const control = input.closest(".bandwidth-control");
+
+        if (limitBytes < 0) {
+            checkbox.checked = false;
+            input.disabled = true;
+            input.value = "";
+            input.placeholder = "uncapped";
+            control.classList.add("disabled");
+        } else {
+            checkbox.checked = true;
+            input.disabled = false;
+            input.value = Math.round(limitBytes / 1024);
+            input.placeholder = "KB/s";
+            control.classList.remove("disabled");
+        }
+    }
+
+    function updateBandwidthUI(limitBytes) {
+        // Called when the real bandwidth setting changes (user action or schedule event)
+        realBandwidth = limitBytes;
+        // If paused, always show 0; otherwise show the real value
+        showBandwidthUI(dlState === "paused" ? 0 : realBandwidth);
+    }
+
+    function syncBandwidthToState() {
+        // Sync the bandwidth display to match the current dlState
+        showBandwidthUI(dlState === "paused" ? 0 : realBandwidth);
+    }
+
+    function sendBandwidthLimit() {
+        const checkbox = $("#bandwidth-enabled");
+        const input = $("#bandwidth-input");
+        let limit;
+        if (!checkbox.checked) {
+            limit = -1;
+        } else {
+            limit = (parseInt(input.value) || 0) * 1024;
+        }
+        realBandwidth = limit;
+        api("POST", "/api/download/bandwidth", { limit });
+    }
+
+    function onBandwidthToggle() {
+        const checkbox = $("#bandwidth-enabled");
+        const input = $("#bandwidth-input");
+        const control = input.closest(".bandwidth-control");
+        if (checkbox.checked) {
+            input.disabled = false;
+            input.placeholder = "KB/s";
+            control.classList.remove("disabled");
+            if (!input.value) input.value = "0";
+            input.focus();
+        } else {
+            input.disabled = true;
+            input.value = "";
+            input.placeholder = "uncapped";
+            control.classList.add("disabled");
+        }
+        sendBandwidthLimit();
+    }
+
+    function onBandwidthInput() {
+        clearTimeout(bwDebounce);
+        bwDebounce = setTimeout(sendBandwidthLimit, 500);
+    }
+
+    // --- Escape ---
+
+    function escapeHtml(str) {
+        if (!str) return "";
+        const div = document.createElement("div");
+        div.textContent = str;
+        return div.innerHTML;
+    }
+
+    // --- Init ---
+
+    function init() {
+        // Controls
+        $("#btn-play").addEventListener("click", () => {
+            if (dlState === "paused") {
+                // Clear the limiter when resuming from pause
+                realBandwidth = -1;
+                api("POST", "/api/download/bandwidth", { limit: -1 });
+            }
+            api("POST", "/api/download/start");
+        });
+        $("#btn-pause").addEventListener("click", () => api("POST", "/api/download/pause"));
+        $("#btn-stop").addEventListener("click", () => api("POST", "/api/download/stop"));
+
+        // Add
+        $("#btn-add").addEventListener("click", openAddModal);
+        $("#btn-add-cancel").addEventListener("click", closeAddModal);
+        $("#btn-add-confirm").addEventListener("click", addArchive);
+        $("#input-add-url").addEventListener("keydown", (e) => { if (e.key === "Enter") addArchive(); });
+
+        // Settings
+        $("#btn-settings").addEventListener("click", openSettings);
+        $("#btn-settings-save-bottom").addEventListener("click", saveSettings);
+        $("#btn-settings-back-bottom").addEventListener("click", closeSettings);
+        $("#btn-test-credentials").addEventListener("click", testCredentials);
+        $("#btn-change-password").addEventListener("click", changePassword);
+        // Tab switching
+        $$(".settings-tab").forEach((tab) => {
+            tab.addEventListener("click", () => switchTab(tab.dataset.tab));
+        });
+        // Schedule
+        $("#btn-add-schedule-rule").addEventListener("click", addScheduleRule);
+
+        // Dirty tracking for settings: listen on all settings inputs
+        $("#page-settings").querySelectorAll("input, select").forEach((el) => {
+            el.addEventListener("input", checkSettingsDirty);
+            el.addEventListener("change", checkSettingsDirty);
+        });
+
+        // Toggle HTTP warning visibility
+        $("#set-use-http").addEventListener("change", () => {
+            $("#http-warning").style.display = $("#set-use-http").checked ? "block" : "none";
+        });
+
+        // Logout
+        $("#btn-logout").addEventListener("click", async () => {
+            await fetch("/logout", { method: "POST" });
+            window.location.href = "/login";
+        });
+
+        // Delete
+        $("#btn-delete-cancel").addEventListener("click", () => { deleteTarget = null; $("#modal-delete").classList.remove("open"); });
+        $("#btn-delete-confirm").addEventListener("click", doDelete);
+
+        // Reset download order modal
+        $("#btn-reset-order-cancel").addEventListener("click", () => $("#modal-reset-order").classList.remove("open"));
+        $("#btn-reset-order-confirm").addEventListener("click", () => {
+            const suppress = $("#reset-order-suppress").checked;
+            $("#modal-reset-order").classList.remove("open");
+            if (suppress) {
+                confirmResetSetting = false;
+                api("POST", "/api/settings", { confirm_reset_order: "0" });
+            }
+            doResetOrder();
+        });
+
+        // Detail
+        $("#btn-back").addEventListener("click", closeDetail);
+        $("#select-all-files").addEventListener("change", (e) => toggleSelectAll(e.target.checked));
+        $("#btn-retry-all").addEventListener("click", () => { if (currentArchiveId) retryArchive(currentArchiveId); });
+        $("#btn-refresh-meta").addEventListener("click", refreshMetadata);
+        $("#btn-clear-changes").addEventListener("click", clearChanges);
+        $("#file-sort").addEventListener("change", (e) => {
+            currentSort = e.target.value;
+            currentPage = 1;
+            loadFiles();
+        });
+        $("#file-search").addEventListener("input", (e) => {
+            clearTimeout(fileSearchTimer);
+            fileSearchTimer = setTimeout(() => {
+                fileSearchQuery = e.target.value.trim();
+                currentPage = 1;
+                loadFiles();
+            }, 250);
+        });
+
+        // Bandwidth
+        $("#bandwidth-enabled").addEventListener("change", onBandwidthToggle);
+        $("#bandwidth-input").addEventListener("input", onBandwidthInput);
+
+        // Close modals on overlay click
+        $$(".modal-overlay").forEach((overlay) => {
+            overlay.addEventListener("click", (e) => {
+                if (e.target === overlay) overlay.classList.remove("open");
+            });
+        });
+
+        // Close modals / settings on Escape
+        document.addEventListener("keydown", (e) => {
+            if (e.key === "Escape") {
+                $$(".modal-overlay.open").forEach((m) => m.classList.remove("open"));
+                if ($("#page-settings").classList.contains("active")) {
+                    closeSettings();
+                } else if (pageDetail.classList.contains("active")) {
+                    closeDetail();
+                }
+            }
+        });
+
+        // Load theme and bandwidth from settings
+        api("GET", "/api/settings").then((s) => {
+            if (s.theme) applyTheme(s.theme);
+            const bw = parseInt(s.bandwidth_limit);
+            updateBandwidthUI(isNaN(bw) ? -1 : bw);
+        });
+
+        refreshArchives();
+        refreshStatus();
+        connectSSE();
+
+        // Set initial lock indicator and reset-order confirmation state
+        api("GET", "/api/settings").then((s) => {
+            updateLockIndicator(s.use_http === "1");
+            confirmResetSetting = s.confirm_reset_order !== "0";
+        }).catch(() => {});
+    }
+
+    document.addEventListener("DOMContentLoaded", init);
+})();

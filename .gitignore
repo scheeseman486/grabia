@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.venv/
+grabia.db
+.secret_key
+.sourceartassets/

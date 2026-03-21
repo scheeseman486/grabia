@@ -1,0 +1,348 @@
+<!--
+  Grabia - Internet Archive Download Manager
+  Copyright (C) 2026 Sharkcheese
+
+  This program is free software; you can redistribute it and/or modify
+  it under the terms of the GNU General Public License as published by
+  the Free Software Foundation; either version 2 of the License, or
+  (at your option) any later version.
+
+  This program is distributed in the hope that it will be useful,
+  but WITHOUT ANY WARRANTY; without even the implied warranty of
+  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+  GNU General Public License for more details.
+
+  You should have received a copy of the GNU General Public License along
+  with this program; if not, write to the Free Software Foundation, Inc.,
+  51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+-->
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Grabia</title>
+    <link rel="icon" href="/static/favicon.ico" type="image/x-icon">
+    <link rel="apple-touch-icon" href="/static/apple-touch-icon.png">
+    <link rel="stylesheet" href="{{ static_url('css/style.css') }}">
+</head>
+<body>
+    <!-- Top Bar -->
+    <header id="topbar">
+        <div class="topbar-left">
+            <h1 class="logo"><img src="{{ static_url('grabia_icon.png') }}" alt="" class="logo-icon"><span>Grab<span class="logo-ia">ia</span></span></h1>
+            <div class="controls">
+                <button id="btn-play" class="ctrl-btn" title="Start downloading">
+                    <svg viewBox="0 0 24 24" width="18" height="18"><polygon points="5,3 19,12 5,21" fill="currentColor"/></svg>
+                </button>
+                <button id="btn-pause" class="ctrl-btn" title="Pause downloading">
+                    <svg viewBox="0 0 24 24" width="18" height="18"><rect x="5" y="3" width="4" height="18" fill="currentColor"/><rect x="15" y="3" width="4" height="18" fill="currentColor"/></svg>
+                </button>
+                <button id="btn-stop" class="ctrl-btn" title="Stop downloading">
+                    <svg viewBox="0 0 24 24" width="18" height="18"><rect x="4" y="4" width="16" height="16" fill="currentColor"/></svg>
+                </button>
+            </div>
+            <div class="bandwidth-control">
+                <label class="bw-toggle" title="Enable bandwidth limiter">
+                    <input type="checkbox" id="bandwidth-enabled">
+                    <svg viewBox="0 0 24 24" width="16" height="16"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-1 17.93c-3.94-.49-7-3.85-7-7.93 0-.62.08-1.22.21-1.79L9 15v1c0 1.1.9 2 2 2v1.93zm6.9-2.54c-.26-.81-1-1.39-1.9-1.39h-1v-3c0-.55-.45-1-1-1H8v-2h2c.55 0 1-.45 1-1V7h2c1.1 0 2-.9 2-2v-.41c2.93 1.19 5 4.06 5 7.41 0 2.08-.8 3.97-2.1 5.39z" fill="currentColor"/></svg>
+                </label>
+                <input type="number" id="bandwidth-input" min="0" step="100" placeholder="uncapped" title="KB/s (0 = paused)" disabled>
+                <span class="bw-unit">KB/s</span>
+            </div>
+        </div>
+        <div class="topbar-right">
+            <canvas id="speed-sparkline" width="80" height="24" title="Download speed history"></canvas>
+            <div class="speed-display" id="speed-display"></div>
+            <div class="status-indicator" id="status-indicator">
+                <span class="status-dot"></span>
+                <span class="status-text">Stopped</span>
+            </div>
+            <button id="btn-add" class="action-btn primary" title="Add archive">
+                <svg viewBox="0 0 24 24" width="18" height="18"><line x1="12" y1="5" x2="12" y2="19" stroke="currentColor" stroke-width="2"/><line x1="5" y1="12" x2="19" y2="12" stroke="currentColor" stroke-width="2"/></svg>
+                Add
+            </button>
+            <button id="btn-settings" class="action-btn" title="Settings">
+                <svg viewBox="0 0 24 24" width="18" height="18"><path d="M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58a.49.49 0 00.12-.61l-1.92-3.32a.488.488 0 00-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54a.484.484 0 00-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.07.62-.07.94s.02.64.07.94l-2.03 1.58a.49.49 0 00-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6A3.6 3.6 0 1112 8.4a3.6 3.6 0 010 7.2z" fill="currentColor"/></svg>
+            </button>
+            <button id="btn-logout" class="action-btn" title="Log out">
+                <svg viewBox="0 0 24 24" width="18" height="18"><path d="M17 7l-1.41 1.41L18.17 11H8v2h10.17l-2.58 2.58L17 17l5-5zM4 5h8V3H4c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h8v-2H4V5z" fill="currentColor"/></svg>
+            </button>
+        </div>
+    </header>
+
+    <!-- Progress Bar -->
+    <div id="global-progress" class="global-progress" style="display:none;">
+        <div class="progress-bar"><div class="progress-fill" id="progress-fill"></div></div>
+        <span id="lock-indicator" class="lock-indicator lock-secure" title="Downloads use HTTPS">
+            <svg class="lock-icon lock-icon-secure" viewBox="0 0 24 24" width="14" height="14"><path d="M18 8h-1V6c0-2.76-2.24-5-5-5S7 3.24 7 6v2H6c-1.1 0-2 .9-2 2v10c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V10c0-1.1-.9-2-2-2zM12 17c-1.1 0-2-.9-2-2s.9-2 2-2 2 .9 2 2-.9 2-2 2zM9 8V6c0-1.66 1.34-3 3-3s3 1.34 3 3v2H9z" fill="currentColor"/></svg>
+            <svg class="lock-icon lock-icon-broken" viewBox="0 0 24 24" width="14" height="14"><path d="M18 8h-1V6c0-2.76-2.24-5-5-5S7 3.24 7 6h2c0-1.66 1.34-3 3-3s3 1.34 3 3v2H6c-1.1 0-2 .9-2 2v10c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V10c0-1.1-.9-2-2-2zM12 17c-1.1 0-2-.9-2-2s.9-2 2-2 2 .9 2 2-.9 2-2 2z" fill="currentColor"/></svg>
+        </span>
+        <div class="progress-text" id="progress-text"></div>
+    </div>
+
+    <!-- Main Content -->
+    <main id="main-content">
+        <!-- Home: Archive List -->
+        <section id="page-home" class="page active">
+            <div class="empty-state" id="empty-state">
+                <svg viewBox="0 0 24 24" width="64" height="64"><path d="M20 6h-8l-2-2H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2zm0 12H4V8h16v10z" fill="currentColor" opacity="0.3"/></svg>
+                <p>No archives added yet.</p>
+                <p>Click <strong>Add</strong> to get started.</p>
+            </div>
+            <ul id="archive-list" class="archive-list"></ul>
+        </section>
+
+        <!-- Detail: Archive Files -->
+        <section id="page-detail" class="page">
+            <div class="detail-header">
+                <button id="btn-back" class="action-btn">
+                    <svg viewBox="0 0 24 24" width="18" height="18"><path d="M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2z" fill="currentColor"/></svg>
+                    Back
+                </button>
+                <div class="detail-info">
+                    <h2 id="detail-title"></h2>
+                    <p id="detail-meta"></p>
+                    <div class="archive-progress-meta" id="detail-progress-meta"></div>
+                </div>
+            </div>
+            <div class="detail-controls">
+                <button class="action-btn" id="btn-retry-all" title="Reset all failed files to pending">
+                    <svg viewBox="0 0 24 24" width="16" height="16"><path d="M17.65 6.35A7.958 7.958 0 0012 4c-4.42 0-7.99 3.58-7.99 8s3.57 8 7.99 8c3.73 0 6.84-2.55 7.73-6h-2.08A5.99 5.99 0 0112 18c-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z" fill="currentColor"/></svg>
+                    Retry Failed
+                </button>
+                <button class="action-btn" id="btn-refresh-meta" title="Re-check Internet Archive for file list changes">
+                    <svg viewBox="0 0 24 24" width="16" height="16"><path d="M12 4V1L8 5l4 4V6c3.31 0 6 2.69 6 6 0 1.01-.25 1.97-.7 2.8l1.46 1.46A7.93 7.93 0 0020 12c0-4.42-3.58-8-8-8zm0 14c-3.31 0-6-2.69-6-6 0-1.01.25-1.97.7-2.8L5.24 7.74A7.93 7.93 0 004 12c0 4.42 3.58 8 8 8v3l4-4-4-4v3z" fill="currentColor"/></svg>
+                    Refresh Metadata
+                </button>
+                <button class="action-btn" id="btn-clear-changes" title="Dismiss change highlights" style="display:none">
+                    <svg viewBox="0 0 24 24" width="16" height="16"><path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z" fill="currentColor"/></svg>
+                    Clear Highlights
+                </button>
+                <div class="refresh-summary" id="refresh-summary" style="display:none"></div>
+                <div class="file-search">
+                    <svg viewBox="0 0 24 24" width="14" height="14"><path d="M15.5 14h-.79l-.28-.27A6.471 6.471 0 0016 9.5 6.5 6.5 0 109.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z" fill="currentColor"/></svg>
+                    <input type="text" id="file-search" placeholder="Filter files…">
+                </div>
+                <div class="sort-control">
+                    <label for="file-sort">Sort by</label>
+                    <select id="file-sort">
+                        <option value="priority">Download Order</option>
+                        <option value="name">Name</option>
+                        <option value="size">Size</option>
+                        <option value="modified">Modified</option>
+                        <option value="status">Status</option>
+                    </select>
+                </div>
+            </div>
+            <div class="file-table-wrap">
+                <table class="file-table">
+                    <thead>
+                        <tr>
+                            <th class="col-check"><input type="checkbox" id="select-all-files" title="Select / deselect all files"></th>
+                            <th class="col-name">Name</th>
+                            <th class="col-size">Size</th>
+                            <th class="col-modified">Modified</th>
+                            <th class="col-status">Status</th>
+                        </tr>
+                    </thead>
+                    <tbody id="file-list"></tbody>
+                </table>
+            </div>
+            <div class="pagination" id="pagination"></div>
+        </section>
+    </main>
+
+    <!-- Add Archive Modal -->
+    <div class="modal-overlay" id="modal-add">
+        <div class="modal">
+            <h3>Add Archive</h3>
+            <p>Enter an Internet Archive URL or identifier:</p>
+            <input type="text" id="input-add-url" placeholder="https://archive.org/details/..." autofocus>
+            <div class="modal-options">
+                <label class="checkbox-label"><input type="checkbox" id="add-enable-archive"> Enable archive</label>
+                <label class="checkbox-label"><input type="checkbox" id="add-select-all-files" checked> Download all files</label>
+            </div>
+            <div class="modal-error" id="add-error"></div>
+            <div class="modal-actions">
+                <button class="action-btn" id="btn-add-cancel">Cancel</button>
+                <button class="action-btn primary" id="btn-add-confirm">Add</button>
+            </div>
+            <div class="modal-loading" id="add-loading" style="display:none;">
+                <div class="spinner"></div> Fetching metadata...
+            </div>
+        </div>
+    </div>
+
+    <!-- Settings Page (Full Screen) -->
+    <section id="page-settings" class="page">
+        <div class="settings-page">
+            <div class="settings-topbar">
+                <h2>Settings</h2>
+            </div>
+            <div class="settings-layout">
+                <nav class="settings-tabs">
+                    <button class="settings-tab active" data-tab="tab-ia-account">
+                        <svg viewBox="0 0 24 24" width="18" height="18"><path d="M20 6h-8l-2-2H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2zm0 12H4V8h16v10z" fill="currentColor"/></svg>
+                        Internet Archive
+                    </button>
+                    <button class="settings-tab" data-tab="tab-downloads">
+                        <svg viewBox="0 0 24 24" width="18" height="18"><path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z" fill="currentColor"/></svg>
+                        Downloads
+                    </button>
+                    <button class="settings-tab" data-tab="tab-appearance">
+                        <svg viewBox="0 0 24 24" width="18" height="18"><path d="M12 3c-4.97 0-9 4.03-9 9s4.03 9 9 9c.83 0 1.5-.67 1.5-1.5 0-.39-.15-.74-.39-1.01-.23-.26-.38-.61-.38-1 0-.83.67-1.5 1.5-1.5H16c2.76 0 5-2.24 5-5 0-4.42-4.03-8-9-8zm-5.5 9c-.83 0-1.5-.67-1.5-1.5S5.67 9 6.5 9 8 9.67 8 10.5 7.33 12 6.5 12zm3-4C8.67 8 8 7.33 8 6.5S8.67 5 9.5 5s1.5.67 1.5 1.5S10.33 8 9.5 8zm5 0c-.83 0-1.5-.67-1.5-1.5S13.67 5 14.5 5s1.5.67 1.5 1.5S15.33 8 14.5 8zm3 4c-.83 0-1.5-.67-1.5-1.5S16.67 9 17.5 9s1.5.67 1.5 1.5-.67 1.5-1.5 1.5z" fill="currentColor"/></svg>
+                        Appearance
+                    </button>
+                    <button class="settings-tab" data-tab="tab-login">
+                        <svg viewBox="0 0 24 24" width="18" height="18"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 3c1.66 0 3 1.34 3 3s-1.34 3-3 3-3-1.34-3-3 1.34-3 3-3zm0 14.2c-2.5 0-4.71-1.28-6-3.22.03-1.99 4-3.08 6-3.08 1.99 0 5.97 1.09 6 3.08-1.29 1.94-3.5 3.22-6 3.22z" fill="currentColor"/></svg>
+                        Grabia Login
+                    </button>
+                    <button class="settings-tab" data-tab="tab-scheduler">
+                        <svg viewBox="0 0 24 24" width="18" height="18"><path d="M11.99 2C6.47 2 2 6.48 2 12s4.47 10 9.99 10C17.52 22 22 17.52 22 12S17.52 2 11.99 2zM12 20c-4.42 0-8-3.58-8-8s3.58-8 8-8 8 3.58 8 8-3.58 8-8 8zm.5-13H11v6l5.25 3.15.75-1.23-4.5-2.67z" fill="currentColor"/></svg>
+                        Speed Schedule
+                    </button>
+                </nav>
+                <div class="settings-content">
+                    <!-- IA Account Tab -->
+                    <div class="settings-panel active" id="tab-ia-account">
+                        <h3>Internet Archive Account</h3>
+                        <p class="settings-desc">Your archive.org login credentials, used to download restricted items.</p>
+                        <div class="settings-form">
+                            <label>Email
+                                <input type="email" id="set-ia-email" placeholder="user@example.com">
+                            </label>
+                            <label>Password
+                                <input type="password" id="set-ia-password" placeholder="Enter password">
+                                <small id="set-ia-pw-hint"></small>
+                            </label>
+                            <div class="settings-form-actions">
+                                <button class="action-btn" id="btn-test-credentials" type="button">Test Credentials</button>
+                                <small id="ia-test-result" class="ia-test-result"></small>
+                            </div>
+                        </div>
+                    </div>
+                    <!-- Downloads Tab -->
+                    <div class="settings-panel" id="tab-downloads">
+                        <h3>Downloads</h3>
+                        <p class="settings-desc">Configure download behaviour and file storage.</p>
+                        <div class="settings-form">
+                            <h4 class="settings-subheading">Default Options</h4>
+                            <p class="settings-desc">Defaults applied when adding a new archive.</p>
+                            <label class="checkbox-label">
+                                <input type="checkbox" id="set-default-enable-archive">
+                                Enable archive
+                            </label>
+                            <label class="checkbox-label">
+                                <input type="checkbox" id="set-default-select-all" checked>
+                                Download all files
+                            </label>
+                            <hr class="settings-divider">
+                            <label>Download Directory
+                                <input type="text" id="set-download-dir" placeholder="/path/to/downloads">
+                            </label>
+                            <label>Max Retries
+                                <input type="number" id="set-max-retries" min="0" max="20" value="3">
+                                <small>How many times to retry a failed download before giving up.</small>
+                            </label>
+                            <label>Retry Delay (seconds)
+                                <input type="number" id="set-retry-delay" min="1" max="300" value="5">
+                                <small>Seconds to wait before retrying a failed file.</small>
+                            </label>
+                            <label>Files Per Page
+                                <input type="number" id="set-files-per-page" min="10" max="500" value="50">
+                            </label>
+                            <label class="checkbox-label">
+                                <input type="checkbox" id="set-confirm-reset-order" checked>
+                                Warn before resetting download order
+                            </label>
+                            <label class="checkbox-label">
+                                <input type="checkbox" id="set-use-http">
+                                Use unencrypted HTTP for downloads
+                            </label>
+                            <div class="http-warning" id="http-warning" style="display:none;">
+                                <strong>Warning:</strong> Unencrypted HTTP transmits data in plain text. Your downloads, metadata requests, and any authentication cookies will be sent without encryption and may be intercepted by third parties on your network. Only enable this if you understand the risks and have a specific reason to avoid HTTPS (e.g. a misconfigured proxy or network that blocks encrypted traffic).
+                            </div>
+                        </div>
+                    </div>
+                    <!-- Appearance Tab -->
+                    <div class="settings-panel" id="tab-appearance">
+                        <h3>Appearance</h3>
+                        <p class="settings-desc">Customise the look and feel.</p>
+                        <div class="settings-form">
+                            <label>Theme
+                                <select id="set-theme">
+                                    <option value="dark">Dark</option>
+                                    <option value="light">Light</option>
+                                </select>
+                            </label>
+                        </div>
+                    </div>
+                    <!-- Grabia Login Tab -->
+                    <div class="settings-panel" id="tab-login">
+                        <h3>Grabia Login</h3>
+                        <p class="settings-desc">Change the username and password used to log in to this Grabia instance.</p>
+                        <div class="settings-form">
+                            <label>Current Password
+                                <input type="password" id="set-old-password" placeholder="Current password" autocomplete="current-password">
+                            </label>
+                            <label>New Password
+                                <input type="password" id="set-new-password" placeholder="New password (min 4 chars)" autocomplete="new-password">
+                            </label>
+                            <div class="modal-error" id="pw-change-error"></div>
+                            <div class="settings-form-actions">
+                                <button class="action-btn" id="btn-change-password" type="button">Change Password</button>
+                            </div>
+                        </div>
+                    </div>
+                    <!-- Speed Schedule Tab -->
+                    <div class="settings-panel" id="tab-scheduler">
+                        <h3>Speed Schedule</h3>
+                        <p class="settings-desc">Set bandwidth limits that activate automatically at specific times. Set 0 KB/s to pause downloads during that window. When no rule matches, downloads run uncapped unless overridden by the manual limiter in the top bar.</p>
+                        <div class="schedule-rules" id="schedule-rules"></div>
+                        <button class="action-btn" id="btn-add-schedule-rule" type="button">
+                            <svg viewBox="0 0 24 24" width="16" height="16"><line x1="12" y1="5" x2="12" y2="19" stroke="currentColor" stroke-width="2"/><line x1="5" y1="12" x2="19" y2="12" stroke="currentColor" stroke-width="2"/></svg>
+                            Add Rule
+                        </button>
+                    </div>
+                </div>
+            </div>
+            <div class="settings-footer">
+                <button class="action-btn primary" id="btn-settings-save-bottom">Save Changes</button>
+                <button class="action-btn" id="btn-settings-back-bottom">Cancel</button>
+            </div>
+        </div>
+    </section>
+
+    <!-- Confirm Delete Modal -->
+    <div class="modal-overlay" id="modal-delete">
+        <div class="modal">
+            <h3>Remove Archive</h3>
+            <p>Remove <strong id="delete-name"></strong> from the list?</p>
+            <p class="text-muted">This does not delete downloaded files.</p>
+            <div class="modal-actions">
+                <button class="action-btn" id="btn-delete-cancel">Cancel</button>
+                <button class="action-btn danger" id="btn-delete-confirm">Remove</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Reset Download Order Modal -->
+    <div class="modal-overlay" id="modal-reset-order">
+        <div class="modal">
+            <h3>Reset Download Order</h3>
+            <p>This will reset the download priority of all files in this archive back to alphabetical order by filename. Any custom ordering you have set will be lost.</p>
+            <label class="checkbox-label modal-suppress">
+                <input type="checkbox" id="reset-order-suppress">
+                Don't show this warning again
+            </label>
+            <div class="modal-actions">
+                <button class="action-btn" id="btn-reset-order-cancel">Cancel</button>
+                <button class="action-btn danger" id="btn-reset-order-confirm">Reset Order</button>
+            </div>
+        </div>
+    </div>
+
+    <script src="{{ static_url('js/app.js') }}"></script>
+</body>
+</html>

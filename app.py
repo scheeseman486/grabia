@@ -1,0 +1,567 @@
+# Grabia - Internet Archive Download Manager
+# Copyright (C) 2026 Sharkcheese
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License along
+# with this program; if not, write to the Free Software Foundation, Inc.,
+# 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+
+"""Flask application for Grabia."""
+
+import os
+import json
+import time
+import queue
+import threading
+import functools
+from flask import Flask, render_template, request, jsonify, Response, session, redirect, url_for
+import database as db
+import ia_client
+from downloader import download_manager
+
+app = Flask(__name__)
+
+def _get_secret_key():
+    """Load or generate a persistent secret key."""
+    key_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".secret_key")
+    if os.path.exists(key_file):
+        with open(key_file, "r") as f:
+            return f.read().strip()
+    key = os.urandom(32).hex()
+    with open(key_file, "w") as f:
+        f.write(key)
+    os.chmod(key_file, 0o600)
+    return key
+
+app.secret_key = os.environ.get("GRABIA_SECRET_KEY") or os.environ.get("HORNBEAM_SECRET_KEY") or _get_secret_key()
+
+
+@app.context_processor
+def cache_buster():
+    """Add file mtime as cache-busting query param for static assets."""
+    def static_url(filename):
+        filepath = os.path.join(app.static_folder, filename)
+        try:
+            mtime = int(os.path.getmtime(filepath))
+        except OSError:
+            mtime = 0
+        return f"/static/{filename}?v={mtime}"
+    return dict(static_url=static_url)
+
+
+# SSE event queue for broadcasting to clients
+sse_queues = []
+sse_lock = threading.Lock()
+
+
+def broadcast_sse(event, data):
+    """Send an SSE event to all connected clients."""
+    msg = f"event: {event}\ndata: {json.dumps(data)}\n\n"
+    with sse_lock:
+        dead = []
+        for q in sse_queues:
+            try:
+                q.put_nowait(msg)
+            except queue.Full:
+                dead.append(q)
+        for q in dead:
+            sse_queues.remove(q)
+
+
+# Hook download manager events into SSE
+def on_download_event(event, data):
+    broadcast_sse(event, data or {})
+
+
+download_manager.add_listener(on_download_event)
+
+
+# --- Auth ---
+
+def login_required(f):
+    @functools.wraps(f)
+    def decorated(*args, **kwargs):
+        if not db.is_auth_setup():
+            # No password set yet — redirect to setup
+            if request.path.startswith("/api/"):
+                return jsonify({"error": "Setup required"}), 403
+            return redirect(url_for("setup_page"))
+        if not session.get("authenticated"):
+            if request.path.startswith("/api/"):
+                return jsonify({"error": "Not authenticated"}), 401
+            return redirect(url_for("login_page"))
+        return f(*args, **kwargs)
+    return decorated
+
+
+@app.route("/setup", methods=["GET"])
+def setup_page():
+    if db.is_auth_setup():
+        return redirect(url_for("login_page"))
+    return render_template("setup.html")
+
+
+@app.route("/setup", methods=["POST"])
+def setup_submit():
+    if db.is_auth_setup():
+        return jsonify({"error": "Already configured"}), 400
+    data = request.json
+    username = (data.get("username") or "").strip()
+    password = data.get("password") or ""
+    if not username or not password:
+        return jsonify({"error": "Username and password are required"}), 400
+    if len(password) < 4:
+        return jsonify({"error": "Password must be at least 4 characters"}), 400
+    db.create_auth(username, password)
+    session["authenticated"] = True
+    session["username"] = username
+    return jsonify({"ok": True})
+
+
+@app.route("/login", methods=["GET"])
+def login_page():
+    if not db.is_auth_setup():
+        return redirect(url_for("setup_page"))
+    if session.get("authenticated"):
+        return redirect(url_for("index"))
+    return render_template("login.html")
+
+
+@app.route("/login", methods=["POST"])
+def login_submit():
+    data = request.json
+    username = (data.get("username") or "").strip()
+    password = data.get("password") or ""
+    if db.verify_auth(username, password):
+        session["authenticated"] = True
+        session["username"] = username
+        session.permanent = True
+        return jsonify({"ok": True})
+    return jsonify({"error": "Invalid username or password"}), 401
+
+
+@app.route("/logout", methods=["POST"])
+def logout():
+    session.clear()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/auth/change-password", methods=["POST"])
+@login_required
+def change_password():
+    data = request.json
+    old_pw = data.get("old_password", "")
+    new_pw = data.get("new_password", "")
+    if not new_pw or len(new_pw) < 4:
+        return jsonify({"error": "New password must be at least 4 characters"}), 400
+    if db.change_password(old_pw, new_pw):
+        return jsonify({"ok": True})
+    return jsonify({"error": "Current password is incorrect"}), 401
+
+
+# --- Pages ---
+
+@app.route("/")
+@login_required
+def index():
+    return render_template("index.html")
+
+
+# --- SSE ---
+
+@app.route("/api/events")
+@login_required
+def events():
+    def stream():
+        q = queue.Queue(maxsize=200)
+        with sse_lock:
+            sse_queues.append(q)
+        try:
+            # Send initial state
+            status = download_manager.get_status()
+            yield f"event: status\ndata: {json.dumps(status)}\n\n"
+            while True:
+                try:
+                    msg = q.get(timeout=15)
+                    if msg is None:
+                        break  # Poison pill — server is shutting down
+                    yield msg
+                except queue.Empty:
+                    yield ": keepalive\n\n"
+        except GeneratorExit:
+            pass
+        finally:
+            with sse_lock:
+                if q in sse_queues:
+                    sse_queues.remove(q)
+
+    return Response(stream(), mimetype="text/event-stream",
+                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+# --- Settings API ---
+
+@app.route("/api/settings", methods=["GET"])
+@login_required
+def get_settings():
+    settings = db.get_all_settings()
+    # Don't expose IA password in full
+    if settings.get("ia_password"):
+        settings["ia_password_set"] = True
+        settings["ia_password"] = ""
+    else:
+        settings["ia_password_set"] = False
+    return jsonify(settings)
+
+
+@app.route("/api/settings", methods=["POST"])
+@login_required
+def update_settings():
+    data = request.json
+    allowed = ["ia_email", "ia_password", "download_dir", "max_retries",
+               "retry_delay", "bandwidth_limit", "theme", "files_per_page",
+               "speed_schedule", "use_http", "confirm_reset_order",
+               "default_enable_archive", "default_select_all"]
+    credentials_changed = False
+    for key in allowed:
+        if key in data:
+            # Don't overwrite password with empty string if it was just hidden
+            if key == "ia_password" and data[key] == "":
+                continue
+            db.set_setting(key, data[key])
+            if key in ("ia_email", "ia_password"):
+                credentials_changed = True
+    if credentials_changed:
+        ia_client.invalidate_cookie_cache()
+    # Update bandwidth limit in running manager
+    if "bandwidth_limit" in data:
+        download_manager.bandwidth_limit = int(data["bandwidth_limit"])
+    broadcast_sse("settings_updated", db.get_all_settings())
+    return jsonify({"ok": True})
+
+
+@app.route("/api/settings/test-credentials", methods=["POST"])
+@login_required
+def test_ia_credentials():
+    """Test IA credentials and return result."""
+    ia_email = db.get_setting("ia_email", "")
+    ia_password = db.get_setting("ia_password", "")
+    if not ia_email or not ia_password:
+        return jsonify({"ok": False, "message": "IA email and password must be saved first"}), 400
+    success, message = ia_client.test_credentials(ia_email, ia_password)
+    return jsonify({"ok": success, "message": message})
+
+
+# --- Archive API ---
+
+@app.route("/api/archives", methods=["GET"])
+@login_required
+def list_archives():
+    archives = db.get_archives()
+    return jsonify(archives)
+
+
+@app.route("/api/archives", methods=["POST"])
+@login_required
+def add_archive():
+    data = request.json
+    url_or_id = data.get("url", "").strip()
+    if not url_or_id:
+        return jsonify({"error": "URL is required"}), 400
+
+    identifier = ia_client.parse_identifier(url_or_id)
+    if not identifier:
+        return jsonify({"error": "Could not parse identifier from URL"}), 400
+
+    # Check for duplicates
+    existing = db.get_archive_by_identifier(identifier)
+    if existing:
+        return jsonify({"error": f"Archive '{identifier}' already exists"}), 409
+
+    try:
+        ia_email = db.get_setting("ia_email", "")
+        ia_password = db.get_setting("ia_password", "")
+        use_http = db.get_setting("use_http", "0") == "1"
+        meta = ia_client.fetch_metadata(identifier, ia_email, ia_password, use_http=use_http)
+    except Exception as e:
+        return jsonify({"error": f"Failed to fetch metadata: {str(e)}"}), 502
+
+    archive_id = db.add_archive(
+        identifier=meta["identifier"],
+        url=meta["url"],
+        title=meta["title"],
+        description=meta["description"],
+        total_size=meta["total_size"],
+        files_count=meta["files_count"],
+        metadata_json=meta["metadata"],
+        server=meta["server"],
+        dir_path=meta["dir"],
+    )
+    db.add_archive_files(archive_id, meta["files"])
+
+    # Apply options from the add modal
+    enable = data.get("enable", False)
+    select_all = data.get("select_all", True)
+    if enable:
+        db.set_archive_download_enabled(archive_id, True)
+    if not select_all:
+        db.set_all_files_selected(archive_id, False)
+
+    archive = db.get_archive(archive_id)
+    broadcast_sse("archive_added", archive)
+    return jsonify(archive), 201
+
+
+@app.route("/api/archives/<int:archive_id>", methods=["GET"])
+@login_required
+def get_archive(archive_id):
+    archive = db.get_archive(archive_id)
+    if not archive:
+        return jsonify({"error": "Not found"}), 404
+    return jsonify(archive)
+
+
+@app.route("/api/archives/<int:archive_id>", methods=["DELETE"])
+@login_required
+def delete_archive(archive_id):
+    db.delete_archive(archive_id)
+    broadcast_sse("archive_removed", {"id": archive_id})
+    return jsonify({"ok": True})
+
+
+@app.route("/api/archives/<int:archive_id>/refresh", methods=["POST"])
+@login_required
+def refresh_archive(archive_id):
+    archive = db.get_archive(archive_id)
+    if not archive:
+        return jsonify({"error": "Not found"}), 404
+
+    try:
+        ia_email = db.get_setting("ia_email", "")
+        ia_password = db.get_setting("ia_password", "")
+        use_http = db.get_setting("use_http", "0") == "1"
+        meta = ia_client.fetch_metadata(archive["identifier"], ia_email, ia_password, use_http=use_http)
+    except Exception as e:
+        return jsonify({"error": f"Failed to fetch metadata: {str(e)}"}), 502
+
+    summary = db.refresh_archive_metadata(archive_id, meta["files"])
+    updated = db.get_archive(archive_id)
+    broadcast_sse("archive_updated", updated)
+    return jsonify({"ok": True, "summary": summary})
+
+
+@app.route("/api/archives/<int:archive_id>/clear-changes", methods=["POST"])
+@login_required
+def clear_changes(archive_id):
+    db.clear_change_statuses(archive_id)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/archives/<int:archive_id>/download", methods=["POST"])
+@login_required
+def toggle_download(archive_id):
+    data = request.json
+    enabled = data.get("enabled", False)
+    db.set_archive_download_enabled(archive_id, enabled)
+    if enabled:
+        db.set_archive_status(archive_id, "queued")
+    else:
+        db.set_archive_status(archive_id, "idle")
+    archive = db.get_archive(archive_id)
+    broadcast_sse("archive_updated", archive)
+    return jsonify(archive)
+
+
+@app.route("/api/archives/reorder", methods=["POST"])
+@login_required
+def reorder_archives():
+    data = request.json
+    id_order = data.get("order", [])
+    db.reorder_archives(id_order)
+    broadcast_sse("archives_reordered", {"order": id_order})
+    return jsonify({"ok": True})
+
+
+# --- Archive Files API ---
+
+@app.route("/api/archives/<int:archive_id>/progress", methods=["GET"])
+@login_required
+def archive_progress(archive_id):
+    return jsonify(db.get_archive_progress(archive_id))
+
+
+@app.route("/api/archives/<int:archive_id>/files", methods=["GET"])
+@login_required
+def list_archive_files(archive_id):
+    page = request.args.get("page", 1, type=int)
+    sort = request.args.get("sort", "name")
+    search = request.args.get("search", "").strip()
+    per_page = int(db.get_setting("files_per_page", "50"))
+    files, total = db.get_archive_files(archive_id, page, per_page, sort=sort, search=search)
+    unselected = db.count_unselected_files(archive_id)
+    progress = db.get_archive_progress(archive_id)
+    return jsonify({
+        "files": files,
+        "total": total,
+        "page": page,
+        "per_page": per_page,
+        "total_pages": max(1, (total + per_page - 1) // per_page),
+        "all_selected": unselected == 0,
+        "progress": progress,
+    })
+
+
+@app.route("/api/files/<int:file_id>/select", methods=["POST"])
+@login_required
+def toggle_file_select(file_id):
+    data = request.json
+    db.set_file_selected(file_id, data.get("selected", True))
+    return jsonify({"ok": True})
+
+
+@app.route("/api/archives/<int:archive_id>/files/select-all", methods=["POST"])
+@login_required
+def select_all_files(archive_id):
+    data = request.json
+    db.set_all_files_selected(archive_id, data.get("selected", True))
+    return jsonify({"ok": True})
+
+
+@app.route("/api/archives/<int:archive_id>/files/reorder", methods=["POST"])
+@login_required
+def reorder_files(archive_id):
+    data = request.json
+    file_ids = data.get("order", [])
+    db.reorder_archive_files(file_ids)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/archives/<int:archive_id>/files/reset-order", methods=["POST"])
+@login_required
+def reset_file_order(archive_id):
+    db.reset_file_priorities(archive_id)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/archives/<int:archive_id>/retry", methods=["POST"])
+@login_required
+def retry_failed_files(archive_id):
+    count = db.reset_failed_files(archive_id)
+    if count > 0:
+        db.set_archive_status(archive_id, "queued")
+    archive = db.get_archive(archive_id)
+    broadcast_sse("archive_updated", archive)
+    return jsonify({"ok": True, "reset_count": count})
+
+
+@app.route("/api/files/<int:file_id>/retry", methods=["POST"])
+@login_required
+def retry_single_file(file_id):
+    db.reset_failed_file(file_id)
+    return jsonify({"ok": True})
+
+
+# --- Download Control API ---
+
+@app.route("/api/download/start", methods=["POST"])
+@login_required
+def start_download():
+    download_manager.start()
+    return jsonify({"state": download_manager.state})
+
+
+@app.route("/api/download/pause", methods=["POST"])
+@login_required
+def pause_download():
+    download_manager.pause()
+    return jsonify({"state": download_manager.state})
+
+
+@app.route("/api/download/stop", methods=["POST"])
+@login_required
+def stop_download():
+    download_manager.stop()
+    return jsonify({"state": download_manager.state})
+
+
+@app.route("/api/download/status", methods=["GET"])
+@login_required
+def download_status():
+    return jsonify(download_manager.get_status())
+
+
+@app.route("/api/download/bandwidth", methods=["POST"])
+@login_required
+def set_bandwidth():
+    data = request.json
+    limit = int(data.get("limit", -1))  # -1 = unlimited, 0 = paused, >0 = throttle
+    download_manager.bandwidth_limit = limit
+    return jsonify({"bandwidth_limit": download_manager.bandwidth_limit})
+
+
+# --- Init ---
+
+def create_app():
+    db.init_db()
+    db.reset_downloading_files()
+    # Load saved bandwidth limit (-1 = unlimited, 0 = paused, >0 = throttle)
+    # One-time migration: old "0 = unlimited" → new "-1 = unlimited"
+    if not db.get_setting("bw_migrated", ""):
+        saved_bw = db.get_setting("bandwidth_limit", "-1")
+        if saved_bw == "0":
+            db.set_setting("bandwidth_limit", "-1")
+        db.set_setting("bw_migrated", "1")
+    saved_bw = db.get_setting("bandwidth_limit", "-1")
+    download_manager.bandwidth_limit = int(saved_bw)
+    return app
+
+
+if __name__ == "__main__":
+    import signal
+    import socket
+    from werkzeug.serving import make_server
+
+    application = create_app()
+
+    port = int(os.environ.get("GRABIA_PORT", 5000))
+
+    # Use SO_REUSEADDR + SO_REUSEPORT to avoid "address already in use" on restart
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+    sock.bind(("127.0.0.1", port))
+    sock.listen(128)
+
+    server = make_server("127.0.0.1", port, application, threaded=True, fd=sock.fileno())
+
+    def _shutdown(signum, frame):
+        print("\n * Shutting down Grabia...")
+        # Poison all SSE queues so their handler threads can finish
+        with sse_lock:
+            for q in sse_queues:
+                try:
+                    q.put_nowait(None)
+                except queue.Full:
+                    pass
+        # Run shutdown in a thread — it blocks waiting for serve_forever()
+        # to exit, and serve_forever() runs in this (main) thread, so calling
+        # shutdown() here directly would deadlock.
+        threading.Thread(target=server.shutdown, daemon=True).start()
+
+    signal.signal(signal.SIGINT, _shutdown)
+    signal.signal(signal.SIGTERM, _shutdown)
+
+    print(f" * Serving Grabia on http://127.0.0.1:{port}")
+    server.serve_forever()
+    download_manager.stop()
+    sock.close()
+    print(" * Stopped.")
