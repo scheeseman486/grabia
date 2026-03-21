@@ -30,9 +30,14 @@ from downloader import download_manager
 
 app = Flask(__name__)
 
+def _data_dir():
+    """Return the data directory (for DB, secret key, etc.)."""
+    return os.environ.get("GRABIA_DATA_DIR") or os.path.dirname(os.path.abspath(__file__))
+
+
 def _get_secret_key():
     """Load or generate a persistent secret key."""
-    key_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".secret_key")
+    key_file = os.path.join(_data_dir(), ".secret_key")
     if os.path.exists(key_file):
         with open(key_file, "r") as f:
             return f.read().strip()
@@ -538,10 +543,12 @@ if __name__ == "__main__":
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-    sock.bind(("127.0.0.1", port))
+    host = os.environ.get("GRABIA_HOST", "127.0.0.1")
+
+    sock.bind((host, port))
     sock.listen(128)
 
-    server = make_server("127.0.0.1", port, application, threaded=True, fd=sock.fileno())
+    server = make_server(host, port, application, threaded=True, fd=sock.fileno())
 
     def _shutdown(signum, frame):
         print("\n * Shutting down Grabia...")
@@ -560,7 +567,7 @@ if __name__ == "__main__":
     signal.signal(signal.SIGINT, _shutdown)
     signal.signal(signal.SIGTERM, _shutdown)
 
-    print(f" * Serving Grabia on http://127.0.0.1:{port}")
+    print(f" * Serving Grabia on http://{host}:{port}")
     server.serve_forever()
     download_manager.stop()
     sock.close()

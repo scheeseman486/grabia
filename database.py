@@ -23,7 +23,8 @@ import json
 import time
 from werkzeug.security import generate_password_hash, check_password_hash
 
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "grabia.db")
+_DATA_DIR = os.environ.get("GRABIA_DATA_DIR") or os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.path.join(_DATA_DIR, "grabia.db")
 
 
 def get_db():
