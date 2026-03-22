@@ -515,16 +515,28 @@ def _run_scan(archive_id):
     manifest = {r["name"]: dict(r) for r in rows}
 
     summary = {"matched": 0, "conflict": 0, "unknown": 0, "missing": 0, "partial": 0}
-    matched_ids = []
-    conflict_ids = []
-    partial_ids = []
 
     total_manifest = len(manifest)
     processed = 0
+    # Batch DB writes: accumulate and commit periodically for live UI updates
+    BATCH_SIZE = 25
+    pending_writes = []
+
+    def _flush_writes():
+        """Commit accumulated DB writes and recompute archive status."""
+        if not pending_writes:
+            return
+        for sql, params in pending_writes:
+            conn.execute(sql, params)
+        conn.commit()
+        pending_writes.clear()
+        db.recompute_archive_status(archive_id)
+
     broadcast_sse("scan_progress", {"archive_id": archive_id, "phase": "verify", "current": 0, "total": total_manifest})
 
     for name, info in manifest.items():
         if _cancelled():
+            _flush_writes()
             _abort()
             return
 
@@ -552,21 +564,35 @@ def _run_scan(archive_id):
         has_md5 = bool(expected_md5) and has_size
 
         if not has_size and not has_md5:
-            conflict_ids.append((info["id"], f"Cannot verify: no size/hash in manifest (local file is {local_size} bytes)"))
+            pending_writes.append((
+                "UPDATE archive_files SET download_status = 'conflict', error_message = ? WHERE id = ?",
+                (f"Cannot verify: no size/hash in manifest (local file is {local_size} bytes)", info["id"]),
+            ))
             summary["conflict"] += 1
             processed += 1
+            if len(pending_writes) >= BATCH_SIZE:
+                _flush_writes()
             _progress()
             continue
 
         # Size check (fast)
         if has_size and local_size != expected_size:
             if local_size < expected_size:
-                partial_ids.append((info["id"], local_size))
+                pending_writes.append((
+                    "UPDATE archive_files SET download_status = 'pending', downloaded_bytes = ?, selected = 1, "
+                    "error_message = 'Partial download detected by scan' WHERE id = ?",
+                    (local_size, info["id"]),
+                ))
                 summary["partial"] += 1
             else:
-                conflict_ids.append((info["id"], f"Size mismatch: local {local_size} vs expected {expected_size}"))
+                pending_writes.append((
+                    "UPDATE archive_files SET download_status = 'conflict', error_message = ? WHERE id = ?",
+                    (f"Size mismatch: local {local_size} vs expected {expected_size}", info["id"]),
+                ))
                 summary["conflict"] += 1
             processed += 1
+            if len(pending_writes) >= BATCH_SIZE:
+                _flush_writes()
             _progress()
             continue
 
@@ -577,26 +603,45 @@ def _run_scan(archive_id):
                 with open(local_path, "rb") as f:
                     for chunk in iter(lambda: f.read(131072), b""):
                         if _cancelled():
+                            _flush_writes()
                             _abort()
                             return
                         md5.update(chunk)
                 if md5.hexdigest() != expected_md5:
-                    conflict_ids.append((info["id"], f"MD5 mismatch: local {md5.hexdigest()} vs expected {expected_md5}"))
+                    pending_writes.append((
+                        "UPDATE archive_files SET download_status = 'conflict', error_message = ? WHERE id = ?",
+                        (f"MD5 mismatch: local {md5.hexdigest()} vs expected {expected_md5}", info["id"]),
+                    ))
                     summary["conflict"] += 1
                     processed += 1
+                    if len(pending_writes) >= BATCH_SIZE:
+                        _flush_writes()
                     _progress()
                     continue
             except OSError as e:
-                conflict_ids.append((info["id"], f"Read error: {e}"))
+                pending_writes.append((
+                    "UPDATE archive_files SET download_status = 'conflict', error_message = ? WHERE id = ?",
+                    (f"Read error: {e}", info["id"]),
+                ))
                 summary["conflict"] += 1
                 processed += 1
+                if len(pending_writes) >= BATCH_SIZE:
+                    _flush_writes()
                 _progress()
                 continue
 
-        matched_ids.append((info["id"], local_size))
+        pending_writes.append((
+            "UPDATE archive_files SET download_status = 'completed', downloaded_bytes = ?, selected = 1 WHERE id = ?",
+            (local_size, info["id"]),
+        ))
         summary["matched"] += 1
         processed += 1
+        if len(pending_writes) >= BATCH_SIZE:
+            _flush_writes()
         _progress()
+
+    # Flush any remaining writes from verification phase
+    _flush_writes()
 
     # Scan for unknown files on disk
     broadcast_sse("scan_progress", {"archive_id": archive_id, "phase": "disk", "current": 0, "total": 0})
@@ -612,24 +657,7 @@ def _run_scan(archive_id):
                 unknown_files.append(rel)
                 summary["unknown"] += 1
 
-    # Apply changes
-    for file_id, size in matched_ids:
-        conn.execute(
-            "UPDATE archive_files SET download_status = 'completed', downloaded_bytes = ?, selected = 1 WHERE id = ?",
-            (size, file_id),
-        )
-    for file_id, local_size in partial_ids:
-        conn.execute(
-            "UPDATE archive_files SET download_status = 'pending', downloaded_bytes = ?, selected = 1, "
-            "error_message = 'Partial download detected by scan' WHERE id = ?",
-            (local_size, file_id),
-        )
-    for file_id, reason in conflict_ids:
-        conn.execute(
-            "UPDATE archive_files SET download_status = 'conflict', error_message = ? WHERE id = ?",
-            (reason, file_id),
-        )
-
+    # Insert unknown files
     max_pri = conn.execute(
         "SELECT COALESCE(MAX(download_priority), -1) FROM archive_files WHERE archive_id = ?",
         (archive_id,),

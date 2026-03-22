@@ -170,6 +170,8 @@
     // Track progress notification IDs per archive
     let scanNotifs = {}; // archive_id -> notif id
     let scanQueuedNotifs = {}; // archive_id -> notif id for "queued" message
+    let scanLastRefresh = {}; // archive_id -> timestamp of last UI refresh
+    const SCAN_REFRESH_INTERVAL = 3000; // refresh file list every 3s during scan
 
     function getArchiveName(archiveId) {
         const a = archives.find((x) => x.id === archiveId);
@@ -205,6 +207,13 @@
                     renderNotifList();
                 }
             }
+            // Periodically refresh file list & archive sidebar during scan
+            const now = Date.now();
+            if (!scanLastRefresh[archive_id] || now - scanLastRefresh[archive_id] >= SCAN_REFRESH_INTERVAL) {
+                scanLastRefresh[archive_id] = now;
+                if (currentArchiveId === archive_id) loadFiles();
+                refreshArchives();
+            }
         } else if (phase === "disk") {
             const notif = notifications.find((n) => n.id === scanNotifs[archive_id]);
             if (notif) {
@@ -222,6 +231,7 @@
                 notifications = notifications.filter((n) => n.id !== scanQueuedNotifs[archive_id]);
                 delete scanQueuedNotifs[archive_id];
             }
+            delete scanLastRefresh[archive_id];
             updateScanButton();
             // Add final summary notification
             const s = data.summary || {};
@@ -248,6 +258,7 @@
                 notifications = notifications.filter((n) => n.id !== scanQueuedNotifs[archive_id]);
                 delete scanQueuedNotifs[archive_id];
             }
+            delete scanLastRefresh[archive_id];
             addNotification(`Scan "${archiveName}": cancelled`, "info");
             updateScanButton();
             loadFiles();
@@ -261,6 +272,7 @@
                 notifications = notifications.filter((n) => n.id !== scanQueuedNotifs[archive_id]);
                 delete scanQueuedNotifs[archive_id];
             }
+            delete scanLastRefresh[archive_id];
             addNotification(`Scan "${archiveName}" failed: ${data.error || "Unknown error"}`, "error");
             updateScanButton();
         }
