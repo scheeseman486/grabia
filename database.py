@@ -116,6 +116,7 @@ def init_db():
         "bandwidth_limit": "0",
         "theme": "dark",
         "files_per_page": "50",
+        "sse_update_rate": "500",
     }
     for key, value in defaults.items():
         conn.execute(

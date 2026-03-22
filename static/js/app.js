@@ -33,7 +33,14 @@
     let dlState = "stopped";
     let dragSrcId = null;
     let dragSrcGroupId = null;
-    let collapsedGroups = new Set(); // group IDs that are collapsed
+    // Groups collapsed by default; store *expanded* group IDs in localStorage
+    let expandedGroups = new Set(
+        JSON.parse(localStorage.getItem("grabia_expanded_groups") || "[]")
+    );
+
+    function saveExpandedGroups() {
+        localStorage.setItem("grabia_expanded_groups", JSON.stringify([...expandedGroups]));
+    }
     let realBandwidth = -1; // tracks the actual backend bandwidth setting
     let lastProgressRefresh = 0; // timestamp of last throttled progress refresh
 
@@ -82,10 +89,26 @@
             const div = document.createElement("div");
             div.className = "notif-item notif-" + n.type;
             const ago = formatTimeAgo(n.time);
+            const hasProgress = n.progress !== undefined;
+            let progressHtml = "";
+            if (hasProgress) {
+                if (n.progress >= 0) {
+                    progressHtml = `<div class="notif-progress-track"><div class="notif-progress-fill" style="width:${n.progress}%"></div></div>`;
+                } else {
+                    progressHtml = `<div class="notif-progress-track"><div class="notif-progress-fill indeterminate"></div></div>`;
+                }
+            }
+            const cancelHtml = n.scanArchiveId
+                ? `<button class="notif-cancel" data-cancel-archive="${n.scanArchiveId}">Cancel</button>`
+                : "";
             div.innerHTML = `
                 <div class="notif-content">
                     <span class="notif-message">${escapeHtml(n.message)}</span>
-                    <span class="notif-time">${ago}</span>
+                    ${progressHtml}
+                    <span class="notif-time-row">
+                        <span class="notif-time">${ago}</span>
+                        ${cancelHtml}
+                    </span>
                 </div>
                 <button class="notif-dismiss" data-notif-id="${n.id}" title="Dismiss">
                     <svg viewBox="0 0 24 24" width="12" height="12"><path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z" fill="currentColor"/></svg>
@@ -95,6 +118,13 @@
                 e.stopPropagation();
                 removeNotification(n.id);
             });
+            const cancelBtn = div.querySelector(".notif-cancel");
+            if (cancelBtn) {
+                cancelBtn.addEventListener("click", (e) => {
+                    e.stopPropagation();
+                    cancelScan(parseInt(cancelBtn.dataset.cancelArchive));
+                });
+            }
             list.appendChild(div);
         });
     }
@@ -135,53 +165,83 @@
         }, 5000);
     }
 
-    // --- Scan Progress Toast ---
+    // --- Scan Progress Notification ---
 
-    let scanProgressToast = null;
+    // Track progress notification IDs per archive
+    let scanNotifs = {}; // archive_id -> notif id
 
-    function showScanProgress(current, total, phase) {
-        const container = document.querySelector("#toast-container");
-        if (!scanProgressToast || !scanProgressToast.parentNode) {
-            scanProgressToast = document.createElement("div");
-            scanProgressToast.className = "toast toast-info toast-progress";
-            scanProgressToast.innerHTML = `
-                <div class="toast-progress-content">
-                    <span class="toast-message">Scanning files...</span>
-                    <div class="toast-progress-bar-track">
-                        <div class="toast-progress-bar-fill"></div>
-                    </div>
-                    <span class="toast-progress-detail"></span>
-                </div>
-            `;
-            container.appendChild(scanProgressToast);
-            requestAnimationFrame(() => scanProgressToast.classList.add("toast-enter"));
-        }
+    function getArchiveName(archiveId) {
+        const a = archives.find((x) => x.id === archiveId);
+        return a ? (a.title || a.identifier) : "Archive #" + archiveId;
+    }
 
-        const msgEl = scanProgressToast.querySelector(".toast-message");
-        const fillEl = scanProgressToast.querySelector(".toast-progress-bar-fill");
-        const detailEl = scanProgressToast.querySelector(".toast-progress-detail");
+    function updateScanProgress(data) {
+        const { archive_id, phase, current, total } = data;
+        const archiveName = getArchiveName(archive_id);
 
         if (phase === "verify") {
             const pct = total > 0 ? Math.round((current / total) * 100) : 0;
-            msgEl.textContent = "Verifying files...";
-            fillEl.style.width = pct + "%";
-            detailEl.textContent = `${current} / ${total} files (${pct}%)`;
+            const msg = `Scanning "${archiveName}": ${current}/${total} (${pct}%)`;
+            if (!scanNotifs[archive_id]) {
+                // Create notification with toast
+                const nid = ++notifIdCounter;
+                scanNotifs[archive_id] = nid;
+                const notif = { id: nid, message: msg, type: "info", time: new Date(), progress: pct, scanArchiveId: archive_id };
+                notifications.unshift(notif);
+                renderNotifBadge();
+                renderNotifList();
+                showToast(`Scan started: "${archiveName}"`, "info");
+            } else {
+                const notif = notifications.find((n) => n.id === scanNotifs[archive_id]);
+                if (notif) {
+                    notif.message = msg;
+                    notif.progress = pct;
+                    renderNotifList();
+                }
+            }
         } else if (phase === "disk") {
-            msgEl.textContent = "Checking for unknown files...";
-            fillEl.style.width = "100%";
-            fillEl.classList.add("indeterminate");
-            detailEl.textContent = "";
+            const notif = notifications.find((n) => n.id === scanNotifs[archive_id]);
+            if (notif) {
+                notif.message = `Scanning "${archiveName}": checking for unknown files...`;
+                notif.progress = -1;
+                renderNotifList();
+            }
         } else if (phase === "done") {
-            removeScanProgress();
-        }
-    }
-
-    function removeScanProgress() {
-        if (scanProgressToast && scanProgressToast.parentNode) {
-            scanProgressToast.classList.add("toast-exit");
-            const ref = scanProgressToast;
-            setTimeout(() => ref.remove(), 300);
-            scanProgressToast = null;
+            // Remove progress notification
+            if (scanNotifs[archive_id]) {
+                notifications = notifications.filter((n) => n.id !== scanNotifs[archive_id]);
+                delete scanNotifs[archive_id];
+            }
+            // Add final summary notification
+            const s = data.summary || {};
+            const parts = [];
+            if (s.matched > 0) parts.push(`${s.matched} matched`);
+            if (s.partial > 0) parts.push(`${s.partial} partial`);
+            if (s.conflict > 0) parts.push(`${s.conflict} conflict`);
+            if (s.unknown > 0) parts.push(`${s.unknown} unknown`);
+            if (s.missing > 0) parts.push(`${s.missing} not on disk`);
+            if (parts.length === 0) {
+                addNotification(`Scan "${archiveName}": no files found on disk`, "info");
+            } else {
+                const type = s.conflict > 0 || s.unknown > 0 ? "warning" : "success";
+                addNotification(`Scan "${archiveName}": ` + parts.join(", "), type);
+            }
+            loadFiles();
+            refreshArchives();
+        } else if (phase === "cancelled") {
+            if (scanNotifs[archive_id]) {
+                notifications = notifications.filter((n) => n.id !== scanNotifs[archive_id]);
+                delete scanNotifs[archive_id];
+            }
+            addNotification(`Scan "${archiveName}": cancelled`, "info");
+            loadFiles();
+            refreshArchives();
+        } else if (phase === "error") {
+            if (scanNotifs[archive_id]) {
+                notifications = notifications.filter((n) => n.id !== scanNotifs[archive_id]);
+                delete scanNotifs[archive_id];
+            }
+            addNotification(`Scan "${archiveName}" failed: ${data.error || "Unknown error"}`, "error");
         }
     }
 
@@ -309,7 +369,14 @@
 
     function applyTheme(theme) {
         document.documentElement.setAttribute("data-theme", theme);
+        localStorage.setItem("grabia_theme", theme);
     }
+
+    // Apply cached theme immediately to avoid flash
+    (function () {
+        const cached = localStorage.getItem("grabia_theme");
+        if (cached) document.documentElement.setAttribute("data-theme", cached);
+    })();
 
     // --- SSE ---
 
@@ -372,7 +439,7 @@
 
         es.addEventListener("scan_progress", (e) => {
             const data = JSON.parse(e.data);
-            showScanProgress(data.current, data.total, data.phase);
+            updateScanProgress(data);
         });
 
         es.addEventListener("archive_added", () => refreshArchives());
@@ -623,7 +690,7 @@
         // Render groups first
         groups.forEach((g, gIdx) => {
             const groupArchives = archives.filter((a) => a.group_id === g.id);
-            const collapsed = collapsedGroups.has(g.id);
+            const collapsed = !expandedGroups.has(g.id);
 
             const header = document.createElement("li");
             header.className = "group-header" + (collapsed ? " collapsed" : "");
@@ -666,8 +733,9 @@
                 else if (action === "move-down") moveGroup(gIdx, gIdx + 1);
                 else if (!e.target.closest(".group-actions") && !e.target.closest(".group-grip")) {
                     // Toggle collapse
-                    if (collapsedGroups.has(g.id)) collapsedGroups.delete(g.id);
-                    else collapsedGroups.add(g.id);
+                    if (expandedGroups.has(g.id)) expandedGroups.delete(g.id);
+                    else expandedGroups.add(g.id);
+                    saveExpandedGroups();
                     renderArchiveList();
                 }
             });
@@ -789,34 +857,19 @@
 
     async function scanExistingFiles() {
         if (!currentArchiveId) return;
-        const btn = $("#btn-scan-files");
-        btn.disabled = true;
-        btn.textContent = "Scanning...";
-
         try {
-            const archive = archives.find((a) => a.id === currentArchiveId);
-            const archiveName = archive ? (archive.title || archive.identifier) : "Unknown";
-            const result = await api("POST", `/api/archives/${currentArchiveId}/scan`);
-            const s = result.summary;
-            const parts = [];
-            if (s.matched > 0) parts.push(`${s.matched} matched`);
-            if (s.partial > 0) parts.push(`${s.partial} partial`);
-            if (s.conflict > 0) parts.push(`${s.conflict} conflict`);
-            if (s.unknown > 0) parts.push(`${s.unknown} unknown`);
-            if (s.missing > 0) parts.push(`${s.missing} not on disk`);
-            if (parts.length === 0) {
-                addNotification(`Scan "${archiveName}": no files found on disk`, "info");
-            } else {
-                const type = s.conflict > 0 || s.unknown > 0 ? "warning" : "success";
-                addNotification(`Scan "${archiveName}": ` + parts.join(", "), type);
-            }
-            await loadFiles();
-            await refreshArchives();
+            await api("POST", `/api/archives/${currentArchiveId}/scan`);
+            // Scan is now queued — progress and results come via SSE
         } catch (e) {
             addNotification("File scan failed: " + e.message, "error");
-        } finally {
-            btn.disabled = false;
-            btn.innerHTML = '<svg viewBox="0 0 24 24" width="16" height="16"><path d="M15.5 14h-.79l-.28-.27A6.471 6.471 0 0016 9.5 6.5 6.5 0 109.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z" fill="currentColor"></path></svg> Scan Existing Files';
+        }
+    }
+
+    async function cancelScan(archiveId) {
+        try {
+            await api("POST", `/api/archives/${archiveId}/scan/cancel`);
+        } catch (e) {
+            // Scan may have already finished
         }
     }
 
@@ -1353,6 +1406,7 @@
             max_retries: $("#set-max-retries").value,
             retry_delay: $("#set-retry-delay").value,
             files_per_page: $("#set-files-per-page").value,
+            sse_update_rate: $("#set-sse-update-rate").value,
             theme: $("#set-theme").value,
             use_http: $("#set-use-http").checked,
             confirm_reset_order: $("#set-confirm-reset-order").checked,
@@ -1378,6 +1432,7 @@
             $("#set-max-retries").value = s.max_retries || "3";
             $("#set-retry-delay").value = s.retry_delay || "5";
             $("#set-files-per-page").value = s.files_per_page || "50";
+            $("#set-sse-update-rate").value = s.sse_update_rate || "500";
             $("#set-theme").value = s.theme || "dark";
             $("#set-use-http").checked = s.use_http === "1";
             $("#http-warning").style.display = s.use_http === "1" ? "block" : "none";
@@ -1423,6 +1478,7 @@
             max_retries: $("#set-max-retries").value,
             retry_delay: $("#set-retry-delay").value,
             files_per_page: $("#set-files-per-page").value,
+            sse_update_rate: $("#set-sse-update-rate").value,
             theme: $("#set-theme").value,
             use_http: $("#set-use-http").checked ? "1" : "0",
             confirm_reset_order: $("#set-confirm-reset-order").checked ? "1" : "0",

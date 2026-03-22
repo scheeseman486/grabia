@@ -429,21 +429,71 @@ def refresh_archive(archive_id):
     return jsonify({"ok": True, "summary": summary})
 
 
-@app.route("/api/archives/<int:archive_id>/scan", methods=["POST"])
-@login_required
-def scan_existing_files(archive_id):
-    """Scan the local download folder for files matching this archive's manifest."""
+# --- Scan Queue ---
+
+_scan_queue = queue.Queue()
+_scan_cancel = {}  # archive_id -> threading.Event
+_scan_lock = threading.Lock()
+
+
+def _scan_worker():
+    """Background worker that processes scan jobs sequentially."""
+    while True:
+        archive_id = _scan_queue.get()
+        try:
+            _run_scan(archive_id)
+        except Exception as e:
+            broadcast_sse("scan_progress", {
+                "archive_id": archive_id, "phase": "error",
+                "error": str(e),
+            })
+        finally:
+            with _scan_lock:
+                _scan_cancel.pop(archive_id, None)
+            _scan_queue.task_done()
+
+
+_scan_thread = threading.Thread(target=_scan_worker, daemon=True)
+_scan_thread.start()
+
+
+def _run_scan(archive_id):
+    """Execute the actual scan logic in a background thread."""
+    cancel_evt = _scan_cancel.get(archive_id)
     archive = db.get_archive(archive_id)
     if not archive:
-        return jsonify({"error": "Not found"}), 404
+        return
+
+    # Read update rate from settings (milliseconds -> seconds)
+    update_rate = int(db.get_setting("sse_update_rate", "500")) / 1000.0
 
     download_dir = db.get_setting("download_dir", os.path.expanduser("~/ia-downloads"))
     base_dir = os.path.realpath(os.path.join(download_dir, archive["identifier"]))
 
     if not os.path.isdir(base_dir):
-        return jsonify({"error": f"Download folder not found: {base_dir}"}), 404
+        broadcast_sse("scan_progress", {
+            "archive_id": archive_id, "phase": "error",
+            "error": f"Download folder not found: {base_dir}",
+        })
+        return
 
-    # Clean slate: wipe all scan-originated rows and reset scan-set statuses on manifest files
+    def _cancelled():
+        return cancel_evt and cancel_evt.is_set()
+
+    def _abort():
+        broadcast_sse("scan_progress", {"archive_id": archive_id, "phase": "cancelled", "current": processed, "total": total_manifest})
+        conn.close()
+
+    # Time-based progress throttle
+    last_progress = [0.0]  # mutable for closure
+
+    def _progress():
+        now = time.monotonic()
+        if now - last_progress[0] >= update_rate or processed == total_manifest:
+            broadcast_sse("scan_progress", {"archive_id": archive_id, "phase": "verify", "current": processed, "total": total_manifest})
+            last_progress[0] = now
+
+    # Clean slate
     conn = db.get_db()
     conn.execute(
         "DELETE FROM archive_files WHERE archive_id = ? AND origin = 'scan'",
@@ -456,7 +506,7 @@ def scan_existing_files(archive_id):
     )
     conn.commit()
 
-    # Ground truth: only IA manifest files (origin='manifest')
+    # Ground truth
     rows = conn.execute(
         "SELECT id, name, size, md5, download_status FROM archive_files "
         "WHERE archive_id = ? AND origin = 'manifest'",
@@ -465,44 +515,39 @@ def scan_existing_files(archive_id):
     manifest = {r["name"]: dict(r) for r in rows}
 
     summary = {"matched": 0, "conflict": 0, "unknown": 0, "missing": 0, "partial": 0}
-    matched_ids = []     # (file_id, local_size) — exact match
-    conflict_ids = []    # (file_id, reason) — file exists but doesn't match
-    partial_ids = []     # (file_id, local_size) — partially downloaded
-    seen_paths = set()   # track manifest files found on disk
+    matched_ids = []
+    conflict_ids = []
+    partial_ids = []
 
     total_manifest = len(manifest)
     processed = 0
     broadcast_sse("scan_progress", {"archive_id": archive_id, "phase": "verify", "current": 0, "total": total_manifest})
 
     for name, info in manifest.items():
+        if _cancelled():
+            _abort()
+            return
+
         local_path = os.path.realpath(os.path.join(base_dir, name))
-        # Path traversal guard
         if not local_path.startswith(base_dir + os.sep) and local_path != base_dir:
             continue
 
         if not os.path.isfile(local_path):
             summary["missing"] += 1
             processed += 1
-            if processed % 10 == 0 or processed == total_manifest:
-                broadcast_sse("scan_progress", {"archive_id": archive_id, "phase": "verify", "current": processed, "total": total_manifest})
+            _progress()
             continue
 
-        seen_paths.add(name)
         local_size = os.path.getsize(local_path)
         expected_size = info["size"]
         expected_md5 = info["md5"]
 
         if info["download_status"] == "completed":
-            # Already marked completed, skip
             summary["matched"] += 1
             processed += 1
-            if processed % 10 == 0 or processed == total_manifest:
-                broadcast_sse("scan_progress", {"archive_id": archive_id, "phase": "verify", "current": processed, "total": total_manifest})
+            _progress()
             continue
 
-        # We need at least one verifiable property to confirm a match.
-        # IA metadata files (e.g. _meta.xml, _files.xml) often have size=0
-        # and no md5 — we can't verify those, so treat them as conflicts.
         has_size = expected_size > 0
         has_md5 = bool(expected_md5) and has_size
 
@@ -510,58 +555,56 @@ def scan_existing_files(archive_id):
             conflict_ids.append((info["id"], f"Cannot verify: no size/hash in manifest (local file is {local_size} bytes)"))
             summary["conflict"] += 1
             processed += 1
-            if processed % 10 == 0 or processed == total_manifest:
-                broadcast_sse("scan_progress", {"archive_id": archive_id, "phase": "verify", "current": processed, "total": total_manifest})
+            _progress()
             continue
 
-        # Size check first (fast)
+        # Size check (fast)
         if has_size and local_size != expected_size:
             if local_size < expected_size:
-                # Smaller than expected — likely a partial download
                 partial_ids.append((info["id"], local_size))
                 summary["partial"] += 1
             else:
                 conflict_ids.append((info["id"], f"Size mismatch: local {local_size} vs expected {expected_size}"))
                 summary["conflict"] += 1
             processed += 1
-            if processed % 10 == 0 or processed == total_manifest:
-                broadcast_sse("scan_progress", {"archive_id": archive_id, "phase": "verify", "current": processed, "total": total_manifest})
+            _progress()
             continue
 
-        # MD5 check (slower, but definitive)
+        # MD5 check — 128KB chunks for better HDD throughput
         if has_md5:
             md5 = hashlib.md5()
             try:
                 with open(local_path, "rb") as f:
-                    for chunk in iter(lambda: f.read(8192), b""):
+                    for chunk in iter(lambda: f.read(131072), b""):
+                        if _cancelled():
+                            _abort()
+                            return
                         md5.update(chunk)
                 if md5.hexdigest() != expected_md5:
                     conflict_ids.append((info["id"], f"MD5 mismatch: local {md5.hexdigest()} vs expected {expected_md5}"))
                     summary["conflict"] += 1
                     processed += 1
-                    if processed % 10 == 0 or processed == total_manifest:
-                        broadcast_sse("scan_progress", {"archive_id": archive_id, "phase": "verify", "current": processed, "total": total_manifest})
+                    _progress()
                     continue
             except OSError as e:
                 conflict_ids.append((info["id"], f"Read error: {e}"))
                 summary["conflict"] += 1
                 processed += 1
-                if processed % 10 == 0 or processed == total_manifest:
-                    broadcast_sse("scan_progress", {"archive_id": archive_id, "phase": "verify", "current": processed, "total": total_manifest})
+                _progress()
                 continue
 
-        # Match — size matches (and md5 if available)
         matched_ids.append((info["id"], local_size))
         summary["matched"] += 1
-
         processed += 1
-        if processed % 10 == 0 or processed == total_manifest:
-            broadcast_sse("scan_progress", {"archive_id": archive_id, "phase": "verify", "current": processed, "total": total_manifest})
+        _progress()
 
-    # Scan for unknown files on disk not in manifest
+    # Scan for unknown files on disk
     broadcast_sse("scan_progress", {"archive_id": archive_id, "phase": "disk", "current": 0, "total": 0})
     unknown_files = []
     for root, _dirs, files in os.walk(base_dir):
+        if _cancelled():
+            _abort()
+            return
         for fname in files:
             full = os.path.join(root, fname)
             rel = os.path.relpath(full, base_dir)
@@ -587,7 +630,6 @@ def scan_existing_files(archive_id):
             (reason, file_id),
         )
 
-    # Insert unknown files into manifest with 'unknown' status and forced lowest priority
     max_pri = conn.execute(
         "SELECT COALESCE(MAX(download_priority), -1) FROM archive_files WHERE archive_id = ?",
         (archive_id,),
@@ -610,13 +652,50 @@ def scan_existing_files(archive_id):
     conn.commit()
     conn.close()
 
-    # Update archive status and file count
     db.recompute_archive_file_count(archive_id)
     db.recompute_archive_status(archive_id)
     updated = db.get_archive(archive_id)
-    broadcast_sse("scan_progress", {"archive_id": archive_id, "phase": "done", "current": total_manifest, "total": total_manifest})
+    broadcast_sse("scan_progress", {
+        "archive_id": archive_id, "phase": "done",
+        "current": total_manifest, "total": total_manifest,
+        "summary": summary,
+    })
     broadcast_sse("archive_updated", updated)
-    return jsonify({"ok": True, "summary": summary, "unknown_files": unknown_files})
+
+
+@app.route("/api/archives/<int:archive_id>/scan", methods=["POST"])
+@login_required
+def scan_existing_files(archive_id):
+    """Queue a scan of the local download folder for files matching this archive's manifest."""
+    archive = db.get_archive(archive_id)
+    if not archive:
+        return jsonify({"error": "Not found"}), 404
+
+    download_dir = db.get_setting("download_dir", os.path.expanduser("~/ia-downloads"))
+    base_dir = os.path.realpath(os.path.join(download_dir, archive["identifier"]))
+    if not os.path.isdir(base_dir):
+        return jsonify({"error": f"Download folder not found: {base_dir}"}), 404
+
+    with _scan_lock:
+        if archive_id in _scan_cancel:
+            return jsonify({"error": "Scan already queued for this archive"}), 409
+        evt = threading.Event()
+        _scan_cancel[archive_id] = evt
+
+    _scan_queue.put(archive_id)
+    return jsonify({"ok": True, "queued": True})
+
+
+@app.route("/api/archives/<int:archive_id>/scan/cancel", methods=["POST"])
+@login_required
+def cancel_scan(archive_id):
+    """Cancel a running or queued scan."""
+    with _scan_lock:
+        evt = _scan_cancel.get(archive_id)
+        if evt:
+            evt.set()
+            return jsonify({"ok": True})
+    return jsonify({"error": "No active scan for this archive"}), 404
 
 
 @app.route("/api/files/<int:file_id>/force-resume", methods=["POST"])
