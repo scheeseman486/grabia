@@ -4,7 +4,7 @@ services:
     ports:
       - "5000:5000"
     volumes:
-      - grabia-data:/app/data
+      - /mnt/user/appdata/grabia:/app/data
       - /mnt/user/grabia_downloads:/root/ia-downloads
     environment:
       - GRABIA_PORT=5000
@@ -13,5 +13,3 @@ services:
       net.unraid.docker.icon: "https://raw.githubusercontent.com/scheeseman486/grabia/main/static/grabia_icon.png"
     restart: unless-stopped
 
-volumes:
-  grabia-data:
