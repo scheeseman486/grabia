@@ -161,6 +161,31 @@ def init_db():
           AND md5 = '' AND sha1 = '' AND format = '' AND source = '' AND mtime = ''
     """)
 
+    # Fix archives stuck on 'downloading' when nothing is actually downloading.
+    # On startup the downloader is not running, so no files can be in-flight.
+    # Recalculate status for any archive marked 'downloading'.
+    stuck = conn.execute(
+        "SELECT id FROM archives WHERE status = 'downloading'"
+    ).fetchall()
+    for row in stuck:
+        aid = row["id"]
+        counts = conn.execute("""
+            SELECT
+                COUNT(*) as total,
+                SUM(CASE WHEN download_status = 'completed' THEN 1 ELSE 0 END) as completed,
+                SUM(CASE WHEN download_status = 'failed' THEN 1 ELSE 0 END) as failed,
+                SUM(CASE WHEN download_status = 'conflict' THEN 1 ELSE 0 END) as conflict
+            FROM archive_files
+            WHERE archive_id = ? AND selected = 1 AND origin = 'manifest'
+        """, (aid,)).fetchone()
+        if counts["total"] > 0:
+            if counts["completed"] == counts["total"]:
+                conn.execute("UPDATE archives SET status = 'completed' WHERE id = ?", (aid,))
+            elif counts["completed"] + counts["failed"] + counts["conflict"] == counts["total"]:
+                conn.execute("UPDATE archives SET status = 'partial' WHERE id = ?", (aid,))
+            else:
+                conn.execute("UPDATE archives SET status = 'idle' WHERE id = ?", (aid,))
+
     conn.commit()
     conn.close()
 
