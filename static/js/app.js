@@ -24,6 +24,7 @@
 
     // --- State ---
     let archives = [];
+    let groups = [];
     let currentArchiveId = null;
     let currentPage = 1;
     let currentSort = "priority";
@@ -31,8 +32,113 @@
     let fileSearchTimer = null;
     let dlState = "stopped";
     let dragSrcId = null;
+    let dragSrcGroupId = null;
+    let collapsedGroups = new Set(); // group IDs that are collapsed
     let realBandwidth = -1; // tracks the actual backend bandwidth setting
     let lastProgressRefresh = 0; // timestamp of last throttled progress refresh
+
+    // --- Notifications ---
+    let notifications = [];
+    let notifIdCounter = 0;
+
+    function addNotification(message, type = "info") {
+        const notif = { id: ++notifIdCounter, message, type, time: new Date() };
+        notifications.unshift(notif);
+        renderNotifBadge();
+        renderNotifList();
+        showToast(message, type);
+    }
+
+    function removeNotification(id) {
+        notifications = notifications.filter((n) => n.id !== id);
+        renderNotifBadge();
+        renderNotifList();
+    }
+
+    function clearAllNotifications() {
+        notifications = [];
+        renderNotifBadge();
+        renderNotifList();
+    }
+
+    function renderNotifBadge() {
+        const badge = $("#notif-badge");
+        if (notifications.length > 0) {
+            badge.textContent = notifications.length > 99 ? "99+" : notifications.length;
+            badge.style.display = "";
+        } else {
+            badge.style.display = "none";
+        }
+    }
+
+    function renderNotifList() {
+        const list = $("#notif-list");
+        if (notifications.length === 0) {
+            list.innerHTML = '<div class="notif-empty">No notifications</div>';
+            return;
+        }
+        list.innerHTML = "";
+        notifications.forEach((n) => {
+            const div = document.createElement("div");
+            div.className = "notif-item notif-" + n.type;
+            const ago = formatTimeAgo(n.time);
+            div.innerHTML = `
+                <div class="notif-content">
+                    <span class="notif-message">${escapeHtml(n.message)}</span>
+                    <span class="notif-time">${ago}</span>
+                </div>
+                <button class="notif-dismiss" data-notif-id="${n.id}" title="Dismiss">
+                    <svg viewBox="0 0 24 24" width="12" height="12"><path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z" fill="currentColor"/></svg>
+                </button>
+            `;
+            div.querySelector(".notif-dismiss").addEventListener("click", (e) => {
+                e.stopPropagation();
+                removeNotification(n.id);
+            });
+            list.appendChild(div);
+        });
+    }
+
+    function formatTimeAgo(date) {
+        const secs = Math.floor((Date.now() - date.getTime()) / 1000);
+        if (secs < 5) return "just now";
+        if (secs < 60) return secs + "s ago";
+        const mins = Math.floor(secs / 60);
+        if (mins < 60) return mins + "m ago";
+        const hrs = Math.floor(mins / 60);
+        return hrs + "h ago";
+    }
+
+    function showToast(message, type = "info") {
+        const container = $("#toast-container");
+        const toast = document.createElement("div");
+        toast.className = "toast toast-" + type;
+        toast.innerHTML = `
+            <span class="toast-message">${escapeHtml(message)}</span>
+            <button class="toast-close" title="Close">
+                <svg viewBox="0 0 24 24" width="12" height="12"><path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z" fill="currentColor"/></svg>
+            </button>
+        `;
+        toast.querySelector(".toast-close").addEventListener("click", () => {
+            toast.classList.add("toast-exit");
+            setTimeout(() => toast.remove(), 300);
+        });
+        container.appendChild(toast);
+        // Trigger entrance animation
+        requestAnimationFrame(() => toast.classList.add("toast-enter"));
+        // Auto-dismiss after 5 seconds
+        setTimeout(() => {
+            if (toast.parentNode) {
+                toast.classList.add("toast-exit");
+                setTimeout(() => toast.remove(), 300);
+            }
+        }, 5000);
+    }
+
+    function toggleNotifPopup() {
+        const popup = $("#notif-popup");
+        popup.classList.toggle("open");
+    }
 
     // --- DOM refs ---
     const $ = (sel) => document.querySelector(sel);
@@ -207,6 +313,7 @@
         es.addEventListener("archive_updated", () => refreshArchives());
         es.addEventListener("archive_removed", () => refreshArchives());
         es.addEventListener("archives_reordered", () => refreshArchives());
+        es.addEventListener("groups_changed", () => refreshGroups());
         es.addEventListener("settings_updated", (e) => {
             const s = JSON.parse(e.data);
             if (s.theme) applyTheme(s.theme);
@@ -309,6 +416,13 @@
         } catch (e) { /* ignore */ }
     }
 
+    async function refreshGroups() {
+        try {
+            groups = await api("GET", "/api/groups");
+            renderArchiveList();
+        } catch (e) { /* ignore */ }
+    }
+
     function updateDetailProgressFromData(p) {
         const prog = $("#detail-progress-meta");
         if (p.downloaded_bytes > 0 || p.completed_files > 0 || p.selected_files > 0) {
@@ -328,8 +442,110 @@
     }
 
 
+    function buildArchiveItem(a, idx, listScope) {
+        const li = document.createElement("li");
+        li.className = "archive-item";
+        li.dataset.id = a.id;
+        li.draggable = true;
+        li.innerHTML = `
+            <div class="archive-grip" title="Drag to reorder">
+                <div class="grip-dots"><span></span><span></span></div>
+                <div class="grip-dots"><span></span><span></span></div>
+                <div class="grip-dots"><span></span><span></span></div>
+            </div>
+            <div class="archive-checkbox" title="Enable download">
+                <input type="checkbox" ${a.download_enabled ? "checked" : ""} data-action="toggle-dl">
+            </div>
+            <div class="archive-info" data-action="open">
+                <div class="archive-title">${escapeHtml(a.title || a.identifier)}</div>
+                <div class="archive-meta">
+                    <span>${a.files_count} files</span>
+                    <span>${formatBytes(a.total_size)}</span>
+                    <span>${a.identifier}</span>
+                </div>
+                ${a.selected_files > 0 ? `<div class="archive-progress-meta">${a.completed_files}/${a.selected_files} files \u2022 ${formatBytes(a.downloaded_bytes)} / ${formatBytes(a.selected_size)}${a.selected_size > 0 ? ` \u2022 ${((a.downloaded_bytes / a.selected_size) * 100).toFixed(1)}%` : ""}</div>` : ""}
+            </div>
+            <span class="archive-status ${a.status}">${a.status}</span>
+            <div class="archive-actions">
+                <button data-action="retry" title="Retry failed files" class="retry" style="display:${a.status === 'partial' || a.status === 'failed' ? 'flex' : 'none'}">
+                    <svg viewBox="0 0 24 24" width="16" height="16"><path d="M17.65 6.35A7.958 7.958 0 0012 4c-4.42 0-7.99 3.58-7.99 8s3.57 8 7.99 8c3.73 0 6.84-2.55 7.73-6h-2.08A5.99 5.99 0 0112 18c-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z" fill="currentColor"/></svg>
+                </button>
+                <button data-action="move-group" title="Move to group">
+                    <svg viewBox="0 0 24 24" width="16" height="16"><path d="M20 6h-8l-2-2H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2zm0 12H4V8h16v10z" fill="currentColor"/></svg>
+                </button>
+                <button data-action="move-up" title="Move up" ${idx === 0 || listScope[idx - 1].download_enabled !== a.download_enabled ? "disabled" : ""}>
+                    <svg viewBox="0 0 24 24" width="16" height="16"><path d="M7.41 15.41L12 10.83l4.59 4.58L18 14l-6-6-6 6z" fill="currentColor"/></svg>
+                </button>
+                <button data-action="move-down" title="Move down" ${idx === listScope.length - 1 || listScope[idx + 1].download_enabled !== a.download_enabled ? "disabled" : ""}>
+                    <svg viewBox="0 0 24 24" width="16" height="16"><path d="M7.41 8.59L12 13.17l4.59-4.58L18 10l-6 6-6-6z" fill="currentColor"/></svg>
+                </button>
+                <button data-action="delete" class="delete" title="Remove">
+                    <svg viewBox="0 0 24 24" width="16" height="16"><path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z" fill="currentColor"/></svg>
+                </button>
+            </div>
+        `;
+
+        // Event delegation
+        li.addEventListener("click", (e) => {
+            const action = e.target.closest("[data-action]")?.dataset.action;
+            if (action === "toggle-dl") {
+                toggleArchiveDownload(a.id, e.target.checked);
+            } else if (action === "open") {
+                openArchiveDetail(a.id);
+            } else if (action === "move-up") {
+                moveArchive(archives.indexOf(a), archives.indexOf(a) - 1);
+            } else if (action === "move-down") {
+                moveArchive(archives.indexOf(a), archives.indexOf(a) + 1);
+            } else if (action === "retry") {
+                retryArchive(a.id);
+            } else if (action === "delete") {
+                confirmDelete(a);
+            } else if (action === "move-group") {
+                openMoveToGroup(a);
+            }
+        });
+
+        // Drag and drop
+        li.addEventListener("dragstart", (e) => {
+            dragSrcId = a.id;
+            dragSrcGroupId = null; // not a group drag
+            li.classList.add("dragging");
+            e.dataTransfer.effectAllowed = "move";
+        });
+        li.addEventListener("dragend", () => {
+            li.classList.remove("dragging");
+            $$(".archive-item").forEach((el) => el.classList.remove("drag-over"));
+        });
+        li.addEventListener("dragover", (e) => {
+            if (dragSrcGroupId !== null) return; // don't accept group drags on archives
+            e.preventDefault();
+            e.dataTransfer.dropEffect = "move";
+            li.classList.add("drag-over");
+        });
+        li.addEventListener("dragleave", () => li.classList.remove("drag-over"));
+        li.addEventListener("drop", (e) => {
+            e.preventDefault();
+            li.classList.remove("drag-over");
+            if (dragSrcGroupId !== null) return; // ignore group drops
+            if (dragSrcId !== null && dragSrcId !== a.id) {
+                const src = archives.find((x) => x.id === dragSrcId);
+                if (src && src.download_enabled === a.download_enabled) {
+                    const order = archives.map((x) => x.id);
+                    const fromIdx = order.indexOf(dragSrcId);
+                    const toIdx = order.indexOf(a.id);
+                    order.splice(fromIdx, 1);
+                    order.splice(toIdx, 0, dragSrcId);
+                    api("POST", "/api/archives/reorder", { order });
+                }
+                dragSrcId = null;
+            }
+        });
+
+        return li;
+    }
+
     function renderArchiveList() {
-        if (archives.length === 0) {
+        if (archives.length === 0 && groups.length === 0) {
             emptyState.style.display = "flex";
             archiveListEl.style.display = "none";
             return;
@@ -338,99 +554,113 @@
         archiveListEl.style.display = "flex";
         archiveListEl.innerHTML = "";
 
-        archives.forEach((a, idx) => {
-            const li = document.createElement("li");
-            li.className = "archive-item";
-            li.dataset.id = a.id;
-            li.draggable = true;
-            li.innerHTML = `
-                <div class="archive-grip" title="Drag to reorder">
-                    <div class="grip-dots"><span></span><span></span></div>
-                    <div class="grip-dots"><span></span><span></span></div>
-                    <div class="grip-dots"><span></span><span></span></div>
-                </div>
-                <div class="archive-checkbox" title="Enable download">
-                    <input type="checkbox" ${a.download_enabled ? "checked" : ""} data-action="toggle-dl">
-                </div>
-                <div class="archive-info" data-action="open">
-                    <div class="archive-title">${escapeHtml(a.title || a.identifier)}</div>
-                    <div class="archive-meta">
-                        <span>${a.files_count} files</span>
-                        <span>${formatBytes(a.total_size)}</span>
-                        <span>${a.identifier}</span>
+        // Render groups first
+        groups.forEach((g, gIdx) => {
+            const groupArchives = archives.filter((a) => a.group_id === g.id);
+            const collapsed = collapsedGroups.has(g.id);
+
+            const header = document.createElement("li");
+            header.className = "group-header" + (collapsed ? " collapsed" : "");
+            header.dataset.groupId = g.id;
+            header.draggable = true;
+            header.innerHTML = `
+                <div class="group-header-left">
+                    <div class="group-grip" title="Drag to reorder group">
+                        <div class="grip-dots"><span></span><span></span></div>
+                        <div class="grip-dots"><span></span><span></span></div>
+                        <div class="grip-dots"><span></span><span></span></div>
                     </div>
-                    ${a.selected_files > 0 ? `<div class="archive-progress-meta">${a.completed_files}/${a.selected_files} files \u2022 ${formatBytes(a.downloaded_bytes)} / ${formatBytes(a.selected_size)}${a.selected_size > 0 ? ` \u2022 ${((a.downloaded_bytes / a.selected_size) * 100).toFixed(1)}%` : ""}</div>` : ""}
+                    <svg class="group-chevron" viewBox="0 0 24 24" width="14" height="14"><path d="M7.41 8.59L12 13.17l4.59-4.58L18 10l-6 6-6-6z" fill="currentColor"/></svg>
+                    <svg class="group-icon" viewBox="0 0 24 24" width="16" height="16"><path d="M20 6h-8l-2-2H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2zm0 12H4V8h16v10z" fill="currentColor"/></svg>
+                    <span class="group-name">${escapeHtml(g.name)}</span>
+                    <span class="group-count">${groupArchives.length}</span>
                 </div>
-                <span class="archive-status ${a.status}">${a.status}</span>
-                <div class="archive-actions">
-                    <button data-action="retry" title="Retry failed files" class="retry" style="display:${a.status === 'partial' || a.status === 'failed' ? 'flex' : 'none'}">
-                        <svg viewBox="0 0 24 24" width="16" height="16"><path d="M17.65 6.35A7.958 7.958 0 0012 4c-4.42 0-7.99 3.58-7.99 8s3.57 8 7.99 8c3.73 0 6.84-2.55 7.73-6h-2.08A5.99 5.99 0 0112 18c-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z" fill="currentColor"/></svg>
+                <div class="group-actions">
+                    <button data-group-action="move-up" title="Move group up" ${gIdx === 0 ? "disabled" : ""}>
+                        <svg viewBox="0 0 24 24" width="14" height="14"><path d="M7.41 15.41L12 10.83l4.59 4.58L18 14l-6-6-6 6z" fill="currentColor"/></svg>
                     </button>
-                    <button data-action="move-up" title="Move up" ${idx === 0 || archives[idx - 1].download_enabled !== a.download_enabled ? "disabled" : ""}>
-                        <svg viewBox="0 0 24 24" width="16" height="16"><path d="M7.41 15.41L12 10.83l4.59 4.58L18 14l-6-6-6 6z" fill="currentColor"/></svg>
+                    <button data-group-action="move-down" title="Move group down" ${gIdx === groups.length - 1 ? "disabled" : ""}>
+                        <svg viewBox="0 0 24 24" width="14" height="14"><path d="M7.41 8.59L12 13.17l4.59-4.58L18 10l-6 6-6-6z" fill="currentColor"/></svg>
                     </button>
-                    <button data-action="move-down" title="Move down" ${idx === archives.length - 1 || archives[idx + 1].download_enabled !== a.download_enabled ? "disabled" : ""}>
-                        <svg viewBox="0 0 24 24" width="16" height="16"><path d="M7.41 8.59L12 13.17l4.59-4.58L18 10l-6 6-6-6z" fill="currentColor"/></svg>
+                    <button data-group-action="rename" title="Rename group">
+                        <svg viewBox="0 0 24 24" width="14" height="14"><path d="M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zM20.71 7.04c.39-.39.39-1.02 0-1.41l-2.34-2.34c-.39-.39-1.02-.39-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z" fill="currentColor"/></svg>
                     </button>
-                    <button data-action="delete" class="delete" title="Remove">
-                        <svg viewBox="0 0 24 24" width="16" height="16"><path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z" fill="currentColor"/></svg>
+                    <button data-group-action="delete" class="delete" title="Delete group">
+                        <svg viewBox="0 0 24 24" width="14" height="14"><path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z" fill="currentColor"/></svg>
                     </button>
                 </div>
             `;
 
-            // Event delegation
-            li.addEventListener("click", (e) => {
-                const action = e.target.closest("[data-action]")?.dataset.action;
-                if (action === "toggle-dl") {
-                    toggleArchiveDownload(a.id, e.target.checked);
-                } else if (action === "open") {
-                    openArchiveDetail(a.id);
-                } else if (action === "move-up") {
-                    moveArchive(idx, idx - 1);
-                } else if (action === "move-down") {
-                    moveArchive(idx, idx + 1);
-                } else if (action === "retry") {
-                    retryArchive(a.id);
-                } else if (action === "delete") {
-                    confirmDelete(a);
+            // Click handling
+            header.addEventListener("click", (e) => {
+                const action = e.target.closest("[data-group-action]")?.dataset.groupAction;
+                if (action === "rename") openRenameGroup(g);
+                else if (action === "delete") openDeleteGroup(g);
+                else if (action === "move-up") moveGroup(gIdx, gIdx - 1);
+                else if (action === "move-down") moveGroup(gIdx, gIdx + 1);
+                else if (!e.target.closest(".group-actions") && !e.target.closest(".group-grip")) {
+                    // Toggle collapse
+                    if (collapsedGroups.has(g.id)) collapsedGroups.delete(g.id);
+                    else collapsedGroups.add(g.id);
+                    renderArchiveList();
                 }
             });
 
-            // Drag and drop
-            li.addEventListener("dragstart", (e) => {
-                dragSrcId = a.id;
-                li.classList.add("dragging");
+            // Group drag-and-drop
+            header.addEventListener("dragstart", (e) => {
+                dragSrcGroupId = g.id;
+                dragSrcId = null;
+                header.classList.add("dragging");
                 e.dataTransfer.effectAllowed = "move";
             });
-            li.addEventListener("dragend", () => {
-                li.classList.remove("dragging");
-                $$(".archive-item").forEach((el) => el.classList.remove("drag-over"));
+            header.addEventListener("dragend", () => {
+                header.classList.remove("dragging");
+                $$(".group-header").forEach((el) => el.classList.remove("drag-over"));
             });
-            li.addEventListener("dragover", (e) => {
+            header.addEventListener("dragover", (e) => {
+                if (dragSrcGroupId === null) return; // only accept group drags
                 e.preventDefault();
                 e.dataTransfer.dropEffect = "move";
-                li.classList.add("drag-over");
+                header.classList.add("drag-over");
             });
-            li.addEventListener("dragleave", () => li.classList.remove("drag-over"));
-            li.addEventListener("drop", (e) => {
+            header.addEventListener("dragleave", () => header.classList.remove("drag-over"));
+            header.addEventListener("drop", (e) => {
                 e.preventDefault();
-                li.classList.remove("drag-over");
-                if (dragSrcId !== null && dragSrcId !== a.id) {
-                    const src = archives.find((x) => x.id === dragSrcId);
-                    // Only allow reorder within the same enabled/disabled group
-                    if (src && src.download_enabled === a.download_enabled) {
-                        const order = archives.map((x) => x.id);
-                        const fromIdx = order.indexOf(dragSrcId);
-                        const toIdx = order.indexOf(a.id);
-                        order.splice(fromIdx, 1);
-                        order.splice(toIdx, 0, dragSrcId);
-                        api("POST", "/api/archives/reorder", { order });
-                    }
-                    dragSrcId = null;
+                header.classList.remove("drag-over");
+                if (dragSrcGroupId !== null && dragSrcGroupId !== g.id) {
+                    const order = groups.map((x) => x.id);
+                    const fromIdx = order.indexOf(dragSrcGroupId);
+                    const toIdx = order.indexOf(g.id);
+                    order.splice(fromIdx, 1);
+                    order.splice(toIdx, 0, dragSrcGroupId);
+                    api("POST", "/api/groups/reorder", { order });
+                    dragSrcGroupId = null;
                 }
             });
 
-            archiveListEl.appendChild(li);
+            archiveListEl.appendChild(header);
+
+            // Group's archives (hidden if collapsed)
+            if (!collapsed) {
+                groupArchives.forEach((a, idx) => {
+                    const li = buildArchiveItem(a, idx, groupArchives);
+                    li.classList.add("in-group");
+                    archiveListEl.appendChild(li);
+                });
+            }
+        });
+
+        // Divider between groups and loose archives
+        const looseArchives = archives.filter((a) => !a.group_id);
+        if (groups.length > 0 && looseArchives.length > 0) {
+            const divider = document.createElement("li");
+            divider.className = "group-divider";
+            archiveListEl.appendChild(divider);
+        }
+
+        // Ungrouped archives
+        looseArchives.forEach((a, idx) => {
+            archiveListEl.appendChild(buildArchiveItem(a, idx, looseArchives));
         });
     }
 
@@ -466,10 +696,8 @@
     async function refreshMetadata() {
         if (!currentArchiveId) return;
         const btn = $("#btn-refresh-meta");
-        const summaryEl = $("#refresh-summary");
         btn.disabled = true;
         btn.textContent = "Checking...";
-        summaryEl.style.display = "none";
 
         try {
             const result = await api("POST", `/api/archives/${currentArchiveId}/refresh`);
@@ -479,26 +707,55 @@
             if (s.removed > 0) parts.push(`${s.removed} removed`);
             if (s.changed > 0) parts.push(`${s.changed} changed`);
             if (parts.length === 0) {
-                summaryEl.textContent = "No changes detected";
+                addNotification("Metadata refresh: no changes detected", "info");
             } else {
-                summaryEl.textContent = parts.join(", ");
+                addNotification("Metadata refresh: " + parts.join(", "), parts.length > 0 ? "warning" : "info");
             }
-            summaryEl.style.display = "";
             await loadFiles();
             await refreshArchives();
         } catch (e) {
-            summaryEl.textContent = "Error: " + e.message;
-            summaryEl.style.display = "";
+            addNotification("Metadata refresh failed: " + e.message, "error");
         } finally {
             btn.disabled = false;
             btn.innerHTML = '<svg viewBox="0 0 24 24" width="16" height="16"><path d="M12 4V1L8 5l4 4V6c3.31 0 6 2.69 6 6 0 1.01-.25 1.97-.7 2.8l1.46 1.46A7.93 7.93 0 0020 12c0-4.42-3.58-8-8-8zm0 14c-3.31 0-6-2.69-6-6 0-1.01.25-1.97.7-2.8L5.24 7.74A7.93 7.93 0 004 12c0 4.42 3.58 8 8 8v3l4-4-4-4v3z" fill="currentColor"></path></svg> Refresh Metadata';
         }
     }
 
+    async function scanExistingFiles() {
+        if (!currentArchiveId) return;
+        const btn = $("#btn-scan-files");
+        btn.disabled = true;
+        btn.textContent = "Scanning...";
+
+        try {
+            const archive = archives.find((a) => a.id === currentArchiveId);
+            const archiveName = archive ? (archive.title || archive.identifier) : "Unknown";
+            const result = await api("POST", `/api/archives/${currentArchiveId}/scan`);
+            const s = result.summary;
+            const parts = [];
+            if (s.matched > 0) parts.push(`${s.matched} matched`);
+            if (s.conflict > 0) parts.push(`${s.conflict} conflict`);
+            if (s.unknown > 0) parts.push(`${s.unknown} unknown`);
+            if (s.missing > 0) parts.push(`${s.missing} not on disk`);
+            if (parts.length === 0) {
+                addNotification(`Scan "${archiveName}": no files found on disk`, "info");
+            } else {
+                const type = s.conflict > 0 || s.unknown > 0 ? "warning" : "success";
+                addNotification(`Scan "${archiveName}": ` + parts.join(", "), type);
+            }
+            await loadFiles();
+            await refreshArchives();
+        } catch (e) {
+            addNotification("File scan failed: " + e.message, "error");
+        } finally {
+            btn.disabled = false;
+            btn.innerHTML = '<svg viewBox="0 0 24 24" width="16" height="16"><path d="M15.5 14h-.79l-.28-.27A6.471 6.471 0 0016 9.5 6.5 6.5 0 109.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z" fill="currentColor"></path></svg> Scan Existing Files';
+        }
+    }
+
     async function clearChanges() {
         if (!currentArchiveId) return;
         await api("POST", `/api/archives/${currentArchiveId}/clear-changes`);
-        $("#refresh-summary").style.display = "none";
         await loadFiles();
     }
 
@@ -520,8 +777,6 @@
             $("#detail-meta").textContent = `${archive.files_count} files \u2022 ${formatBytes(archive.total_size)} \u2022 ${archive.identifier}`;
             updateDetailProgress();
         }
-        $("#refresh-summary").style.display = "none";
-
         await loadFiles();
     }
 
@@ -679,7 +934,7 @@
 
         // In priority mode, identify the boundary between selected and unselected
         // (server already sorts selected DESC, priority ASC)
-        const selectedFiles = isPriority ? files.filter((f) => f.selected) : [];
+        const selectedFiles = isPriority ? files.filter((f) => f.selected && f.download_status !== "unknown") : [];
         const lastSelectedIdx = isPriority ? selectedFiles.length - 1 : -1;
 
         let hasChanges = false;
@@ -702,26 +957,33 @@
 
             let html = "";
 
+            const isUnknown = f.download_status === "unknown";
+
             // Grip column (priority mode only, selected files only)
             if (isPriority) {
-                html += f.selected ? buildGripCell() : '<td class="col-grip"></td>';
+                html += (f.selected && !isUnknown) ? buildGripCell() : '<td class="col-grip"></td>';
             }
 
-            html += `<td class="col-check"><input type="checkbox" ${f.selected ? "checked" : ""} data-file-id="${f.id}"></td>`;
+            if (isUnknown) {
+                html += `<td class="col-check"><input type="checkbox" disabled title="Unknown file — not in archive manifest" data-file-id="${f.id}"></td>`;
+            } else {
+                html += `<td class="col-check"><input type="checkbox" ${f.selected ? "checked" : ""} data-file-id="${f.id}"></td>`;
+            }
             html += `<td class="col-name"><span class="file-name">${escapeHtml(f.name)}</span>${changeIcon}</td>`;
             html += `<td class="col-size" style="text-align:right">${formatBytes(f.size)}</td>`;
             html += `<td class="col-modified">${formatDate(f.mtime)}</td>`;
             const displayStatus = formatFileStatus(f);
             const statusClass = displayStatus === "skipped" ? "skipped" : f.download_status;
+            const hasError = (f.download_status === "failed" || f.download_status === "conflict" || f.download_status === "unknown") && f.error_message;
             html += `<td class="col-status">` +
-                `<span class="file-status ${statusClass}" ${f.download_status === "failed" && f.error_message ? `title="${escapeHtml(f.error_message)}"` : ""}>${displayStatus}</span>` +
-                (f.download_status === "failed" && f.error_message ? `<span class="file-error-hint" title="${escapeHtml(f.error_message)}">&#9432;</span>` : "") +
+                `<span class="file-status ${statusClass}" ${hasError ? `title="${escapeHtml(f.error_message)}"` : ""}>${displayStatus}</span>` +
+                (hasError ? `<span class="file-error-hint" title="${escapeHtml(f.error_message)}">&#9432;</span>` : "") +
                 (f.download_status === "failed" ? `<button class="retry-file-btn" data-retry-file="${f.id}" title="Retry this file">&#x21bb;</button>` : "") +
                 `</td>`;
 
             // Priority buttons (priority mode only, selected files only)
             if (isPriority) {
-                if (f.selected) {
+                if (f.selected && !isUnknown) {
                     const selIdx = selectedFiles.indexOf(f);
                     html += buildPriorityCell(f.id, selIdx === 0, selIdx === lastSelectedIdx);
                 } else {
@@ -731,13 +993,15 @@
 
             tr.innerHTML = html;
 
-            // Checkbox handler
-            tr.querySelector("input[type=checkbox]").addEventListener("change", (e) => {
-                api("POST", `/api/files/${f.id}/select`, { selected: e.target.checked }).then(() => {
-                    if (isPriority) loadFiles(); // re-sort grouping
+            // Checkbox handler (skip for unknown files)
+            if (!isUnknown) {
+                tr.querySelector("input[type=checkbox]").addEventListener("change", (e) => {
+                    api("POST", `/api/files/${f.id}/select`, { selected: e.target.checked }).then(() => {
+                        if (isPriority) loadFiles(); // re-sort grouping
+                    });
+                    syncSelectAll();
                 });
-                syncSelectAll();
-            });
+            }
 
             // Retry handler
             const retryBtn = tr.querySelector(".retry-file-btn");
@@ -746,7 +1010,7 @@
             }
 
             // Priority mode: drag & priority button handlers for selected files
-            if (isPriority && f.selected) {
+            if (isPriority && f.selected && !isUnknown) {
                 attachPriorityDrag(tr, f.id);
                 const upBtn = tr.querySelector(`[data-move-up="${f.id}"]`);
                 const downBtn = tr.querySelector(`[data-move-down="${f.id}"]`);
@@ -834,6 +1098,15 @@
             $("#add-enable-archive").checked = s.default_enable_archive === "1";
             $("#add-select-all-files").checked = s.default_select_all !== "0";
         }).catch(() => {});
+        // Populate group dropdown
+        const sel = $("#add-group-select");
+        sel.innerHTML = '<option value="">None</option>';
+        groups.forEach((g) => {
+            const opt = document.createElement("option");
+            opt.value = g.id;
+            opt.textContent = g.name;
+            sel.appendChild(opt);
+        });
     }
 
     function closeAddModal() {
@@ -851,10 +1124,12 @@
         $("#btn-add-confirm").disabled = true;
 
         try {
+            const groupVal = $("#add-group-select").value;
             await api("POST", "/api/archives", {
                 url,
                 enable: $("#add-enable-archive").checked,
                 select_all: $("#add-select-all-files").checked,
+                group_id: groupVal ? parseInt(groupVal) : null,
             });
             closeAddModal();
             await refreshArchives();
@@ -1218,6 +1493,120 @@
         return div.innerHTML;
     }
 
+    // --- Group Management ---
+
+    let pendingGroupArchive = null; // archive object for "move to group" modal
+    let pendingRenameGroup = null;  // group object for rename modal
+    let pendingDeleteGroup = null;  // group object for delete modal
+
+    function openCreateGroup() {
+        $("#input-group-name").value = "";
+        $("#group-create-error").textContent = "";
+        $("#modal-create-group").classList.add("open");
+        setTimeout(() => $("#input-group-name").focus(), 50);
+    }
+
+    async function doCreateGroup() {
+        const name = $("#input-group-name").value.trim();
+        if (!name) {
+            $("#group-create-error").textContent = "Please enter a group name.";
+            return;
+        }
+        try {
+            await api("POST", "/api/groups", { name });
+            $("#modal-create-group").classList.remove("open");
+            await refreshGroups();
+        } catch (e) {
+            $("#group-create-error").textContent = e.message || "Failed to create group.";
+        }
+    }
+
+    function openRenameGroup(g) {
+        pendingRenameGroup = g;
+        $("#input-group-rename").value = g.name;
+        $("#group-rename-error").textContent = "";
+        $("#modal-rename-group").classList.add("open");
+        setTimeout(() => $("#input-group-rename").focus(), 50);
+    }
+
+    async function doRenameGroup() {
+        if (!pendingRenameGroup) return;
+        const name = $("#input-group-rename").value.trim();
+        if (!name) {
+            $("#group-rename-error").textContent = "Please enter a name.";
+            return;
+        }
+        try {
+            await api("PUT", `/api/groups/${pendingRenameGroup.id}`, { name });
+            $("#modal-rename-group").classList.remove("open");
+            pendingRenameGroup = null;
+            await refreshGroups();
+        } catch (e) {
+            $("#group-rename-error").textContent = e.message || "Failed to rename group.";
+        }
+    }
+
+    function openDeleteGroup(g) {
+        pendingDeleteGroup = g;
+        $("#delete-group-name").textContent = g.name;
+        $("#modal-delete-group").classList.add("open");
+    }
+
+    async function doDeleteGroup() {
+        if (!pendingDeleteGroup) return;
+        try {
+            await api("DELETE", `/api/groups/${pendingDeleteGroup.id}`);
+            $("#modal-delete-group").classList.remove("open");
+            pendingDeleteGroup = null;
+            await refreshGroups();
+            await refreshArchives();
+        } catch (e) { /* ignore */ }
+    }
+
+    async function moveGroup(fromIdx, toIdx) {
+        if (toIdx < 0 || toIdx >= groups.length) return;
+        const order = groups.map((x) => x.id);
+        const [moved] = order.splice(fromIdx, 1);
+        order.splice(toIdx, 0, moved);
+        await api("POST", "/api/groups/reorder", { order });
+        await refreshGroups();
+    }
+
+    function openMoveToGroup(a) {
+        pendingGroupArchive = a;
+        $("#move-archive-name").textContent = a.title || a.identifier;
+        const list = $("#move-group-list");
+        list.innerHTML = "";
+
+        // "No group" option
+        const noGroup = document.createElement("button");
+        noGroup.className = "move-group-option" + (!a.group_id ? " active" : "");
+        noGroup.textContent = "No group";
+        noGroup.addEventListener("click", () => doMoveToGroup(null));
+        list.appendChild(noGroup);
+
+        // Each group
+        groups.forEach((g) => {
+            const btn = document.createElement("button");
+            btn.className = "move-group-option" + (a.group_id === g.id ? " active" : "");
+            btn.innerHTML = `<svg viewBox="0 0 24 24" width="14" height="14"><path d="M20 6h-8l-2-2H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2zm0 12H4V8h16v10z" fill="currentColor"/></svg> ${escapeHtml(g.name)}`;
+            btn.addEventListener("click", () => doMoveToGroup(g.id));
+            list.appendChild(btn);
+        });
+
+        $("#modal-move-to-group").classList.add("open");
+    }
+
+    async function doMoveToGroup(groupId) {
+        if (!pendingGroupArchive) return;
+        try {
+            await api("POST", `/api/archives/${pendingGroupArchive.id}/group`, { group_id: groupId });
+            $("#modal-move-to-group").classList.remove("open");
+            pendingGroupArchive = null;
+            await refreshArchives();
+        } catch (e) { /* ignore */ }
+    }
+
     // --- Init ---
 
     function init() {
@@ -1273,6 +1662,29 @@
         $("#btn-delete-cancel").addEventListener("click", () => { deleteTarget = null; $("#modal-delete").classList.remove("open"); });
         $("#btn-delete-confirm").addEventListener("click", doDelete);
 
+        // Notifications
+        $("#btn-notifications").addEventListener("click", (e) => {
+            e.stopPropagation();
+            toggleNotifPopup();
+        });
+        $("#notif-popup").addEventListener("click", (e) => e.stopPropagation());
+        $("#btn-notif-clear-all").addEventListener("click", clearAllNotifications);
+        document.addEventListener("click", () => {
+            $("#notif-popup").classList.remove("open");
+        });
+
+        // Groups
+        $("#btn-add-group").addEventListener("click", openCreateGroup);
+        $("#btn-group-create-cancel").addEventListener("click", () => $("#modal-create-group").classList.remove("open"));
+        $("#btn-group-create-confirm").addEventListener("click", doCreateGroup);
+        $("#input-group-name").addEventListener("keydown", (e) => { if (e.key === "Enter") doCreateGroup(); });
+        $("#btn-group-rename-cancel").addEventListener("click", () => { pendingRenameGroup = null; $("#modal-rename-group").classList.remove("open"); });
+        $("#btn-group-rename-confirm").addEventListener("click", doRenameGroup);
+        $("#input-group-rename").addEventListener("keydown", (e) => { if (e.key === "Enter") doRenameGroup(); });
+        $("#btn-group-delete-cancel").addEventListener("click", () => { pendingDeleteGroup = null; $("#modal-delete-group").classList.remove("open"); });
+        $("#btn-group-delete-confirm").addEventListener("click", doDeleteGroup);
+        $("#btn-move-group-cancel").addEventListener("click", () => { pendingGroupArchive = null; $("#modal-move-to-group").classList.remove("open"); });
+
         // Reset download order modal
         $("#btn-reset-order-cancel").addEventListener("click", () => $("#modal-reset-order").classList.remove("open"));
         $("#btn-reset-order-confirm").addEventListener("click", () => {
@@ -1290,6 +1702,7 @@
         $("#select-all-files").addEventListener("change", (e) => toggleSelectAll(e.target.checked));
         $("#btn-retry-all").addEventListener("click", () => { if (currentArchiveId) retryArchive(currentArchiveId); });
         $("#btn-refresh-meta").addEventListener("click", refreshMetadata);
+        $("#btn-scan-files").addEventListener("click", scanExistingFiles);
         $("#btn-clear-changes").addEventListener("click", clearChanges);
         $("#file-sort").addEventListener("change", (e) => {
             currentSort = e.target.value;
@@ -1336,6 +1749,7 @@
         });
 
         refreshArchives();
+        refreshGroups();
         refreshStatus();
         connectSSE();
 

@@ -21,6 +21,7 @@ import os
 import json
 import time
 import queue
+import hashlib
 import threading
 import functools
 from flask import Flask, render_template, request, jsonify, Response, session, redirect, url_for
@@ -266,6 +267,67 @@ def test_ia_credentials():
     return jsonify({"ok": success, "message": message})
 
 
+# --- Group API ---
+
+@app.route("/api/groups", methods=["GET"])
+@login_required
+def list_groups():
+    return jsonify(db.get_groups())
+
+
+@app.route("/api/groups", methods=["POST"])
+@login_required
+def create_group():
+    data = request.json
+    name = (data.get("name") or "").strip()
+    if not name:
+        return jsonify({"error": "Group name is required"}), 400
+    group_id = db.add_group(name)
+    group = db.get_group(group_id)
+    broadcast_sse("groups_changed", {})
+    return jsonify(group), 201
+
+
+@app.route("/api/groups/<int:group_id>", methods=["PUT"])
+@login_required
+def update_group(group_id):
+    data = request.json
+    name = (data.get("name") or "").strip()
+    if not name:
+        return jsonify({"error": "Group name is required"}), 400
+    db.rename_group(group_id, name)
+    broadcast_sse("groups_changed", {})
+    return jsonify({"ok": True})
+
+
+@app.route("/api/groups/<int:group_id>", methods=["DELETE"])
+@login_required
+def remove_group(group_id):
+    db.delete_group(group_id)
+    broadcast_sse("groups_changed", {})
+    return jsonify({"ok": True})
+
+
+@app.route("/api/groups/reorder", methods=["POST"])
+@login_required
+def reorder_groups():
+    data = request.json
+    db.reorder_groups(data.get("order", []))
+    broadcast_sse("groups_changed", {})
+    return jsonify({"ok": True})
+
+
+@app.route("/api/archives/<int:archive_id>/group", methods=["POST"])
+@login_required
+def set_archive_group(archive_id):
+    data = request.json
+    group_id = data.get("group_id")  # None to remove from group
+    db.set_archive_group(archive_id, group_id)
+    archive = db.get_archive(archive_id)
+    broadcast_sse("archive_updated", archive)
+    return jsonify(archive)
+
+
 # --- Archive API ---
 
 @app.route("/api/archives", methods=["GET"])
@@ -316,10 +378,13 @@ def add_archive():
     # Apply options from the add modal
     enable = data.get("enable", False)
     select_all = data.get("select_all", True)
+    group_id = data.get("group_id")
     if enable:
         db.set_archive_download_enabled(archive_id, True)
     if not select_all:
         db.set_all_files_selected(archive_id, False)
+    if group_id:
+        db.set_archive_group(archive_id, group_id)
 
     archive = db.get_archive(archive_id)
     broadcast_sse("archive_added", archive)
@@ -362,6 +427,155 @@ def refresh_archive(archive_id):
     updated = db.get_archive(archive_id)
     broadcast_sse("archive_updated", updated)
     return jsonify({"ok": True, "summary": summary})
+
+
+@app.route("/api/archives/<int:archive_id>/scan", methods=["POST"])
+@login_required
+def scan_existing_files(archive_id):
+    """Scan the local download folder for files matching this archive's manifest."""
+    archive = db.get_archive(archive_id)
+    if not archive:
+        return jsonify({"error": "Not found"}), 404
+
+    download_dir = db.get_setting("download_dir", os.path.expanduser("~/ia-downloads"))
+    base_dir = os.path.realpath(os.path.join(download_dir, archive["identifier"]))
+
+    if not os.path.isdir(base_dir):
+        return jsonify({"error": f"Download folder not found: {base_dir}"}), 404
+
+    # Clean slate: wipe all scan-originated rows and reset scan-set statuses on manifest files
+    conn = db.get_db()
+    conn.execute(
+        "DELETE FROM archive_files WHERE archive_id = ? AND origin = 'scan'",
+        (archive_id,),
+    )
+    conn.execute(
+        "UPDATE archive_files SET download_status = 'pending', error_message = '' "
+        "WHERE archive_id = ? AND download_status IN ('conflict', 'unknown')",
+        (archive_id,),
+    )
+    conn.commit()
+
+    # Ground truth: only IA manifest files (origin='manifest')
+    rows = conn.execute(
+        "SELECT id, name, size, md5, download_status FROM archive_files "
+        "WHERE archive_id = ? AND origin = 'manifest'",
+        (archive_id,),
+    ).fetchall()
+    manifest = {r["name"]: dict(r) for r in rows}
+
+    summary = {"matched": 0, "conflict": 0, "unknown": 0, "missing": 0}
+    matched_ids = []     # (file_id, local_size) — exact match
+    conflict_ids = []    # (file_id, reason) — file exists but doesn't match
+    seen_paths = set()   # track manifest files found on disk
+
+    for name, info in manifest.items():
+        local_path = os.path.realpath(os.path.join(base_dir, name))
+        # Path traversal guard
+        if not local_path.startswith(base_dir + os.sep) and local_path != base_dir:
+            continue
+
+        if not os.path.isfile(local_path):
+            summary["missing"] += 1
+            continue
+
+        seen_paths.add(name)
+        local_size = os.path.getsize(local_path)
+        expected_size = info["size"]
+        expected_md5 = info["md5"]
+
+        if info["download_status"] == "completed":
+            # Already marked completed, skip
+            summary["matched"] += 1
+            continue
+
+        # We need at least one verifiable property to confirm a match.
+        # IA metadata files (e.g. _meta.xml, _files.xml) often have size=0
+        # and no md5 — we can't verify those, so treat them as conflicts.
+        has_size = expected_size > 0
+        has_md5 = bool(expected_md5) and has_size
+
+        if not has_size and not has_md5:
+            conflict_ids.append((info["id"], f"Cannot verify: no size/hash in manifest (local file is {local_size} bytes)"))
+            summary["conflict"] += 1
+            continue
+
+        # Size check first (fast)
+        if has_size and local_size != expected_size:
+            conflict_ids.append((info["id"], f"Size mismatch: local {local_size} vs expected {expected_size}"))
+            summary["conflict"] += 1
+            continue
+
+        # MD5 check (slower, but definitive)
+        if has_md5:
+            md5 = hashlib.md5()
+            try:
+                with open(local_path, "rb") as f:
+                    for chunk in iter(lambda: f.read(8192), b""):
+                        md5.update(chunk)
+                if md5.hexdigest() != expected_md5:
+                    conflict_ids.append((info["id"], f"MD5 mismatch: local {md5.hexdigest()} vs expected {expected_md5}"))
+                    summary["conflict"] += 1
+                    continue
+            except OSError as e:
+                conflict_ids.append((info["id"], f"Read error: {e}"))
+                summary["conflict"] += 1
+                continue
+
+        # Match — size matches (and md5 if available)
+        matched_ids.append((info["id"], local_size))
+        summary["matched"] += 1
+
+    # Scan for unknown files on disk not in manifest
+    unknown_files = []
+    for root, _dirs, files in os.walk(base_dir):
+        for fname in files:
+            full = os.path.join(root, fname)
+            rel = os.path.relpath(full, base_dir)
+            if rel not in manifest:
+                unknown_files.append(rel)
+                summary["unknown"] += 1
+
+    # Apply changes
+    for file_id, size in matched_ids:
+        conn.execute(
+            "UPDATE archive_files SET download_status = 'completed', downloaded_bytes = ?, selected = 1 WHERE id = ?",
+            (size, file_id),
+        )
+    for file_id, reason in conflict_ids:
+        conn.execute(
+            "UPDATE archive_files SET download_status = 'conflict', error_message = ? WHERE id = ?",
+            (reason, file_id),
+        )
+
+    # Insert unknown files into manifest with 'unknown' status and forced lowest priority
+    max_pri = conn.execute(
+        "SELECT COALESCE(MAX(download_priority), -1) FROM archive_files WHERE archive_id = ?",
+        (archive_id,),
+    ).fetchone()[0]
+    for i, rel_name in enumerate(unknown_files):
+        local_path = os.path.join(base_dir, rel_name)
+        local_size = 0
+        try:
+            local_size = os.path.getsize(local_path)
+        except OSError:
+            pass
+        conn.execute(
+            """INSERT OR IGNORE INTO archive_files
+               (archive_id, name, size, md5, sha1, format, source, mtime,
+                selected, download_status, downloaded_bytes, error_message, download_priority, origin)
+               VALUES (?, ?, ?, '', '', '', '', '', 0, 'unknown', ?, 'File found on disk but not in archive manifest', ?, 'scan')""",
+            (archive_id, rel_name, local_size, local_size, max_pri + 1 + i),
+        )
+
+    conn.commit()
+    conn.close()
+
+    # Update archive status and file count
+    db.recompute_archive_file_count(archive_id)
+    updated = db.get_archive(archive_id)
+    broadcast_sse("archive_updated", updated)
+    return jsonify({"ok": True, "summary": summary, "unknown_files": unknown_files})
 
 
 @app.route("/api/archives/<int:archive_id>/clear-changes", methods=["POST"])

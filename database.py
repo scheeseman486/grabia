@@ -93,6 +93,12 @@ def init_db():
             FOREIGN KEY (file_id) REFERENCES archive_files(id) ON DELETE CASCADE
         );
 
+        CREATE TABLE IF NOT EXISTS archive_groups (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            position INTEGER NOT NULL DEFAULT 0
+        );
+
         CREATE TABLE IF NOT EXISTS auth (
             id INTEGER PRIMARY KEY CHECK (id = 1),
             username TEXT NOT NULL,
@@ -135,6 +141,25 @@ def init_db():
                   AND af2.name < archive_files.name
             )
         """)
+
+    try:
+        conn.execute("SELECT group_id FROM archives LIMIT 1")
+    except sqlite3.OperationalError:
+        conn.execute("ALTER TABLE archives ADD COLUMN group_id INTEGER DEFAULT NULL REFERENCES archive_groups(id) ON DELETE SET NULL")
+
+    try:
+        conn.execute("SELECT origin FROM archive_files LIMIT 1")
+    except sqlite3.OperationalError:
+        conn.execute("ALTER TABLE archive_files ADD COLUMN origin TEXT NOT NULL DEFAULT 'manifest'")
+
+    # Fix any scan-inserted rows incorrectly tagged as 'manifest'.
+    # Real IA files always have at least one metadata field populated;
+    # scan-inserted files have md5, sha1, format, source, and mtime all empty.
+    conn.execute("""
+        UPDATE archive_files SET origin = 'scan'
+        WHERE origin = 'manifest'
+          AND md5 = '' AND sha1 = '' AND format = '' AND source = '' AND mtime = ''
+    """)
 
     conn.commit()
     conn.close()
@@ -251,6 +276,9 @@ def get_archives():
     archives = [dict(r) for r in rows]
     _enrich_archives_with_progress(archives, conn)
     conn.close()
+    # Ensure group_id is always present (for older DBs before migration runs mid-session)
+    for a in archives:
+        a.setdefault("group_id", None)
     return archives
 
 
@@ -292,6 +320,21 @@ def reorder_archives(id_order):
     conn = get_db()
     for pos, aid in enumerate(id_order):
         conn.execute("UPDATE archives SET position = ? WHERE id = ?", (pos, aid))
+    conn.commit()
+    conn.close()
+
+
+def recompute_archive_file_count(archive_id):
+    """Recompute files_count and total_size for an archive from the archive_files table."""
+    conn = get_db()
+    row = conn.execute(
+        "SELECT COUNT(*) as cnt, COALESCE(SUM(size), 0) as total FROM archive_files WHERE archive_id = ?",
+        (archive_id,),
+    ).fetchone()
+    conn.execute(
+        "UPDATE archives SET files_count = ?, total_size = ? WHERE id = ?",
+        (row["cnt"], row["total"], archive_id),
+    )
     conn.commit()
     conn.close()
 
@@ -603,6 +646,65 @@ def refresh_archive_metadata(archive_id, new_files_list):
     conn.commit()
     conn.close()
     return summary
+
+
+# --- Groups ---
+
+def get_groups():
+    conn = get_db()
+    rows = conn.execute("SELECT * FROM archive_groups ORDER BY position ASC").fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_group(group_id):
+    conn = get_db()
+    row = conn.execute("SELECT * FROM archive_groups WHERE id = ?", (group_id,)).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def add_group(name):
+    conn = get_db()
+    max_pos = conn.execute("SELECT COALESCE(MAX(position), -1) FROM archive_groups").fetchone()[0]
+    conn.execute("INSERT INTO archive_groups (name, position) VALUES (?, ?)", (name, max_pos + 1))
+    group_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+    conn.commit()
+    conn.close()
+    return group_id
+
+
+def rename_group(group_id, name):
+    conn = get_db()
+    conn.execute("UPDATE archive_groups SET name = ? WHERE id = ?", (name, group_id))
+    conn.commit()
+    conn.close()
+
+
+def delete_group(group_id):
+    """Delete a group. Archives in the group become ungrouped."""
+    conn = get_db()
+    conn.execute("UPDATE archives SET group_id = NULL WHERE group_id = ?", (group_id,))
+    conn.execute("DELETE FROM archive_groups WHERE id = ?", (group_id,))
+    conn.commit()
+    conn.close()
+
+
+def reorder_groups(id_order):
+    """id_order is a list of group IDs in desired order."""
+    conn = get_db()
+    for pos, gid in enumerate(id_order):
+        conn.execute("UPDATE archive_groups SET position = ? WHERE id = ?", (pos, gid))
+    conn.commit()
+    conn.close()
+
+
+def set_archive_group(archive_id, group_id):
+    """Move an archive into a group (or remove from group if group_id is None)."""
+    conn = get_db()
+    conn.execute("UPDATE archives SET group_id = ? WHERE id = ?", (group_id, archive_id))
+    conn.commit()
+    conn.close()
 
 
 # --- Auth ---
