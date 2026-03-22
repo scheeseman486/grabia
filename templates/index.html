@@ -178,8 +178,11 @@
     <div class="modal-overlay" id="modal-add">
         <div class="modal">
             <h3>Add Archive</h3>
-            <p>Enter an Internet Archive URL or identifier:</p>
+            <label class="checkbox-label batch-toggle"><input type="checkbox" id="add-batch-mode"> Batch Processing</label>
+            <p id="add-prompt-single">Enter an Internet Archive URL or identifier:</p>
+            <p id="add-prompt-batch" style="display:none">Enter URLs or identifiers, one per line:</p>
             <input type="text" id="input-add-url" placeholder="https://archive.org/details/..." autofocus>
+            <textarea id="input-add-batch" rows="6" placeholder="https://archive.org/details/...&#10;https://archive.org/details/...&#10;some-identifier" style="display:none"></textarea>
             <div class="modal-options">
                 <label class="checkbox-label"><input type="checkbox" id="add-enable-archive"> Enable archive</label>
                 <label class="checkbox-label"><input type="checkbox" id="add-select-all-files" checked> Download all files</label>
@@ -195,7 +198,7 @@
                 <button class="action-btn primary" id="btn-add-confirm">Add</button>
             </div>
             <div class="modal-loading" id="add-loading" style="display:none;">
-                <div class="spinner"></div> Fetching metadata...
+                <div class="spinner"></div> <span id="add-loading-text">Fetching metadata...</span>
             </div>
         </div>
     </div>

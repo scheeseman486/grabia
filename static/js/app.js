@@ -1149,7 +1149,12 @@
     function openAddModal() {
         $("#modal-add").classList.add("open");
         const input = $("#input-add-url");
+        const batch = $("#input-add-batch");
+        const batchCheck = $("#add-batch-mode");
         input.value = "";
+        batch.value = "";
+        batchCheck.checked = false;
+        toggleBatchMode(false);
         input.focus();
         $("#add-error").textContent = "";
         $("#add-loading").style.display = "none";
@@ -1169,35 +1174,95 @@
         });
     }
 
+    function toggleBatchMode(on) {
+        $("#input-add-url").style.display = on ? "none" : "";
+        $("#input-add-batch").style.display = on ? "" : "none";
+        $("#add-prompt-single").style.display = on ? "none" : "";
+        $("#add-prompt-batch").style.display = on ? "" : "none";
+        if (on) {
+            $("#input-add-batch").focus();
+        } else {
+            $("#input-add-url").focus();
+        }
+    }
+
     function closeAddModal() {
         $("#modal-add").classList.remove("open");
     }
 
     async function addArchive() {
-        const url = $("#input-add-url").value.trim();
-        if (!url) {
-            $("#add-error").textContent = "Please enter a URL or identifier.";
-            return;
-        }
-        $("#add-error").textContent = "";
-        $("#add-loading").style.display = "flex";
-        $("#btn-add-confirm").disabled = true;
+        const isBatch = $("#add-batch-mode").checked;
+        const enable = $("#add-enable-archive").checked;
+        const selectAll = $("#add-select-all-files").checked;
+        const groupVal = $("#add-group-select").value;
+        const groupId = groupVal ? parseInt(groupVal) : null;
 
-        try {
-            const groupVal = $("#add-group-select").value;
-            await api("POST", "/api/archives", {
-                url,
-                enable: $("#add-enable-archive").checked,
-                select_all: $("#add-select-all-files").checked,
-                group_id: groupVal ? parseInt(groupVal) : null,
-            });
-            closeAddModal();
-            await refreshArchives();
-        } catch (e) {
-            $("#add-error").textContent = e.message;
-        } finally {
+        if (isBatch) {
+            const lines = $("#input-add-batch").value.split("\n").map((l) => l.trim()).filter((l) => l);
+            if (lines.length === 0) {
+                $("#add-error").textContent = "Please enter at least one URL or identifier.";
+                return;
+            }
+            $("#add-error").textContent = "";
+            $("#add-loading").style.display = "flex";
+            $("#btn-add-confirm").disabled = true;
+
+            let succeeded = 0;
+            let failed = 0;
+            const errors = [];
+            for (let i = 0; i < lines.length; i++) {
+                $("#add-loading-text").textContent = `Processing ${i + 1} of ${lines.length}...`;
+                try {
+                    await api("POST", "/api/archives", {
+                        url: lines[i],
+                        enable,
+                        select_all: selectAll,
+                        group_id: groupId,
+                    });
+                    succeeded++;
+                } catch (e) {
+                    failed++;
+                    errors.push(`${lines[i]}: ${e.message}`);
+                }
+            }
+
             $("#add-loading").style.display = "none";
+            $("#add-loading-text").textContent = "Fetching metadata...";
             $("#btn-add-confirm").disabled = false;
+            await refreshArchives();
+
+            if (failed === 0) {
+                addNotification(`Batch add: ${succeeded} archive${succeeded !== 1 ? "s" : ""} added`, "success");
+                closeAddModal();
+            } else {
+                addNotification(`Batch add: ${succeeded} added, ${failed} failed`, "warning");
+                $("#add-error").innerHTML = errors.map((e) => escapeHtml(e)).join("<br>");
+            }
+        } else {
+            const url = $("#input-add-url").value.trim();
+            if (!url) {
+                $("#add-error").textContent = "Please enter a URL or identifier.";
+                return;
+            }
+            $("#add-error").textContent = "";
+            $("#add-loading").style.display = "flex";
+            $("#btn-add-confirm").disabled = true;
+
+            try {
+                await api("POST", "/api/archives", {
+                    url,
+                    enable,
+                    select_all: selectAll,
+                    group_id: groupId,
+                });
+                closeAddModal();
+                await refreshArchives();
+            } catch (e) {
+                $("#add-error").textContent = e.message;
+            } finally {
+                $("#add-loading").style.display = "none";
+                $("#btn-add-confirm").disabled = false;
+            }
         }
     }
 
@@ -1687,6 +1752,7 @@
         $("#btn-add-cancel").addEventListener("click", closeAddModal);
         $("#btn-add-confirm").addEventListener("click", addArchive);
         $("#input-add-url").addEventListener("keydown", (e) => { if (e.key === "Enter") addArchive(); });
+        $("#add-batch-mode").addEventListener("change", (e) => toggleBatchMode(e.target.checked));
 
         // Settings
         $("#btn-settings").addEventListener("click", openSettings);
