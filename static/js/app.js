@@ -298,11 +298,22 @@
             throttledProgressRefresh();
         });
 
+        es.addEventListener("file_error", (e) => {
+            const data = JSON.parse(e.data);
+            const fname = data.filename || "Unknown file";
+            const archive = data.identifier || "";
+            const detail = data.error || "Unknown error";
+            addNotification(`Download error: ${fname}${archive ? " (" + archive + ")" : ""} — ${detail}`, "error");
+        });
+
         es.addEventListener("file_failed", (e) => {
             const data = JSON.parse(e.data);
             updateFileRow(data.file_id, { download_status: "failed" });
             lastProgressRefresh = 0;
             throttledProgressRefresh();
+            const fname = data.filename || "Unknown file";
+            const archive = data.identifier || "";
+            addNotification(`Download failed: ${fname}${archive ? " (" + archive + ")" : ""} — retries exhausted`, "error");
         });
 
         es.addEventListener("file_start", () => {

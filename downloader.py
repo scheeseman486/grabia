@@ -218,7 +218,7 @@ class DownloadManager:
             error_msg = f"Blocked path traversal in filename: {filename}"
             log.warning(error_msg)
             db.set_file_download_status(file_id, "failed", error_message=error_msg)
-            self._notify("file_error", {"file_id": file_id, "error": error_msg})
+            self._notify("file_error", {"file_id": file_id, "filename": filename, "identifier": identifier, "error": error_msg})
             return
         os.makedirs(os.path.dirname(local_path), exist_ok=True)
 
@@ -264,21 +264,21 @@ class DownloadManager:
             log.warning("Download failed for %s: %s", filename, error_msg)
             db.set_file_download_status(file_id, "failed", error_message=error_msg)
             db.increment_file_retry(file_id)
-            self._notify("file_error", {"file_id": file_id, "error": error_msg})
+            self._notify("file_error", {"file_id": file_id, "filename": filename, "identifier": identifier, "error": error_msg})
         except Exception as e:
             error_msg = str(e)
             log.warning("Download failed for %s: %s", filename, error_msg)
             db.set_file_download_status(file_id, "failed", error_message=error_msg)
             db.increment_file_retry(file_id)
-            self._notify("file_error", {"file_id": file_id, "error": error_msg})
+            self._notify("file_error", {"file_id": file_id, "filename": filename, "identifier": identifier, "error": error_msg})
 
         if success:
             db.set_file_download_status(file_id, "completed", downloaded_bytes=expected_size)
-            self._notify("file_complete", {"file_id": file_id, "filename": filename})
+            self._notify("file_complete", {"file_id": file_id, "filename": filename, "identifier": identifier})
         elif not self._stop_event.is_set() and not success:
             # Mark failed, increment retry — the download loop will re-pick it
             # if retries remain, after processing other pending files first
-            self._notify("file_failed", {"file_id": file_id})
+            self._notify("file_failed", {"file_id": file_id, "filename": filename, "identifier": identifier})
 
         # Check if all files in this archive are done
         self._check_archive_completion(archive_id)
@@ -485,6 +485,10 @@ class DownloadManager:
                 db.set_archive_status(archive_id, "completed")
             elif row["completed"] + row["failed"] + row["conflict"] == row["total"]:
                 db.set_archive_status(archive_id, "partial")
+            else:
+                # Still has pending files but nothing actively downloading —
+                # set back to queued so it doesn't stay stuck on "downloading"
+                db.set_archive_status(archive_id, "queued")
 
 
 # Singleton
