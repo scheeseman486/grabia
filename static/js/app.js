@@ -994,7 +994,6 @@
         }
         await loadFiles();
         updateScanButton();
-        updateSortArrows();
     }
 
     function closeDetail() {
@@ -1081,6 +1080,15 @@
         $("#select-all-files").addEventListener("change", (e) => toggleSelectAll(e.target.checked));
         const resetBtn = document.getElementById("btn-reset-order");
         if (resetBtn) resetBtn.addEventListener("click", confirmResetOrder);
+        // Re-attach column header sort handlers
+        for (const [cls, sort] of Object.entries(SORT_COL_MAP)) {
+            const th = $(`.${cls}`);
+            if (th) {
+                th.style.cursor = "pointer";
+                th.addEventListener("click", () => onColumnHeaderClick(sort));
+            }
+        }
+        updateSortArrows();
     }
 
     function getColspan() {
@@ -2041,13 +2049,6 @@
         $("#btn-refresh-meta").addEventListener("click", refreshMetadata);
         $("#btn-scan-files").addEventListener("click", scanExistingFiles);
         $("#btn-clear-changes").addEventListener("click", clearChanges);
-        for (const [cls, sort] of Object.entries(SORT_COL_MAP)) {
-            const th = $(`.${cls}`);
-            if (th) {
-                th.style.cursor = "pointer";
-                th.addEventListener("click", () => onColumnHeaderClick(sort));
-            }
-        }
         $("#file-sort").addEventListener("change", (e) => {
             currentSort = e.target.value;
             currentSortDir = "";
