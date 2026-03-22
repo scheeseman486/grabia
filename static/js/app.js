@@ -169,6 +169,7 @@
 
     // Track progress notification IDs per archive
     let scanNotifs = {}; // archive_id -> notif id
+    let scanQueuedNotifs = {}; // archive_id -> notif id for "queued" message
 
     function getArchiveName(archiveId) {
         const a = archives.find((x) => x.id === archiveId);
@@ -183,7 +184,12 @@
             const pct = total > 0 ? Math.round((current / total) * 100) : 0;
             const msg = `Scanning "${archiveName}": ${current}/${total} (${pct}%)`;
             if (!scanNotifs[archive_id]) {
-                // Create notification with toast
+                // Remove "queued" notification if present
+                if (scanQueuedNotifs[archive_id]) {
+                    notifications = notifications.filter((n) => n.id !== scanQueuedNotifs[archive_id]);
+                    delete scanQueuedNotifs[archive_id];
+                }
+                // Create progress notification with toast
                 const nid = ++notifIdCounter;
                 scanNotifs[archive_id] = nid;
                 const notif = { id: nid, message: msg, type: "info", time: new Date(), progress: pct, scanArchiveId: archive_id };
@@ -207,11 +213,16 @@
                 renderNotifList();
             }
         } else if (phase === "done") {
-            // Remove progress notification
+            // Remove progress and queued notifications
             if (scanNotifs[archive_id]) {
                 notifications = notifications.filter((n) => n.id !== scanNotifs[archive_id]);
                 delete scanNotifs[archive_id];
             }
+            if (scanQueuedNotifs[archive_id]) {
+                notifications = notifications.filter((n) => n.id !== scanQueuedNotifs[archive_id]);
+                delete scanQueuedNotifs[archive_id];
+            }
+            updateScanButton();
             // Add final summary notification
             const s = data.summary || {};
             const parts = [];
@@ -233,7 +244,12 @@
                 notifications = notifications.filter((n) => n.id !== scanNotifs[archive_id]);
                 delete scanNotifs[archive_id];
             }
+            if (scanQueuedNotifs[archive_id]) {
+                notifications = notifications.filter((n) => n.id !== scanQueuedNotifs[archive_id]);
+                delete scanQueuedNotifs[archive_id];
+            }
             addNotification(`Scan "${archiveName}": cancelled`, "info");
+            updateScanButton();
             loadFiles();
             refreshArchives();
         } else if (phase === "error") {
@@ -241,7 +257,12 @@
                 notifications = notifications.filter((n) => n.id !== scanNotifs[archive_id]);
                 delete scanNotifs[archive_id];
             }
+            if (scanQueuedNotifs[archive_id]) {
+                notifications = notifications.filter((n) => n.id !== scanQueuedNotifs[archive_id]);
+                delete scanQueuedNotifs[archive_id];
+            }
             addNotification(`Scan "${archiveName}" failed: ${data.error || "Unknown error"}`, "error");
+            updateScanButton();
         }
     }
 
@@ -857,11 +878,24 @@
 
     async function scanExistingFiles() {
         if (!currentArchiveId) return;
+        const archiveName = getArchiveName(currentArchiveId);
         try {
-            await api("POST", `/api/archives/${currentArchiveId}/scan`);
-            // Scan is now queued — progress and results come via SSE
+            const aid = currentArchiveId;
+            await api("POST", `/api/archives/${aid}/scan`);
+            // Scan is now queued — track the queued notification so we can remove it when progress starts
+            const qid = ++notifIdCounter;
+            scanQueuedNotifs[aid] = qid;
+            notifications.unshift({ id: qid, message: `Scan "${archiveName}": queued`, type: "info", time: new Date() });
+            renderNotifBadge();
+            renderNotifList();
+            showToast(`Scan "${archiveName}": queued`, "info");
+            updateScanButton();
         } catch (e) {
-            addNotification("File scan failed: " + e.message, "error");
+            if (e.message && e.message.includes("already queued")) {
+                addNotification(`Scan "${archiveName}": already queued`, "info");
+            } else {
+                addNotification(`Scan "${archiveName}" failed: ` + e.message, "error");
+            }
         }
     }
 
@@ -871,6 +905,17 @@
         } catch (e) {
             // Scan may have already finished
         }
+    }
+
+    function updateScanButton() {
+        const btn = $("#btn-scan-files");
+        if (!btn) return;
+        const active = currentArchiveId && (scanNotifs[currentArchiveId] || scanQueuedNotifs[currentArchiveId]);
+        btn.disabled = !!active;
+        btn.style.opacity = active ? "0.5" : "";
+        btn.title = active
+            ? "Scan already in progress or queued for this archive"
+            : "Scan local folder for existing files that match this archive";
     }
 
     async function clearChanges() {
@@ -934,6 +979,7 @@
             updateDetailProgress();
         }
         await loadFiles();
+        updateScanButton();
     }
 
     function closeDetail() {
