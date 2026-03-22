@@ -135,8 +135,58 @@
         }, 5000);
     }
 
+    // --- Scan Progress Toast ---
+
+    let scanProgressToast = null;
+
+    function showScanProgress(current, total, phase) {
+        const container = document.querySelector("#toast-container");
+        if (!scanProgressToast || !scanProgressToast.parentNode) {
+            scanProgressToast = document.createElement("div");
+            scanProgressToast.className = "toast toast-info toast-progress";
+            scanProgressToast.innerHTML = `
+                <div class="toast-progress-content">
+                    <span class="toast-message">Scanning files...</span>
+                    <div class="toast-progress-bar-track">
+                        <div class="toast-progress-bar-fill"></div>
+                    </div>
+                    <span class="toast-progress-detail"></span>
+                </div>
+            `;
+            container.appendChild(scanProgressToast);
+            requestAnimationFrame(() => scanProgressToast.classList.add("toast-enter"));
+        }
+
+        const msgEl = scanProgressToast.querySelector(".toast-message");
+        const fillEl = scanProgressToast.querySelector(".toast-progress-bar-fill");
+        const detailEl = scanProgressToast.querySelector(".toast-progress-detail");
+
+        if (phase === "verify") {
+            const pct = total > 0 ? Math.round((current / total) * 100) : 0;
+            msgEl.textContent = "Verifying files...";
+            fillEl.style.width = pct + "%";
+            detailEl.textContent = `${current} / ${total} files (${pct}%)`;
+        } else if (phase === "disk") {
+            msgEl.textContent = "Checking for unknown files...";
+            fillEl.style.width = "100%";
+            fillEl.classList.add("indeterminate");
+            detailEl.textContent = "";
+        } else if (phase === "done") {
+            removeScanProgress();
+        }
+    }
+
+    function removeScanProgress() {
+        if (scanProgressToast && scanProgressToast.parentNode) {
+            scanProgressToast.classList.add("toast-exit");
+            const ref = scanProgressToast;
+            setTimeout(() => ref.remove(), 300);
+            scanProgressToast = null;
+        }
+    }
+
     function toggleNotifPopup() {
-        const popup = $("#notif-popup");
+        const popup = document.querySelector("#notif-popup");
         popup.classList.toggle("open");
     }
 
@@ -318,6 +368,11 @@
 
         es.addEventListener("file_start", () => {
             refreshStatus();
+        });
+
+        es.addEventListener("scan_progress", (e) => {
+            const data = JSON.parse(e.data);
+            showScanProgress(data.current, data.total, data.phase);
         });
 
         es.addEventListener("archive_added", () => refreshArchives());

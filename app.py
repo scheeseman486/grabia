@@ -470,6 +470,10 @@ def scan_existing_files(archive_id):
     partial_ids = []     # (file_id, local_size) — partially downloaded
     seen_paths = set()   # track manifest files found on disk
 
+    total_manifest = len(manifest)
+    processed = 0
+    broadcast_sse("scan_progress", {"archive_id": archive_id, "phase": "verify", "current": 0, "total": total_manifest})
+
     for name, info in manifest.items():
         local_path = os.path.realpath(os.path.join(base_dir, name))
         # Path traversal guard
@@ -478,6 +482,9 @@ def scan_existing_files(archive_id):
 
         if not os.path.isfile(local_path):
             summary["missing"] += 1
+            processed += 1
+            if processed % 10 == 0 or processed == total_manifest:
+                broadcast_sse("scan_progress", {"archive_id": archive_id, "phase": "verify", "current": processed, "total": total_manifest})
             continue
 
         seen_paths.add(name)
@@ -488,6 +495,9 @@ def scan_existing_files(archive_id):
         if info["download_status"] == "completed":
             # Already marked completed, skip
             summary["matched"] += 1
+            processed += 1
+            if processed % 10 == 0 or processed == total_manifest:
+                broadcast_sse("scan_progress", {"archive_id": archive_id, "phase": "verify", "current": processed, "total": total_manifest})
             continue
 
         # We need at least one verifiable property to confirm a match.
@@ -499,6 +509,9 @@ def scan_existing_files(archive_id):
         if not has_size and not has_md5:
             conflict_ids.append((info["id"], f"Cannot verify: no size/hash in manifest (local file is {local_size} bytes)"))
             summary["conflict"] += 1
+            processed += 1
+            if processed % 10 == 0 or processed == total_manifest:
+                broadcast_sse("scan_progress", {"archive_id": archive_id, "phase": "verify", "current": processed, "total": total_manifest})
             continue
 
         # Size check first (fast)
@@ -510,6 +523,9 @@ def scan_existing_files(archive_id):
             else:
                 conflict_ids.append((info["id"], f"Size mismatch: local {local_size} vs expected {expected_size}"))
                 summary["conflict"] += 1
+            processed += 1
+            if processed % 10 == 0 or processed == total_manifest:
+                broadcast_sse("scan_progress", {"archive_id": archive_id, "phase": "verify", "current": processed, "total": total_manifest})
             continue
 
         # MD5 check (slower, but definitive)
@@ -522,17 +538,28 @@ def scan_existing_files(archive_id):
                 if md5.hexdigest() != expected_md5:
                     conflict_ids.append((info["id"], f"MD5 mismatch: local {md5.hexdigest()} vs expected {expected_md5}"))
                     summary["conflict"] += 1
+                    processed += 1
+                    if processed % 10 == 0 or processed == total_manifest:
+                        broadcast_sse("scan_progress", {"archive_id": archive_id, "phase": "verify", "current": processed, "total": total_manifest})
                     continue
             except OSError as e:
                 conflict_ids.append((info["id"], f"Read error: {e}"))
                 summary["conflict"] += 1
+                processed += 1
+                if processed % 10 == 0 or processed == total_manifest:
+                    broadcast_sse("scan_progress", {"archive_id": archive_id, "phase": "verify", "current": processed, "total": total_manifest})
                 continue
 
         # Match — size matches (and md5 if available)
         matched_ids.append((info["id"], local_size))
         summary["matched"] += 1
 
+        processed += 1
+        if processed % 10 == 0 or processed == total_manifest:
+            broadcast_sse("scan_progress", {"archive_id": archive_id, "phase": "verify", "current": processed, "total": total_manifest})
+
     # Scan for unknown files on disk not in manifest
+    broadcast_sse("scan_progress", {"archive_id": archive_id, "phase": "disk", "current": 0, "total": 0})
     unknown_files = []
     for root, _dirs, files in os.walk(base_dir):
         for fname in files:
@@ -587,6 +614,7 @@ def scan_existing_files(archive_id):
     db.recompute_archive_file_count(archive_id)
     db.recompute_archive_status(archive_id)
     updated = db.get_archive(archive_id)
+    broadcast_sse("scan_progress", {"archive_id": archive_id, "phase": "done", "current": total_manifest, "total": total_manifest})
     broadcast_sse("archive_updated", updated)
     return jsonify({"ok": True, "summary": summary, "unknown_files": unknown_files})
 

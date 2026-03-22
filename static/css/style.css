@@ -1583,6 +1583,42 @@ main {
 }
 .toast-close:hover { background: var(--bg-active); color: var(--text-primary); }
 
+/* Toast progress bar */
+.toast-progress { min-width: 260px; }
+.toast-progress-content {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    flex: 1;
+}
+.toast-progress-bar-track {
+    height: 6px;
+    background: var(--bg-tertiary);
+    border-radius: 3px;
+    overflow: hidden;
+}
+.toast-progress-bar-fill {
+    height: 100%;
+    background: var(--accent);
+    border-radius: 3px;
+    transition: width 0.2s ease;
+    width: 0%;
+}
+.toast-progress-bar-fill.indeterminate {
+    width: 100% !important;
+    animation: indeterminate 1.2s ease-in-out infinite;
+    background: linear-gradient(90deg, transparent, var(--accent), transparent);
+    background-size: 200% 100%;
+}
+@keyframes indeterminate {
+    0% { background-position: 200% 0; }
+    100% { background-position: -200% 0; }
+}
+.toast-progress-detail {
+    font-size: 11px;
+    color: var(--text-muted);
+}
+
 /* ===== Responsive ===== */
 
 @media (max-width: 700px) {
