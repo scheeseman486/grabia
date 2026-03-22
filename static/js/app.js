@@ -64,7 +64,7 @@
     }
 
     function clearAllNotifications() {
-        notifications = [];
+        notifications = notifications.filter((n) => n.scanArchiveId);
         renderNotifBadge();
         renderNotifList();
     }
@@ -1019,7 +1019,11 @@
     const SORT_COL_MAP = { "col-name": "name", "col-size": "size", "col-modified": "modified", "col-status": "status" };
     const SORT_DEFAULTS = { name: "asc", size: "desc", modified: "desc", status: "asc", priority: "asc" };
 
+    // Stack icon SVG for the priority/download-order column
+    const STACK_ICON = '<svg viewBox="0 0 24 24" width="14" height="14" style="vertical-align:middle"><path d="M4 18h16v-2H4v2zm0-5h16v-2H4v2zm0-7v2h16V6H4z" fill="currentColor"/></svg>';
+
     function updateSortArrows() {
+        // Text column headers
         for (const [cls, sort] of Object.entries(SORT_COL_MAP)) {
             const th = $(`.${cls}`);
             if (!th) continue;
@@ -1031,6 +1035,13 @@
             } else {
                 th.textContent = label;
             }
+        }
+        // Priority (stack icon) column header
+        const priTh = $(".col-priority-sort");
+        if (priTh) {
+            const dir = currentSortDir || SORT_DEFAULTS["priority"];
+            const arrow = currentSort === "priority" ? `<span class="sort-arrow">${dir === "asc" ? "\u25B2" : "\u25BC"}</span>` : "";
+            priTh.innerHTML = STACK_ICON + arrow;
         }
     }
 
@@ -1063,10 +1074,7 @@
         const thead = fileListEl.closest("table").querySelector("thead tr");
         thead.innerHTML = "";
         if (isPriority) {
-            thead.innerHTML += '<th class="col-grip">' +
-                '<button class="btn-reset-order" id="btn-reset-order" title="Reset download order to alphabetical">' +
-                '<svg viewBox="0 0 24 24" width="14" height="14"><path d="M17.65 6.35A7.958 7.958 0 0012 4c-4.42 0-7.99 3.58-7.99 8s3.57 8 7.99 8c3.73 0 6.84-2.55 7.73-6h-2.08A5.99 5.99 0 0112 18c-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z" fill="currentColor"/></svg>' +
-                '</button></th>';
+            thead.innerHTML += '<th class="col-grip col-priority-sort" title="Download Order"></th>';
         }
         thead.innerHTML += '<th class="col-check"><input type="checkbox" id="select-all-files" title="Select / deselect all files"></th>';
         thead.innerHTML += '<th class="col-name">Name</th>';
@@ -1076,10 +1084,17 @@
         if (isPriority) {
             thead.innerHTML += '<th class="col-priority"></th>';
         }
+        // Show/hide reset order button based on sort mode
+        const resetBtn = $("#btn-reset-order");
+        if (resetBtn) resetBtn.style.display = isPriority ? "" : "none";
         // Re-attach handlers
         $("#select-all-files").addEventListener("change", (e) => toggleSelectAll(e.target.checked));
-        const resetBtn = document.getElementById("btn-reset-order");
-        if (resetBtn) resetBtn.addEventListener("click", confirmResetOrder);
+        // Priority column sort header (stack icon)
+        const priTh = $(".col-priority-sort");
+        if (priTh) {
+            priTh.style.cursor = "pointer";
+            priTh.addEventListener("click", () => onColumnHeaderClick("priority"));
+        }
         // Re-attach column header sort handlers
         for (const [cls, sort] of Object.entries(SORT_COL_MAP)) {
             const th = $(`.${cls}`);
@@ -2030,7 +2045,8 @@
         $("#btn-force-resume-cancel").addEventListener("click", () => { pendingForceResumeId = null; $("#modal-force-resume").classList.remove("open"); });
         $("#btn-force-resume-confirm").addEventListener("click", doForceResume);
 
-        // Reset download order modal
+        // Reset download order
+        $("#btn-reset-order").addEventListener("click", confirmResetOrder);
         $("#btn-reset-order-cancel").addEventListener("click", () => $("#modal-reset-order").classList.remove("open"));
         $("#btn-reset-order-confirm").addEventListener("click", () => {
             const suppress = $("#reset-order-suppress").checked;

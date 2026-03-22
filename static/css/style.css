@@ -746,19 +746,7 @@ main {
 /* File drag & priority (Download Order mode) */
 
 .col-grip { width: 28px; padding: 0 4px; text-align: center; }
-.btn-reset-order {
-    background: none;
-    border: none;
-    color: var(--text-muted);
-    cursor: pointer;
-    padding: 2px;
-    line-height: 1;
-    border-radius: 3px;
-}
-.btn-reset-order:hover {
-    color: var(--danger);
-    background: var(--bg-hover);
-}
+.col-priority-sort:hover { color: var(--accent); }
 .col-priority { width: 52px; text-align: center; padding: 0 2px; }
 
 .file-grip {
