@@ -420,6 +420,20 @@
         </div>
     </div>
 
+    <!-- Force Resume Conflict Modal -->
+    <div class="modal-overlay" id="modal-force-resume">
+        <div class="modal">
+            <h3>Resolve Conflict</h3>
+            <p id="force-resume-info"></p>
+            <p id="force-resume-progress"></p>
+            <p class="text-warning">Warning: if this file does not belong to this archive, it will be overwritten by the correct file on the next download.</p>
+            <div class="modal-actions">
+                <button class="action-btn" id="btn-force-resume-cancel">Cancel</button>
+                <button class="action-btn danger" id="btn-force-resume-confirm">Force Resume</button>
+            </div>
+        </div>
+    </div>
+
     <div id="toast-container" class="toast-container"></div>
     <script src="{{ static_url('js/app.js') }}"></script>
 </body>

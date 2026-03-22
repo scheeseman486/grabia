@@ -734,6 +734,7 @@
             const s = result.summary;
             const parts = [];
             if (s.matched > 0) parts.push(`${s.matched} matched`);
+            if (s.partial > 0) parts.push(`${s.partial} partial`);
             if (s.conflict > 0) parts.push(`${s.conflict} conflict`);
             if (s.unknown > 0) parts.push(`${s.unknown} unknown`);
             if (s.missing > 0) parts.push(`${s.missing} not on disk`);
@@ -757,6 +758,42 @@
         if (!currentArchiveId) return;
         await api("POST", `/api/archives/${currentArchiveId}/clear-changes`);
         await loadFiles();
+    }
+
+    // --- Force Resume Conflict ---
+
+    let pendingForceResumeId = null;
+
+    function openForceResume(info) {
+        pendingForceResumeId = info.id;
+        $("#force-resume-info").innerHTML =
+            `<strong>${escapeHtml(info.name)}</strong><br>` +
+            `Reason: ${escapeHtml(info.error)}`;
+        if (info.size > 0) {
+            // We don't know the on-disk size from the file list data, but the error message
+            // for size mismatches contains it. Show the manifest size for context.
+            $("#force-resume-progress").textContent =
+                `Expected size: ${formatBytes(info.size)}. ` +
+                `Forcing resume will mark this file as pending and the downloader will attempt to resume or re-download it.`;
+        } else {
+            $("#force-resume-progress").textContent =
+                "Forcing resume will mark this file as pending and the downloader will attempt to re-download it.";
+        }
+        $("#modal-force-resume").classList.add("open");
+    }
+
+    async function doForceResume() {
+        if (!pendingForceResumeId) return;
+        try {
+            await api("POST", `/api/files/${pendingForceResumeId}/force-resume`);
+            addNotification("Conflict resolved — file queued for download", "success");
+            await loadFiles();
+            await refreshArchives();
+        } catch (e) {
+            addNotification("Failed to resolve conflict: " + e.message, "error");
+        }
+        $("#modal-force-resume").classList.remove("open");
+        pendingForceResumeId = null;
     }
 
     // --- Archive Detail ---
@@ -975,9 +1012,12 @@
             const displayStatus = formatFileStatus(f);
             const statusClass = displayStatus === "skipped" ? "skipped" : f.download_status;
             const hasError = (f.download_status === "failed" || f.download_status === "conflict" || f.download_status === "unknown") && f.error_message;
+            const isConflict = f.download_status === "conflict";
             html += `<td class="col-status">` +
                 `<span class="file-status ${statusClass}" ${hasError ? `title="${escapeHtml(f.error_message)}"` : ""}>${displayStatus}</span>` +
-                (hasError ? `<span class="file-error-hint" title="${escapeHtml(f.error_message)}">&#9432;</span>` : "") +
+                (hasError && isConflict
+                    ? `<span class="file-error-hint clickable" data-conflict-file='${JSON.stringify({id: f.id, name: f.name, size: f.size, error: f.error_message})}' title="Click to resolve conflict">&#9432;</span>`
+                    : hasError ? `<span class="file-error-hint" title="${escapeHtml(f.error_message)}">&#9432;</span>` : "") +
                 (f.download_status === "failed" ? `<button class="retry-file-btn" data-retry-file="${f.id}" title="Retry this file">&#x21bb;</button>` : "") +
                 `</td>`;
 
@@ -1007,6 +1047,15 @@
             const retryBtn = tr.querySelector(".retry-file-btn");
             if (retryBtn) {
                 retryBtn.addEventListener("click", () => retryFile(f.id));
+            }
+
+            // Conflict resolve handler
+            const conflictHint = tr.querySelector(".file-error-hint.clickable");
+            if (conflictHint) {
+                conflictHint.addEventListener("click", () => {
+                    const info = JSON.parse(conflictHint.dataset.conflictFile);
+                    openForceResume(info);
+                });
             }
 
             // Priority mode: drag & priority button handlers for selected files
@@ -1684,6 +1733,10 @@
         $("#btn-group-delete-cancel").addEventListener("click", () => { pendingDeleteGroup = null; $("#modal-delete-group").classList.remove("open"); });
         $("#btn-group-delete-confirm").addEventListener("click", doDeleteGroup);
         $("#btn-move-group-cancel").addEventListener("click", () => { pendingGroupArchive = null; $("#modal-move-to-group").classList.remove("open"); });
+
+        // Force resume conflict modal
+        $("#btn-force-resume-cancel").addEventListener("click", () => { pendingForceResumeId = null; $("#modal-force-resume").classList.remove("open"); });
+        $("#btn-force-resume-confirm").addEventListener("click", doForceResume);
 
         // Reset download order modal
         $("#btn-reset-order-cancel").addEventListener("click", () => $("#modal-reset-order").classList.remove("open"));

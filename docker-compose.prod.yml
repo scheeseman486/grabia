@@ -1,0 +1,14 @@
+services:
+  grabia:
+    image: ghcr.io/scheeseman486/grabia:latest
+    ports:
+      - "5000:5000"
+    volumes:
+      - grabia-data:/app/data
+      - /mnt/user/data/grabia/downloads:/app/downloads
+    environment:
+      - GRABIA_PORT=5000
+    restart: unless-stopped
+
+volumes:
+  grabia-data:

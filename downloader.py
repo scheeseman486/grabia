@@ -473,7 +473,8 @@ class DownloadManager:
             SELECT
                 COUNT(*) as total,
                 SUM(CASE WHEN download_status = 'completed' THEN 1 ELSE 0 END) as completed,
-                SUM(CASE WHEN download_status = 'failed' THEN 1 ELSE 0 END) as failed
+                SUM(CASE WHEN download_status = 'failed' THEN 1 ELSE 0 END) as failed,
+                SUM(CASE WHEN download_status = 'conflict' THEN 1 ELSE 0 END) as conflict
             FROM archive_files
             WHERE archive_id = ? AND selected = 1
         """, (archive_id,)).fetchone()
@@ -482,7 +483,7 @@ class DownloadManager:
         if row["total"] > 0:
             if row["completed"] == row["total"]:
                 db.set_archive_status(archive_id, "completed")
-            elif row["failed"] > 0 and row["completed"] + row["failed"] == row["total"]:
+            elif row["completed"] + row["failed"] + row["conflict"] == row["total"]:
                 db.set_archive_status(archive_id, "partial")
 
 

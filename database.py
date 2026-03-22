@@ -339,6 +339,29 @@ def recompute_archive_file_count(archive_id):
     conn.close()
 
 
+def recompute_archive_status(archive_id):
+    """Recalculate archive status from its file statuses (used after scan)."""
+    conn = get_db()
+    row = conn.execute("""
+        SELECT
+            COUNT(*) as total,
+            SUM(CASE WHEN download_status = 'completed' THEN 1 ELSE 0 END) as completed,
+            SUM(CASE WHEN download_status = 'failed' THEN 1 ELSE 0 END) as failed,
+            SUM(CASE WHEN download_status = 'conflict' THEN 1 ELSE 0 END) as conflict
+        FROM archive_files
+        WHERE archive_id = ? AND selected = 1 AND origin = 'manifest'
+    """, (archive_id,)).fetchone()
+    if row["total"] > 0:
+        if row["completed"] == row["total"]:
+            set_archive_status(archive_id, "completed")
+        elif row["completed"] + row["failed"] + row["conflict"] == row["total"]:
+            # All files accounted for but some are failed/conflict
+            set_archive_status(archive_id, "partial")
+        elif row["completed"] > 0 or row["conflict"] > 0:
+            set_archive_status(archive_id, "idle")
+    conn.close()
+
+
 def set_archive_download_enabled(archive_id, enabled):
     conn = get_db()
     conn.execute("UPDATE archives SET download_enabled = ? WHERE id = ?", (1 if enabled else 0, archive_id))

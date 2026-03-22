@@ -1306,6 +1306,8 @@ main {
 }
 
 .text-muted { color: var(--text-muted); font-size: 13px; }
+.text-warning { color: #c9a227; font-size: 13px; font-style: italic; }
+.file-error-hint.clickable { cursor: pointer; text-decoration: underline; }
 
 @media (max-width: 700px) {
     .settings-layout { flex-direction: column; }

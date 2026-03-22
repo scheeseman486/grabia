@@ -464,9 +464,10 @@ def scan_existing_files(archive_id):
     ).fetchall()
     manifest = {r["name"]: dict(r) for r in rows}
 
-    summary = {"matched": 0, "conflict": 0, "unknown": 0, "missing": 0}
+    summary = {"matched": 0, "conflict": 0, "unknown": 0, "missing": 0, "partial": 0}
     matched_ids = []     # (file_id, local_size) — exact match
     conflict_ids = []    # (file_id, reason) — file exists but doesn't match
+    partial_ids = []     # (file_id, local_size) — partially downloaded
     seen_paths = set()   # track manifest files found on disk
 
     for name, info in manifest.items():
@@ -502,8 +503,13 @@ def scan_existing_files(archive_id):
 
         # Size check first (fast)
         if has_size and local_size != expected_size:
-            conflict_ids.append((info["id"], f"Size mismatch: local {local_size} vs expected {expected_size}"))
-            summary["conflict"] += 1
+            if local_size < expected_size:
+                # Smaller than expected — likely a partial download
+                partial_ids.append((info["id"], local_size))
+                summary["partial"] += 1
+            else:
+                conflict_ids.append((info["id"], f"Size mismatch: local {local_size} vs expected {expected_size}"))
+                summary["conflict"] += 1
             continue
 
         # MD5 check (slower, but definitive)
@@ -542,6 +548,12 @@ def scan_existing_files(archive_id):
             "UPDATE archive_files SET download_status = 'completed', downloaded_bytes = ?, selected = 1 WHERE id = ?",
             (size, file_id),
         )
+    for file_id, local_size in partial_ids:
+        conn.execute(
+            "UPDATE archive_files SET download_status = 'pending', downloaded_bytes = ?, selected = 1, "
+            "error_message = 'Partial download detected by scan' WHERE id = ?",
+            (local_size, file_id),
+        )
     for file_id, reason in conflict_ids:
         conn.execute(
             "UPDATE archive_files SET download_status = 'conflict', error_message = ? WHERE id = ?",
@@ -573,9 +585,44 @@ def scan_existing_files(archive_id):
 
     # Update archive status and file count
     db.recompute_archive_file_count(archive_id)
+    db.recompute_archive_status(archive_id)
     updated = db.get_archive(archive_id)
     broadcast_sse("archive_updated", updated)
     return jsonify({"ok": True, "summary": summary, "unknown_files": unknown_files})
+
+
+@app.route("/api/files/<int:file_id>/force-resume", methods=["POST"])
+@login_required
+def force_resume_file(file_id):
+    """Force a conflict file back to pending state so the downloader will resume it."""
+    conn = db.get_db()
+    row = conn.execute(
+        "SELECT id, archive_id, name, size, download_status FROM archive_files WHERE id = ?",
+        (file_id,),
+    ).fetchone()
+    if not row:
+        return jsonify({"error": "File not found"}), 404
+    if row["download_status"] != "conflict":
+        return jsonify({"error": "File is not in conflict state"}), 400
+
+    # Get actual file size on disk
+    archive = db.get_archive(row["archive_id"])
+    download_dir = db.get_setting("download_dir", os.path.expanduser("~/ia-downloads"))
+    local_path = os.path.join(download_dir, archive["identifier"], row["name"])
+    local_size = 0
+    if os.path.isfile(local_path):
+        local_size = os.path.getsize(local_path)
+
+    conn.execute(
+        "UPDATE archive_files SET download_status = 'pending', downloaded_bytes = ?, "
+        "selected = 1, error_message = '' WHERE id = ?",
+        (local_size, file_id),
+    )
+    conn.commit()
+    conn.close()
+
+    db.recompute_archive_status(row["archive_id"])
+    return jsonify({"ok": True, "downloaded_bytes": local_size, "size": row["size"]})
 
 
 @app.route("/api/archives/<int:archive_id>/clear-changes", methods=["POST"])
