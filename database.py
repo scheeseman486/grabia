@@ -405,18 +405,25 @@ def set_archive_status(archive_id, status):
 # --- Archive Files ---
 
 _FILE_SORT_MAP = {
-    "name": "name ASC",
-    "size": "size DESC",
-    "modified": "mtime DESC",
-    "status": "download_status ASC, name ASC",
-    "priority": "selected DESC, download_priority ASC",
+    "name": ("name", "ASC"),
+    "size": ("size", "DESC"),
+    "modified": ("mtime", "DESC"),
+    "status": ("download_status", "ASC"),
+    "priority": ("download_priority", "ASC"),
 }
 
 
-def get_archive_files(archive_id, page=1, per_page=50, sort="name", search=""):
+def get_archive_files(archive_id, page=1, per_page=50, sort="name", sort_dir=None, search=""):
     conn = get_db()
     offset = (page - 1) * per_page
-    order = _FILE_SORT_MAP.get(sort, _FILE_SORT_MAP["name"])
+    col, default_dir = _FILE_SORT_MAP.get(sort, _FILE_SORT_MAP["name"])
+    direction = sort_dir.upper() if sort_dir in ("asc", "desc") else default_dir
+    if sort == "priority":
+        order = f"selected DESC, download_priority {direction}"
+    else:
+        order = f"{col} {direction}"
+        if sort != "name":
+            order += ", name ASC"
     where = "archive_id = ?"
     params = [archive_id]
     if search:

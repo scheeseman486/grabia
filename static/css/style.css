@@ -831,10 +831,13 @@ main {
 
 .col-check { width: 40px; text-align: center; }
 .col-check input { accent-color: var(--accent); cursor: pointer; }
+.col-name, .col-size, .col-modified, .col-status { user-select: none; }
+.col-name:hover, .col-size:hover, .col-modified:hover, .col-status:hover { color: var(--accent); }
 .col-name { min-width: 200px; }
 .col-size { width: 100px; text-align: right; }
 .col-modified { width: 150px; }
 .col-status { width: 120px; }
+.sort-arrow { font-size: 10px; opacity: 0.7; margin-left: 2px; }
 
 .file-name {
     word-break: break-all;

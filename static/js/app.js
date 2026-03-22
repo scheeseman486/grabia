@@ -28,6 +28,7 @@
     let currentArchiveId = null;
     let currentPage = 1;
     let currentSort = "priority";
+    let currentSortDir = ""; // empty = use backend default
     let fileSearchQuery = "";
     let fileSearchTimer = null;
     let dlState = "stopped";
@@ -978,6 +979,7 @@
         currentArchiveId = id;
         currentPage = 1;
         currentSort = "priority";
+        currentSortDir = "";
         fileSearchQuery = "";
         $("#file-sort").value = "priority";
         $("#file-search").value = "";
@@ -992,6 +994,7 @@
         }
         await loadFiles();
         updateScanButton();
+        updateSortArrows();
     }
 
     function closeDetail() {
@@ -1005,12 +1008,47 @@
         if (!currentArchiveId) return;
         try {
             const searchParam = fileSearchQuery ? `&search=${encodeURIComponent(fileSearchQuery)}` : "";
-            const data = await api("GET", `/api/archives/${currentArchiveId}/files?page=${currentPage}&sort=${currentSort}${searchParam}`);
+            const dirParam = currentSortDir ? `&sort_dir=${currentSortDir}` : "";
+            const data = await api("GET", `/api/archives/${currentArchiveId}/files?page=${currentPage}&sort=${currentSort}${dirParam}${searchParam}`);
             renderFiles(data);
             if (data.progress) updateDetailProgressFromData(data.progress);
         } catch (e) {
             fileListEl.innerHTML = `<tr><td colspan="5" style="text-align:center;padding:20px;color:var(--danger)">${escapeHtml(e.message)}</td></tr>`;
         }
+    }
+
+    const SORT_COL_MAP = { "col-name": "name", "col-size": "size", "col-modified": "modified", "col-status": "status" };
+    const SORT_DEFAULTS = { name: "asc", size: "desc", modified: "desc", status: "asc", priority: "asc" };
+
+    function updateSortArrows() {
+        for (const [cls, sort] of Object.entries(SORT_COL_MAP)) {
+            const th = $(`.${cls}`);
+            if (!th) continue;
+            const label = th.textContent.replace(/[\u25B2\u25BC]/g, "").trim();
+            if (sort === currentSort) {
+                const dir = currentSortDir || SORT_DEFAULTS[sort];
+                const arrow = dir === "asc" ? "\u25B2" : "\u25BC";
+                th.innerHTML = `${label} <span class="sort-arrow">${arrow}</span>`;
+            } else {
+                th.textContent = label;
+            }
+        }
+    }
+
+    function onColumnHeaderClick(sortKey) {
+        if (currentSort === sortKey) {
+            // Toggle direction
+            const def = SORT_DEFAULTS[sortKey];
+            const cur = currentSortDir || def;
+            currentSortDir = cur === "asc" ? "desc" : "asc";
+        } else {
+            currentSort = sortKey;
+            currentSortDir = "";
+            $("#file-sort").value = sortKey;
+        }
+        currentPage = 1;
+        loadFiles();
+        updateSortArrows();
     }
 
     function syncSelectAll() {
@@ -2003,10 +2041,19 @@
         $("#btn-refresh-meta").addEventListener("click", refreshMetadata);
         $("#btn-scan-files").addEventListener("click", scanExistingFiles);
         $("#btn-clear-changes").addEventListener("click", clearChanges);
+        for (const [cls, sort] of Object.entries(SORT_COL_MAP)) {
+            const th = $(`.${cls}`);
+            if (th) {
+                th.style.cursor = "pointer";
+                th.addEventListener("click", () => onColumnHeaderClick(sort));
+            }
+        }
         $("#file-sort").addEventListener("change", (e) => {
             currentSort = e.target.value;
+            currentSortDir = "";
             currentPage = 1;
             loadFiles();
+            updateSortArrows();
         });
         $("#file-search").addEventListener("input", (e) => {
             clearTimeout(fileSearchTimer);

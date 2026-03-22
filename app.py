@@ -805,9 +805,10 @@ def archive_progress(archive_id):
 def list_archive_files(archive_id):
     page = request.args.get("page", 1, type=int)
     sort = request.args.get("sort", "name")
+    sort_dir = request.args.get("sort_dir", "")
     search = request.args.get("search", "").strip()
     per_page = int(db.get_setting("files_per_page", "50"))
-    files, total = db.get_archive_files(archive_id, page, per_page, sort=sort, search=search)
+    files, total = db.get_archive_files(archive_id, page, per_page, sort=sort, sort_dir=sort_dir, search=search)
     unselected = db.count_unselected_files(archive_id)
     progress = db.get_archive_progress(archive_id)
     return jsonify({
