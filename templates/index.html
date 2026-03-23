@@ -228,6 +228,10 @@
                         <svg viewBox="0 0 24 24" width="18" height="18"><path d="M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58a.49.49 0 00.12-.61l-1.92-3.32a.49.49 0 00-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54a.484.484 0 00-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.07.62-.07.94s.02.64.07.94l-2.03 1.58a.49.49 0 00-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6A3.6 3.6 0 1115.6 12 3.6 3.6 0 0112 15.6z" fill="currentColor"/></svg>
                         Processing
                     </button>
+                    <button class="settings-tab" data-tab="tab-debug">
+                        <svg viewBox="0 0 24 24" width="18" height="18"><path d="M20 8h-2.81a5.985 5.985 0 00-1.82-1.96L17 4.41 15.59 3l-2.17 2.17C12.96 5.06 12.49 5 12 5s-.96.06-1.41.17L8.41 3 7 4.41l1.62 1.63C7.88 6.55 7.26 7.22 6.81 8H4v2h2.09c-.05.33-.09.66-.09 1v1H4v2h2v1c0 .34.04.67.09 1H4v2h2.81c1.04 1.79 2.97 3 5.19 3s4.15-1.21 5.19-3H20v-2h-2.09c.05-.33.09-.66.09-1v-1h2v-2h-2v-1c0-.34-.04-.67-.09-1H20V8zm-6 8h-4v-2h4v2zm0-4h-4v-2h4v2z" fill="currentColor"/></svg>
+                        Debug
+                    </button>
                 </nav>
                 <div class="settings-content">
                     <!-- IA Account Tab -->
@@ -373,6 +377,21 @@
                         <p class="settings-desc">Profiles define how files should be converted after downloading. Assign them to archives via the "Process Archive" button.</p>
                         <div id="processing-profiles-list"></div>
                         <button class="action-btn" id="btn-add-profile" type="button">Add Profile</button>
+                    </div>
+                    <!-- Debug Tab -->
+                    <div class="settings-panel" id="tab-debug">
+                        <h3>Debug Logging</h3>
+                        <p class="settings-desc">Enable debug output to see detailed information about scans, downloads, and file processing in the terminal console.</p>
+                        <div class="settings-form">
+                            <label class="toggle-label">
+                                <input type="checkbox" id="set-debug-enabled">
+                                Enable debug logging
+                            </label>
+                            <label>Log file (optional)
+                                <input type="text" id="set-debug-log-file" placeholder="Console only (no file)">
+                                <small>Also write debug output to a file. Leave blank for console-only.</small>
+                            </label>
+                        </div>
                     </div>
                 </div>
             </div>

@@ -27,6 +27,7 @@ from datetime import datetime
 import requests
 import database as db
 import ia_client
+from logger import log
 
 log = logging.getLogger(__name__)
 
@@ -216,7 +217,7 @@ class DownloadManager:
         local_path = os.path.realpath(os.path.join(base_dir, filename))
         if not local_path.startswith(base_dir + os.sep) and local_path != base_dir:
             error_msg = f"Blocked path traversal in filename: {filename}"
-            log.warning(error_msg)
+            log.warning("download", "%s", error_msg)
             db.set_file_download_status(file_id, "failed", error_message=error_msg)
             self._notify("file_error", {"file_id": file_id, "filename": filename, "identifier": identifier, "error": error_msg})
             return
@@ -230,7 +231,7 @@ class DownloadManager:
         ia_password = db.get_setting("ia_password", "")
         cookies, auth_error = ia_client.get_download_cookies(ia_email, ia_password)
         if auth_error:
-            log.warning("IA auth issue for %s: %s", filename, auth_error)
+            log.warning("download", "IA auth issue for %s: %s", filename, auth_error)
 
         with self._lock:
             self._current_file_info = {
@@ -243,6 +244,7 @@ class DownloadManager:
                 "status": "downloading",
             }
 
+        log.debug("download", "Starting download: %s (%s bytes)", filename, expected_size)
         db.set_file_download_status(file_id, "downloading")
         db.set_archive_status(archive_id, "downloading")
         self._notify("file_start", {"file_id": file_id, "filename": filename})
@@ -261,18 +263,19 @@ class DownloadManager:
                 ia_client.invalidate_cookie_cache()
             else:
                 error_msg = f"HTTP {status_code}: {str(e)}"
-            log.warning("Download failed for %s: %s", filename, error_msg)
+            log.warning("download", "Failed %s: %s", filename, error_msg)
             db.set_file_download_status(file_id, "failed", error_message=error_msg)
             db.increment_file_retry(file_id)
             self._notify("file_error", {"file_id": file_id, "filename": filename, "identifier": identifier, "error": error_msg})
         except Exception as e:
             error_msg = str(e)
-            log.warning("Download failed for %s: %s", filename, error_msg)
+            log.warning("download", "Failed %s: %s", filename, error_msg)
             db.set_file_download_status(file_id, "failed", error_message=error_msg)
             db.increment_file_retry(file_id)
             self._notify("file_error", {"file_id": file_id, "filename": filename, "identifier": identifier, "error": error_msg})
 
         if success:
+            log.debug("download", "Completed: %s", filename)
             db.set_file_download_status(file_id, "completed", downloaded_bytes=expected_size)
             self._notify("file_complete", {"file_id": file_id, "filename": filename, "identifier": identifier})
         elif not self._stop_event.is_set() and not success:

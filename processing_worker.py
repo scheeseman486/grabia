@@ -23,6 +23,7 @@ import threading
 import time
 
 import database as db
+from logger import log
 from processors import (
     get_processor,
     ProcessingError,
@@ -126,6 +127,8 @@ def _run_processing(job):
     def _cancelled():
         return cancel_evt and cancel_evt.is_set()
 
+    log.info("worker", "Processing job started: archive=%d, profile=%d", archive_id, profile_id)
+
     # Load profile
     profile = db.get_processing_profile(profile_id)
     if not profile:
@@ -155,6 +158,8 @@ def _run_processing(job):
     # Merge profile options with overrides
     profile_options = json.loads(profile.get("options_json", "{}"))
     merged_options = {**profile_options, **options_override}
+    log.debug("worker", "Profile: %s, processor: %s, options: %s",
+              profile["name"], profile["processor_type"], merged_options)
 
     # Get download directory
     download_dir = db.get_setting("download_dir", os.path.expanduser("~/ia-downloads"))
@@ -175,11 +180,18 @@ def _run_processing(job):
         files = db.get_processable_files(archive_id)
 
     # Filter to files the processor can handle
-    # Filter by input extensions
     input_exts = set(processor_cls.input_extensions)
+    pre_filter = len(files)
+    rejected = [f for f in files if os.path.splitext(f["name"])[1].lower() not in input_exts]
     files = [f for f in files if os.path.splitext(f["name"])[1].lower() in input_exts]
+    log.debug("worker", "File filter: %d eligible, %d matched extensions %s, %d rejected",
+              pre_filter, len(files), sorted(input_exts), len(rejected))
+    for r in rejected:
+        ext = os.path.splitext(r["name"])[1].lower()
+        log.debug("worker", "  Rejected: %s (ext: %s)", r["name"], ext)
 
     if not files:
+        log.info("worker", "No files to process after filtering — done")
         _broadcast("processing_progress", {
             "archive_id": archive_id,
             "phase": "done",
@@ -228,6 +240,7 @@ def _run_processing(job):
             })
 
         try:
+            log.debug("worker", "Processing file %d/%d: %s", i + 1, len(files), filename)
             processor = processor_cls(
                 options=merged_options,
                 cancel_check=_cancelled,
@@ -240,6 +253,7 @@ def _run_processing(job):
             result = processor.process(file_path, archive_dir)
 
             if result.get("skipped"):
+                log.info("worker", "Skipped %s: %s", filename, result.get("reason", "Not processable"))
                 db.set_file_processing_status(
                     file_id, "skipped",
                     error=result.get("reason", "Not processable"),
@@ -254,6 +268,7 @@ def _run_processing(job):
                         except OSError:
                             pass
 
+                log.info("worker", "Completed %s -> %s", filename, result["processed_filename"])
                 db.set_file_processing_status(
                     file_id, "completed",
                     processed_filename=result["processed_filename"],
@@ -284,6 +299,7 @@ def _run_processing(job):
             return
 
         except ProcessingError as e:
+            log.error("worker", "Failed %s: %s", filename, e)
             db.set_file_processing_status(file_id, "failed", error=str(e))
             summary["failed"] += 1
             _broadcast("processing_progress", {
@@ -309,6 +325,8 @@ def _run_processing(job):
                 "total": len(files),
             })
 
+    log.info("worker", "Processing complete for archive %d: %d processed, %d skipped, %d failed",
+             archive_id, summary["processed"], summary["skipped"], summary["failed"])
     _broadcast("processing_progress", {
         "archive_id": archive_id,
         "phase": "done",

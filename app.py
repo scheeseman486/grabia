@@ -28,6 +28,7 @@ from flask import Flask, render_template, request, jsonify, Response, session, r
 import database as db
 import ia_client
 from downloader import download_manager
+from logger import log, configure as configure_logging
 
 app = Flask(__name__)
 
@@ -238,7 +239,8 @@ def update_settings():
                "speed_schedule", "use_http", "confirm_reset_order",
                "default_enable_archive", "default_select_all", "sse_update_rate",
                "tool_chdman_path", "tool_maxcso_path", "tool_7z_path",
-               "tool_unrar_path", "processing_temp_dir"]
+               "tool_unrar_path", "processing_temp_dir",
+               "debug_enabled", "debug_log_file"]
     credentials_changed = False
     for key in allowed:
         if key in data:
@@ -253,6 +255,12 @@ def update_settings():
     # Update bandwidth limit in running manager
     if "bandwidth_limit" in data:
         download_manager.bandwidth_limit = int(data["bandwidth_limit"])
+    # Reconfigure debug logging if changed
+    if "debug_enabled" in data or "debug_log_file" in data:
+        configure_logging(
+            enabled=db.get_setting("debug_enabled", "0") == "1",
+            log_file=db.get_setting("debug_log_file", ""),
+        )
     broadcast_sse("settings_updated", db.get_all_settings())
     return jsonify({"ok": True})
 
@@ -461,9 +469,11 @@ _scan_thread.start()
 
 def _run_scan(archive_id):
     """Execute the actual scan logic in a background thread."""
+    log.info("scan", "Starting scan for archive %d", archive_id)
     cancel_evt = _scan_cancel.get(archive_id)
     archive = db.get_archive(archive_id)
     if not archive:
+        log.warning("scan", "Archive %d not found, aborting scan", archive_id)
         return
 
     # Read update rate from settings (milliseconds -> seconds)
@@ -515,6 +525,7 @@ def _run_scan(archive_id):
         (archive_id,),
     ).fetchall()
     manifest = {r["name"]: dict(r) for r in rows}
+    log.debug("scan", "Manifest has %d files for %s", len(manifest), archive["identifier"])
 
     summary = {"matched": 0, "conflict": 0, "unknown": 0, "missing": 0, "partial": 0}
 
@@ -546,11 +557,13 @@ def _run_scan(archive_id):
         if info.get("processing_status") == "completed":
             pf = info.get("processed_filename", "")
             if pf and os.path.isfile(os.path.join(base_dir, pf)):
+                log.debug("scan", "%s: processed file %s exists, matched", name, pf)
                 summary["matched"] += 1
                 processed += 1
                 _progress()
                 continue
             # Processed file is gone — reset processing state so it can be re-downloaded/re-processed
+            log.info("scan", "%s: processed file %s missing, resetting processing state", name, pf)
             pending_writes.append((
                 "UPDATE archive_files SET processing_status = '', processed_filename = '', "
                 "processed_files_json = '', processor_type = '', processing_error = '' WHERE id = ?",
@@ -724,9 +737,13 @@ def _run_scan(archive_id):
     conn.commit()
     conn.close()
 
+    if unknown_files:
+        log.debug("scan", "%d unknown files found on disk", len(unknown_files))
+
     db.recompute_archive_file_count(archive_id)
     db.recompute_archive_status(archive_id)
     updated = db.get_archive(archive_id)
+    log.info("scan", "Scan complete for %s: %s", archive["identifier"], summary)
     broadcast_sse("scan_progress", {
         "archive_id": archive_id, "phase": "done",
         "current": total_manifest, "total": total_manifest,
@@ -1084,6 +1101,11 @@ def process_single_file(file_id):
 def create_app():
     db.init_db()
     db.reset_downloading_files()
+    # Configure debug logging from saved settings
+    configure_logging(
+        enabled=db.get_setting("debug_enabled", "0") == "1",
+        log_file=db.get_setting("debug_log_file", ""),
+    )
     # Start processing worker
     from processing_worker import init_processing_worker
     init_processing_worker(broadcast_sse)

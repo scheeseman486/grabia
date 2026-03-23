@@ -24,6 +24,8 @@ import subprocess
 import tempfile
 import zipfile
 
+from logger import log
+
 # Optional extraction libraries
 try:
     import py7zr
@@ -74,8 +76,14 @@ def _find_binary(name, setting_key=None):
     if setting_key:
         custom = db.get_setting(setting_key, "")
         if custom and os.path.isfile(custom) and os.access(custom, os.X_OK):
+            log.debug("tools", "%s: using custom path %s", name, custom)
             return custom
-    return shutil.which(name)
+    path = shutil.which(name)
+    if path:
+        log.debug("tools", "%s: found on PATH at %s", name, path)
+    else:
+        log.debug("tools", "%s: not found", name)
+    return path
 
 
 def _get_binary_version(path, version_flag="--version"):
@@ -122,15 +130,20 @@ def _extract_archive(archive_path, dest_dir, cancel_check=None):
     """Extract a compressed archive (zip, 7z, rar) to dest_dir.
     Returns list of extracted file paths relative to dest_dir."""
     ext = os.path.splitext(archive_path)[1].lower()
+    log.debug("extract", "Extracting %s (format: %s)", os.path.basename(archive_path), ext)
 
     if ext == ".zip":
-        return _extract_zip(archive_path, dest_dir)
+        files = _extract_zip(archive_path, dest_dir)
     elif ext == ".7z":
-        return _extract_7z(archive_path, dest_dir)
+        files = _extract_7z(archive_path, dest_dir)
     elif ext == ".rar":
-        return _extract_rar(archive_path, dest_dir)
+        files = _extract_rar(archive_path, dest_dir)
     else:
         raise ProcessingError(f"Unsupported archive format: {ext}")
+    log.debug("extract", "Extracted %d files from %s", len(files), os.path.basename(archive_path))
+    for f in files:
+        log.debug("extract", "  %s", f)
+    return files
 
 
 def _extract_zip(path, dest_dir):
@@ -233,6 +246,12 @@ def find_disc_images(file_list, base_dir):
                 "name": base,
             })
 
+    if found:
+        log.debug("disc", "Found %d disc image(s):", len(found))
+        for d in found:
+            log.debug("disc", "  %s [%s] — %d file(s)", d["name"], d["type"], len(d["files"]))
+    else:
+        log.debug("disc", "No disc images found in %d files", len(file_list))
     return found
 
 
@@ -274,21 +293,29 @@ def detect_disc_type(image_path, disc_info=None):
         "cd" or "dvd"
     """
     ext = os.path.splitext(image_path)[1].lower()
+    fname = os.path.basename(image_path)
 
     # CUE/BIN and GDI are inherently CD formats
     if ext in (".cue", ".gdi"):
+        log.debug("disc", "%s: detected as CD (format: %s)", fname, ext)
         return "cd"
     if disc_info and disc_info.get("type") in ("cue", "gdi"):
+        log.debug("disc", "%s: detected as CD (disc_info type: %s)", fname, disc_info["type"])
         return "cd"
     # .bin without a CUE is treated as raw CD sector dump
     if ext == ".bin":
+        log.debug("disc", "%s: detected as CD (standalone .bin)", fname)
         return "cd"
 
     # For ISO/IMG: inspect the file
     try:
         file_size = os.path.getsize(image_path)
     except OSError:
+        log.debug("disc", "%s: cannot stat file, defaulting to DVD", fname)
         return "dvd"  # safe fallback for large/unknown
+
+    size_mb = file_size / (1024 * 1024)
+    log.debug("disc", "%s: size %.1f MB, checking sector layout", fname, size_mb)
 
     # Check for raw CD sectors (2352 bytes/sector).  The ISO 9660 Primary
     # Volume Descriptor sits at logical sector 16.  For 2352-byte sectors
@@ -299,13 +326,16 @@ def detect_disc_type(image_path, disc_info=None):
             # Check 2352-byte sector layout first (raw CD)
             f.seek(16 * 2352 + 16)
             if f.read(5) == b"CD001":
+                log.debug("disc", "%s: detected as CD (2352-byte raw sectors)", fname)
                 return "cd"
             # Check standard 2048-byte sector layout
             f.seek(16 * 2048 + 1)
             if f.read(5) == b"CD001":
                 # Valid ISO 9660 — use size heuristic
                 if file_size <= _CD_MAX_BYTES:
+                    log.debug("disc", "%s: detected as CD (ISO 9660, %.1f MB <= threshold)", fname, size_mb)
                     return "cd"
+                log.debug("disc", "%s: detected as DVD (ISO 9660, %.1f MB > threshold)", fname, size_mb)
                 return "dvd"
     except OSError:
         pass
@@ -431,6 +461,8 @@ class CHDCDProcessor(BaseProcessor):
     ]
 
     def process(self, file_path, download_dir):
+        fname = os.path.basename(file_path)
+        log.info("proc", "CHD CD: processing %s", fname)
         chdman = _find_binary("chdman", "tool_chdman_path")
         if not chdman:
             raise ProcessingError("chdman not found. Install MAME tools or set the path in settings.")
@@ -440,9 +472,11 @@ class CHDCDProcessor(BaseProcessor):
 
         # If it's already an ISO or BIN, process directly (no extraction needed)
         if ext in (".iso", ".bin"):
+            log.debug("proc", "CHD CD: %s is a direct disc image, skipping extraction", fname)
             return self._convert_iso_direct(file_path, download_dir, chdman)
 
         # It's an archive — extract and find disc images
+        log.debug("proc", "CHD CD: %s is an archive, extracting to search for disc images", fname)
         temp_dir = self.get_temp_dir(file_path)
         try:
             self._progress(phase="extracting", filename=os.path.basename(file_path))
@@ -455,6 +489,7 @@ class CHDCDProcessor(BaseProcessor):
 
             disc_images = find_disc_images(extracted, temp_dir)
             if not disc_images:
+                log.info("proc", "CHD CD: %s — no disc images found, skipping", fname)
                 return {"skipped": True, "reason": "No disc images found in archive"}
 
             results = []
@@ -540,6 +575,7 @@ class CHDCDProcessor(BaseProcessor):
         if num_proc > 0:
             cmd.extend(["-np", str(num_proc)])
 
+        log.debug("proc", "Running: %s", " ".join(cmd))
         self._check_cancel()
         result = subprocess.run(
             cmd,
@@ -547,8 +583,10 @@ class CHDCDProcessor(BaseProcessor):
         )
         if result.returncode != 0:
             err = (result.stderr or result.stdout or "").strip()
+            log.error("proc", "chdman createcd failed (rc=%d): %s", result.returncode, err[:500])
             raise ProcessingError(f"chdman createcd failed: {err[:500]}")
 
+        log.debug("proc", "chdman createcd succeeded, verifying %s", os.path.basename(output_path))
         # Verify the output
         verify_result = subprocess.run(
             [chdman, "verify", "-i", output_path],
@@ -612,6 +650,8 @@ class CHDAutoProcessor(BaseProcessor):
         return ["-c", codec] if codec else []
 
     def process(self, file_path, download_dir):
+        fname = os.path.basename(file_path)
+        log.info("proc", "CHD Auto: processing %s", fname)
         chdman = _find_binary("chdman", "tool_chdman_path")
         if not chdman:
             raise ProcessingError("chdman not found. Install MAME tools or set the path in settings.")
@@ -621,9 +661,11 @@ class CHDAutoProcessor(BaseProcessor):
         # Standalone disc image (not in an archive)
         if ext in (".iso", ".img", ".bin"):
             disc_type = detect_disc_type(file_path)
+            log.debug("proc", "CHD Auto: %s is a direct disc image, detected as %s", fname, disc_type.upper())
             return self._convert_direct(file_path, download_dir, chdman, disc_type)
 
         # Archive — extract and find disc images
+        log.debug("proc", "CHD Auto: %s is an archive, extracting to search for disc images", fname)
         temp_dir = self.get_temp_dir(file_path)
         try:
             self._progress(phase="extracting", filename=os.path.basename(file_path))
@@ -636,6 +678,7 @@ class CHDAutoProcessor(BaseProcessor):
 
             disc_images = find_disc_images(extracted, temp_dir)
             if not disc_images:
+                log.info("proc", "CHD Auto: %s — no disc images found, skipping", fname)
                 return {"skipped": True, "reason": "No disc images found in archive"}
 
             results = []
@@ -735,10 +778,12 @@ class CHDAutoProcessor(BaseProcessor):
         if num_proc > 0:
             cmd.extend(["-np", str(num_proc)])
 
+        log.debug("proc", "Running: %s", " ".join(cmd))
         self._check_cancel()
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=7200)
         if result.returncode != 0:
             err = (result.stderr or result.stdout or "").strip()
+            log.error("proc", "chdman createcd failed (rc=%d): %s", result.returncode, err[:500])
             raise ProcessingError(f"chdman createcd failed: {err[:500]}")
 
         self._verify_chd(chdman, output_path)
@@ -750,22 +795,27 @@ class CHDAutoProcessor(BaseProcessor):
         if num_proc > 0:
             cmd.extend(["-np", str(num_proc)])
 
+        log.debug("proc", "Running: %s", " ".join(cmd))
         self._check_cancel()
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=14400)
         if result.returncode != 0:
             err = (result.stderr or result.stdout or "").strip()
+            log.error("proc", "chdman createdvd failed (rc=%d): %s", result.returncode, err[:500])
             raise ProcessingError(f"chdman createdvd failed: {err[:500]}")
 
         self._verify_chd(chdman, output_path)
 
     def _verify_chd(self, chdman, chd_path):
+        log.debug("proc", "Verifying %s", os.path.basename(chd_path))
         verify_result = subprocess.run(
             [chdman, "verify", "-i", chd_path],
             capture_output=True, text=True, timeout=7200,
         )
         if verify_result.returncode != 0:
+            log.error("proc", "CHD verification failed for %s", os.path.basename(chd_path))
             os.remove(chd_path)
             raise ProcessingError("CHD verification failed after conversion")
+        log.debug("proc", "CHD verification passed for %s", os.path.basename(chd_path))
 
 
 # ---------------------------------------------------------------------------

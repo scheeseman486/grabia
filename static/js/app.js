@@ -1602,6 +1602,8 @@
             tool_7z: $("#set-tool-7z").value,
             tool_unrar: $("#set-tool-unrar").value,
             processing_temp_dir: $("#set-processing-temp-dir").value,
+            debug_enabled: $("#set-debug-enabled").checked,
+            debug_log_file: $("#set-debug-log-file").value,
         });
     }
 
@@ -1637,6 +1639,9 @@
             $("#set-tool-7z").value = s.tool_7z_path || "";
             $("#set-tool-unrar").value = s.tool_unrar_path || "";
             $("#set-processing-temp-dir").value = s.processing_temp_dir || "";
+            // Debug settings
+            $("#set-debug-enabled").checked = s.debug_enabled === "1";
+            $("#set-debug-log-file").value = s.debug_log_file || "";
             // Load schedule rules
             scheduleRules = JSON.parse(s.speed_schedule || "[]");
             renderScheduleRules();
@@ -1689,6 +1694,8 @@
             tool_7z_path: $("#set-tool-7z").value,
             tool_unrar_path: $("#set-tool-unrar").value,
             processing_temp_dir: $("#set-processing-temp-dir").value,
+            debug_enabled: $("#set-debug-enabled").checked ? "1" : "0",
+            debug_log_file: $("#set-debug-log-file").value,
         };
         try {
             await api("POST", "/api/settings", data);
