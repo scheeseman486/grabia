@@ -255,6 +255,68 @@ def _parse_cue_bins(cue_path, base_dir):
 
 
 # ---------------------------------------------------------------------------
+# Disc type detection (CD vs DVD)
+# ---------------------------------------------------------------------------
+
+# CD-ROM max capacity ~800 MB (overburn).  Anything larger is almost
+# certainly a DVD (single-layer 4.7 GB, dual-layer 8.5 GB).
+_CD_MAX_BYTES = 870_000_000  # generous upper bound for overburned CDs
+
+
+def detect_disc_type(image_path, disc_info=None):
+    """Detect whether a disc image is CD or DVD.
+
+    Args:
+        image_path: path to an ISO/IMG file, or a CUE/GDI file
+        disc_info: optional dict from find_disc_images() with 'type' key
+
+    Returns:
+        "cd" or "dvd"
+    """
+    ext = os.path.splitext(image_path)[1].lower()
+
+    # CUE/BIN and GDI are inherently CD formats
+    if ext in (".cue", ".gdi"):
+        return "cd"
+    if disc_info and disc_info.get("type") in ("cue", "gdi"):
+        return "cd"
+    # .bin without a CUE is treated as raw CD sector dump
+    if ext == ".bin":
+        return "cd"
+
+    # For ISO/IMG: inspect the file
+    try:
+        file_size = os.path.getsize(image_path)
+    except OSError:
+        return "dvd"  # safe fallback for large/unknown
+
+    # Check for raw CD sectors (2352 bytes/sector).  The ISO 9660 Primary
+    # Volume Descriptor sits at logical sector 16.  For 2352-byte sectors
+    # the PVD magic "CD001" appears at offset 16*2352 + 16 = 37648.
+    # For standard 2048-byte sectors it's at 16*2048 + 1 = 32769.
+    try:
+        with open(image_path, "rb") as f:
+            # Check 2352-byte sector layout first (raw CD)
+            f.seek(16 * 2352 + 16)
+            if f.read(5) == b"CD001":
+                return "cd"
+            # Check standard 2048-byte sector layout
+            f.seek(16 * 2048 + 1)
+            if f.read(5) == b"CD001":
+                # Valid ISO 9660 — use size heuristic
+                if file_size <= _CD_MAX_BYTES:
+                    return "cd"
+                return "dvd"
+    except OSError:
+        pass
+
+    # Fallback: size-only heuristic
+    if file_size <= _CD_MAX_BYTES:
+        return "cd"
+    return "dvd"
+
+
+# ---------------------------------------------------------------------------
 # Exceptions
 # ---------------------------------------------------------------------------
 
@@ -480,6 +542,181 @@ class CHDCDProcessor(BaseProcessor):
         )
         if verify_result.returncode != 0:
             os.remove(output_path)
+            raise ProcessingError("CHD verification failed after conversion")
+
+
+# ---------------------------------------------------------------------------
+# CHD Auto Processor (auto-detects CD vs DVD)
+# ---------------------------------------------------------------------------
+
+@register_processor
+class CHDAutoProcessor(BaseProcessor):
+    type_id = "chd_auto"
+    label = "CHD (Auto)"
+    description = "Auto-detect CD or DVD and convert to CHD using the appropriate chdman command"
+    input_extensions = [".zip", ".7z", ".rar", ".iso", ".bin", ".img"]
+    options_schema = [
+        {
+            "key": "num_processors",
+            "label": "Threads",
+            "type": "number",
+            "default": 0,
+            "description": "0 = auto (use all cores)",
+        },
+    ]
+
+    def process(self, file_path, download_dir):
+        chdman = _find_binary("chdman", "tool_chdman_path")
+        if not chdman:
+            raise ProcessingError("chdman not found. Install MAME tools or set the path in settings.")
+
+        ext = os.path.splitext(file_path)[1].lower()
+
+        # Standalone disc image (not in an archive)
+        if ext in (".iso", ".img", ".bin"):
+            disc_type = detect_disc_type(file_path)
+            return self._convert_direct(file_path, download_dir, chdman, disc_type)
+
+        # Archive — extract and find disc images
+        temp_dir = self.get_temp_dir(file_path)
+        try:
+            self._progress(phase="extracting", filename=os.path.basename(file_path))
+            self._check_cancel()
+            extracted = _extract_archive(file_path, temp_dir, self._cancel_check)
+            self._check_cancel()
+
+            # Handle nested archives
+            extracted = self._handle_nested(extracted, temp_dir)
+
+            disc_images = find_disc_images(extracted, temp_dir)
+            if not disc_images:
+                return {"skipped": True, "reason": "No disc images found in archive"}
+
+            results = []
+            for i, disc in enumerate(disc_images):
+                self._check_cancel()
+                self._progress(
+                    phase="converting",
+                    filename=disc["name"],
+                    current=i + 1,
+                    total=len(disc_images),
+                )
+                chd_name = disc["name"] + ".chd"
+                chd_path = os.path.join(download_dir, chd_name)
+
+                # Detect disc type from the primary image file
+                if disc["type"] == "cue":
+                    disc_type = "cd"  # CUE is always CD
+                    input_path = disc["cue_path"]
+                elif disc["type"] == "gdi":
+                    disc_type = "cd"  # GDI is always CD
+                    input_path = disc["gdi_path"]
+                else:
+                    input_path = disc["iso_path"]
+                    disc_type = detect_disc_type(input_path, disc)
+
+                self._progress(
+                    phase="converting",
+                    filename=f"{disc['name']} ({disc_type.upper()})",
+                    current=i + 1,
+                    total=len(disc_images),
+                )
+
+                if disc_type == "cd":
+                    self._run_chdman_createcd(chdman, input_path, chd_path)
+                else:
+                    self._run_chdman_createdvd(chdman, input_path, chd_path)
+
+                results.append(chd_path)
+
+            processed_filename = os.path.relpath(results[0], download_dir)
+            return {
+                "processed_filename": processed_filename,
+                "files_created": results,
+                "files_to_delete": [file_path],
+                "skipped": False,
+            }
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def _convert_direct(self, file_path, download_dir, chdman, disc_type):
+        """Convert a standalone disc image directly to CHD."""
+        base_name = os.path.splitext(os.path.basename(file_path))[0]
+        chd_path = os.path.join(download_dir, base_name + ".chd")
+
+        self._progress(
+            phase="converting",
+            filename=f"{os.path.basename(file_path)} ({disc_type.upper()})",
+            current=1, total=1,
+        )
+
+        if disc_type == "cd":
+            self._run_chdman_createcd(chdman, file_path, chd_path)
+        else:
+            self._run_chdman_createdvd(chdman, file_path, chd_path)
+
+        return {
+            "processed_filename": os.path.relpath(chd_path, download_dir),
+            "files_created": [chd_path],
+            "files_to_delete": [file_path],
+            "skipped": False,
+        }
+
+    def _handle_nested(self, file_list, base_dir):
+        """Check for nested archives and extract them."""
+        archive_exts = {".zip", ".7z", ".rar"}
+        new_files = list(file_list)
+        for rel in list(file_list):
+            ext = os.path.splitext(rel)[1].lower()
+            if ext in archive_exts:
+                nested_path = os.path.join(base_dir, rel)
+                nested_dir = os.path.join(base_dir, os.path.splitext(rel)[0])
+                os.makedirs(nested_dir, exist_ok=True)
+                try:
+                    inner = _extract_archive(nested_path, nested_dir, self._cancel_check)
+                    for inner_rel in inner:
+                        new_files.append(os.path.join(os.path.splitext(rel)[0], inner_rel))
+                    os.remove(nested_path)
+                    new_files.remove(rel)
+                except ProcessingError:
+                    pass
+        return new_files
+
+    def _run_chdman_createcd(self, chdman, input_path, output_path):
+        cmd = [chdman, "createcd", "-i", input_path, "-o", output_path, "-f"]
+        num_proc = int(self.options.get("num_processors", 0))
+        if num_proc > 0:
+            cmd.extend(["-np", str(num_proc)])
+
+        self._check_cancel()
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=7200)
+        if result.returncode != 0:
+            err = (result.stderr or result.stdout or "").strip()
+            raise ProcessingError(f"chdman createcd failed: {err[:500]}")
+
+        self._verify_chd(chdman, output_path)
+
+    def _run_chdman_createdvd(self, chdman, input_path, output_path):
+        cmd = [chdman, "createdvd", "-i", input_path, "-o", output_path, "-f"]
+        num_proc = int(self.options.get("num_processors", 0))
+        if num_proc > 0:
+            cmd.extend(["-np", str(num_proc)])
+
+        self._check_cancel()
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=14400)
+        if result.returncode != 0:
+            err = (result.stderr or result.stdout or "").strip()
+            raise ProcessingError(f"chdman createdvd failed: {err[:500]}")
+
+        self._verify_chd(chdman, output_path)
+
+    def _verify_chd(self, chdman, chd_path):
+        verify_result = subprocess.run(
+            [chdman, "verify", "-i", chd_path],
+            capture_output=True, text=True, timeout=7200,
+        )
+        if verify_result.returncode != 0:
+            os.remove(chd_path)
             raise ProcessingError("CHD verification failed after conversion")
 
 
