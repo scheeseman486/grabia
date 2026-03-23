@@ -846,6 +846,27 @@ main {
 .file-status.failed { background: rgba(255, 107, 107, 0.15); color: var(--danger); }
 .file-status.conflict { background: rgba(252, 196, 25, 0.15); color: var(--warning); }
 .file-status.unknown { background: rgba(155, 89, 182, 0.15); color: #9b59b6; }
+.file-status.processed { background: rgba(52, 152, 219, 0.15); color: #3498db; }
+.file-status.proc-failed { background: rgba(255, 107, 107, 0.15); color: var(--danger); }
+.file-status.proc-active { background: rgba(52, 152, 219, 0.15); color: #3498db; }
+
+/* Processing profiles list */
+.profile-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 10px 12px;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    margin-bottom: 8px;
+}
+.profile-info strong { display: block; font-size: 14px; }
+.profile-info small { color: var(--text-muted); font-size: 12px; }
+.profile-actions { display: flex; gap: 6px; }
+.action-btn.small { font-size: 12px; padding: 4px 8px; }
+.action-btn.danger { color: var(--danger); border-color: var(--danger); }
+.action-btn.danger:hover { background: rgba(255, 107, 107, 0.1); }
 
 /* Pagination */
 

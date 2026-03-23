@@ -75,8 +75,8 @@ Nothing fancy: Flask, SQLite, vanilla JS, and plain CSS.
 ## Future Plans
 
 - **Post-processing**; unzipping and converting uncompressed archives to CHD, that sort of thing.
-- **Docker!** I made this to run on my Unraid server eventually.
 - **Torrent support?** Probably not going to integrate a torrent client, but might optionally pass off archive torrent files to another downloader so it can automatically seed downloads.
+- **Sync/Uploads?** The interface could also be useful for managing archives on IA itself.
 
 ## License
 

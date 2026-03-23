@@ -64,7 +64,7 @@
     }
 
     function clearAllNotifications() {
-        notifications = notifications.filter((n) => n.scanArchiveId);
+        notifications = notifications.filter((n) => n.scanArchiveId || n.processingArchiveId);
         renderNotifBadge();
         renderNotifList();
     }
@@ -474,6 +474,11 @@
         es.addEventListener("scan_progress", (e) => {
             const data = JSON.parse(e.data);
             updateScanProgress(data);
+        });
+
+        es.addEventListener("processing_progress", (e) => {
+            const data = JSON.parse(e.data);
+            updateProcessingProgress(data);
         });
 
         es.addEventListener("archive_added", () => refreshArchives());
@@ -1019,9 +1024,6 @@
     const SORT_COL_MAP = { "col-name": "name", "col-size": "size", "col-modified": "modified", "col-status": "status" };
     const SORT_DEFAULTS = { name: "asc", size: "desc", modified: "desc", status: "asc", priority: "asc" };
 
-    // Stack icon SVG for the priority/download-order column
-    const STACK_ICON = '<svg viewBox="0 0 24 24" width="14" height="14" style="vertical-align:middle"><path d="M4 18h16v-2H4v2zm0-5h16v-2H4v2zm0-7v2h16V6H4z" fill="currentColor"/></svg>';
-
     function updateSortArrows() {
         // Text column headers
         for (const [cls, sort] of Object.entries(SORT_COL_MAP)) {
@@ -1036,12 +1038,12 @@
                 th.textContent = label;
             }
         }
-        // Priority (stack icon) column header
+        // Priority column header — just an arrow
         const priTh = $(".col-priority-sort");
         if (priTh) {
             const dir = currentSortDir || SORT_DEFAULTS["priority"];
-            const arrow = currentSort === "priority" ? `<span class="sort-arrow">${dir === "asc" ? "\u25B2" : "\u25BC"}</span>` : "";
-            priTh.innerHTML = STACK_ICON + arrow;
+            const arrow = dir === "asc" ? "\u25B2" : "\u25BC";
+            priTh.innerHTML = `<span class="sort-arrow">${arrow}</span>`;
         }
     }
 
@@ -1248,11 +1250,18 @@
             html += `<td class="col-size" style="text-align:right">${formatBytes(f.size)}</td>`;
             html += `<td class="col-modified">${formatDate(f.mtime)}</td>`;
             const displayStatus = formatFileStatus(f);
-            const statusClass = displayStatus === "skipped" ? "skipped" : f.download_status;
-            const hasError = (f.download_status === "failed" || f.download_status === "conflict" || f.download_status === "unknown") && f.error_message;
+            const procStatus = f.processing_status || "";
+            const statusClass = procStatus === "completed" ? "processed"
+                : procStatus === "failed" ? "proc-failed"
+                : procStatus === "processing" || procStatus === "queued" ? "proc-active"
+                : displayStatus === "skipped" ? "skipped"
+                : f.download_status;
+            const hasError = ((f.download_status === "failed" || f.download_status === "conflict" || f.download_status === "unknown") && f.error_message)
+                || (procStatus === "failed" && f.processing_error);
             const isConflict = f.download_status === "conflict";
+            const errorMsg = (procStatus === "failed" && f.processing_error) ? f.processing_error : f.error_message;
             html += `<td class="col-status">` +
-                `<span class="file-status ${statusClass}" ${hasError ? `title="${escapeHtml(f.error_message)}"` : ""}>${displayStatus}</span>` +
+                `<span class="file-status ${statusClass}" ${hasError ? `title="${escapeHtml(errorMsg)}"` : ""}>${displayStatus}</span>` +
                 (hasError && isConflict
                     ? `<span class="file-error-hint clickable" data-conflict-file='${JSON.stringify({id: f.id, name: f.name, size: f.size, error: f.error_message})}' title="Click to resolve conflict">&#9432;</span>`
                     : hasError ? `<span class="file-error-hint" title="${escapeHtml(f.error_message)}">&#9432;</span>` : "") +
@@ -1352,6 +1361,17 @@
         if (f.download_status === "downloading" && f.size > 0) {
             const pct = ((f.downloaded_bytes / f.size) * 100).toFixed(1);
             return `${pct}%`;
+        }
+        // Show processing status if present
+        if (f.processing_status && f.processing_status !== "") {
+            if (f.processing_status === "completed") {
+                const ext = (f.processed_filename || "").split(".").pop().toUpperCase();
+                return ext ? `${ext}` : "processed";
+            }
+            if (f.processing_status === "processing") return "converting...";
+            if (f.processing_status === "queued") return "proc. queued";
+            if (f.processing_status === "failed") return "proc. failed";
+            if (f.processing_status === "skipped") return "proc. skipped";
         }
         return f.download_status;
     }
@@ -1532,6 +1552,11 @@
             default_enable_archive: $("#set-default-enable-archive").checked,
             default_select_all: $("#set-default-select-all").checked,
             schedule: JSON.stringify(collectScheduleRules()),
+            tool_chdman: $("#set-tool-chdman").value,
+            tool_maxcso: $("#set-tool-maxcso").value,
+            tool_7z: $("#set-tool-7z").value,
+            tool_unrar: $("#set-tool-unrar").value,
+            processing_temp_dir: $("#set-processing-temp-dir").value,
         });
     }
 
@@ -1561,6 +1586,12 @@
             $("#set-old-password").value = "";
             $("#set-new-password").value = "";
             $("#pw-change-error").textContent = "";
+            // Tool paths
+            $("#set-tool-chdman").value = s.tool_chdman_path || "";
+            $("#set-tool-maxcso").value = s.tool_maxcso_path || "";
+            $("#set-tool-7z").value = s.tool_7z_path || "";
+            $("#set-tool-unrar").value = s.tool_unrar_path || "";
+            $("#set-processing-temp-dir").value = s.processing_temp_dir || "";
             // Load schedule rules
             scheduleRules = JSON.parse(s.speed_schedule || "[]");
             renderScheduleRules();
@@ -1587,6 +1618,10 @@
     function switchTab(tabId) {
         $$(".settings-tab").forEach((t) => t.classList.toggle("active", t.dataset.tab === tabId));
         $$(".settings-panel").forEach((p) => p.classList.toggle("active", p.id === tabId));
+        if (tabId === "tab-processing") {
+            detectAndShowTools();
+            renderProfilesList();
+        }
     }
 
     async function saveSettings() {
@@ -1604,6 +1639,11 @@
             default_enable_archive: $("#set-default-enable-archive").checked ? "1" : "0",
             default_select_all: $("#set-default-select-all").checked ? "1" : "0",
             speed_schedule: JSON.stringify(collectScheduleRules()),
+            tool_chdman_path: $("#set-tool-chdman").value,
+            tool_maxcso_path: $("#set-tool-maxcso").value,
+            tool_7z_path: $("#set-tool-7z").value,
+            tool_unrar_path: $("#set-tool-unrar").value,
+            processing_temp_dir: $("#set-processing-temp-dir").value,
         };
         try {
             await api("POST", "/api/settings", data);
@@ -1962,6 +2002,315 @@
         } catch (e) { /* ignore */ }
     }
 
+    // --- Processing ---
+
+    let processorTypes = {};  // loaded once from API
+    let processingProfiles = []; // cached profiles
+
+    async function loadProcessorTypes() {
+        if (Object.keys(processorTypes).length) return;
+        try {
+            processorTypes = await api("GET", "/api/processing/types");
+        } catch (e) { /* ignore */ }
+    }
+
+    async function loadProcessingProfiles() {
+        try {
+            processingProfiles = await api("GET", "/api/processing/profiles");
+        } catch (e) {
+            processingProfiles = [];
+        }
+        return processingProfiles;
+    }
+
+    function renderProfileOptions(containerEl, typeId, currentOptions) {
+        containerEl.innerHTML = "";
+        const typeInfo = processorTypes[typeId];
+        if (!typeInfo || !typeInfo.options_schema) return;
+        for (const opt of typeInfo.options_schema) {
+            const label = document.createElement("label");
+            label.textContent = opt.label;
+            let input;
+            if (opt.type === "select" && opt.choices) {
+                input = document.createElement("select");
+                input.dataset.optKey = opt.key;
+                for (const ch of opt.choices) {
+                    const o = document.createElement("option");
+                    o.value = ch.value;
+                    o.textContent = ch.label;
+                    if ((currentOptions && currentOptions[opt.key] || opt.default) === ch.value) o.selected = true;
+                    input.appendChild(o);
+                }
+            } else {
+                input = document.createElement("input");
+                input.type = opt.type === "number" ? "number" : "text";
+                input.dataset.optKey = opt.key;
+                input.value = (currentOptions && currentOptions[opt.key]) ?? opt.default ?? "";
+                if (opt.description) {
+                    const sm = document.createElement("small");
+                    sm.textContent = opt.description;
+                    label.appendChild(input);
+                    label.appendChild(sm);
+                    containerEl.appendChild(label);
+                    continue;
+                }
+            }
+            label.appendChild(input);
+            containerEl.appendChild(label);
+        }
+    }
+
+    function collectOptions(containerEl) {
+        const opts = {};
+        containerEl.querySelectorAll("[data-opt-key]").forEach(el => {
+            opts[el.dataset.optKey] = el.value;
+        });
+        return opts;
+    }
+
+    // --- Processing Profiles in Settings ---
+
+    async function renderProfilesList() {
+        await loadProcessorTypes();
+        const profiles = await loadProcessingProfiles();
+        const list = $("#processing-profiles-list");
+        if (!profiles.length) {
+            list.innerHTML = '<p style="color:var(--text-muted);font-size:13px;">No profiles yet. Click "Add Profile" to create one.</p>';
+            return;
+        }
+        list.innerHTML = "";
+        for (const p of profiles) {
+            const row = document.createElement("div");
+            row.className = "profile-row";
+            const typeLabel = (processorTypes[p.processor_type] || {}).label || p.processor_type;
+            row.innerHTML = `
+                <div class="profile-info">
+                    <strong>${escapeHtml(p.name)}</strong>
+                    <small>${escapeHtml(typeLabel)}</small>
+                </div>
+                <div class="profile-actions">
+                    <button class="action-btn small" data-edit-profile="${p.id}">Edit</button>
+                    <button class="action-btn small danger" data-delete-profile="${p.id}">Delete</button>
+                </div>`;
+            list.appendChild(row);
+        }
+        list.querySelectorAll("[data-edit-profile]").forEach(btn => {
+            btn.addEventListener("click", () => openEditProfile(parseInt(btn.dataset.editProfile)));
+        });
+        list.querySelectorAll("[data-delete-profile]").forEach(btn => {
+            btn.addEventListener("click", async () => {
+                if (confirm("Delete this profile?")) {
+                    await api("DELETE", `/api/processing/profiles/${btn.dataset.deleteProfile}`);
+                    renderProfilesList();
+                }
+            });
+        });
+    }
+
+    let editingProfileId = null;
+
+    async function openEditProfile(profileId) {
+        await loadProcessorTypes();
+        editingProfileId = profileId || null;
+        const modal = $("#modal-edit-profile");
+        const nameInput = $("#edit-profile-name");
+        const typeSelect = $("#edit-profile-type");
+        const optionsDiv = $("#edit-profile-options");
+
+        $("#edit-profile-title").textContent = editingProfileId ? "Edit Profile" : "Add Profile";
+
+        // Populate type dropdown
+        typeSelect.innerHTML = "";
+        for (const [tid, info] of Object.entries(processorTypes)) {
+            const o = document.createElement("option");
+            o.value = tid;
+            o.textContent = info.label;
+            typeSelect.appendChild(o);
+        }
+
+        if (editingProfileId) {
+            const profile = processingProfiles.find(p => p.id === editingProfileId);
+            if (profile) {
+                nameInput.value = profile.name;
+                typeSelect.value = profile.processor_type;
+                renderProfileOptions(optionsDiv, profile.processor_type, profile.options);
+            }
+        } else {
+            nameInput.value = "";
+            renderProfileOptions(optionsDiv, typeSelect.value, {});
+        }
+
+        typeSelect.onchange = () => renderProfileOptions(optionsDiv, typeSelect.value, {});
+        modal.classList.add("open");
+    }
+
+    async function saveProfile() {
+        const name = $("#edit-profile-name").value.trim();
+        const processorType = $("#edit-profile-type").value;
+        const options = collectOptions($("#edit-profile-options"));
+        if (!name) return;
+
+        if (editingProfileId) {
+            await api("PUT", `/api/processing/profiles/${editingProfileId}`, { name, processor_type: processorType, options });
+        } else {
+            await api("POST", "/api/processing/profiles", { name, processor_type: processorType, options });
+        }
+        $("#modal-edit-profile").classList.remove("open");
+        renderProfilesList();
+    }
+
+    // --- Tool Detection ---
+
+    async function detectAndShowTools() {
+        try {
+            const tools = await api("GET", "/api/processing/tools");
+            for (const [name, info] of Object.entries(tools)) {
+                const statusEl = $(`#tool-${name}-status`);
+                if (statusEl) {
+                    if (info.available) {
+                        statusEl.textContent = `Detected: ${info.path} (${info.version || "unknown version"})`;
+                        statusEl.style.color = "var(--accent)";
+                    } else {
+                        statusEl.textContent = "Not found";
+                        statusEl.style.color = "var(--text-muted)";
+                    }
+                }
+            }
+        } catch (e) { /* ignore */ }
+    }
+
+    // --- Process Archive Modal ---
+
+    async function openProcessArchiveModal() {
+        if (!currentArchiveId) return;
+        await loadProcessorTypes();
+        const profiles = await loadProcessingProfiles();
+        const select = $("#process-profile-select");
+        select.innerHTML = "";
+        if (!profiles.length) {
+            const o = document.createElement("option");
+            o.textContent = "No profiles — create one in Settings";
+            o.disabled = true;
+            select.appendChild(o);
+            $("#btn-process-confirm").disabled = true;
+        } else {
+            for (const p of profiles) {
+                const o = document.createElement("option");
+                o.value = p.id;
+                o.textContent = p.name;
+                select.appendChild(o);
+            }
+            $("#btn-process-confirm").disabled = false;
+            // Show options for selected profile
+            const onProfileChange = () => {
+                const pid = parseInt(select.value);
+                const prof = profiles.find(p => p.id === pid);
+                if (prof) renderProfileOptions($("#process-profile-options"), prof.processor_type, prof.options);
+            };
+            select.onchange = onProfileChange;
+            onProfileChange();
+        }
+
+        // Show eligible file count
+        try {
+            const data = await api("GET", `/api/archives/${currentArchiveId}/processable`);
+            $("#process-eligible-count").textContent = `${data.count} file${data.count !== 1 ? "s" : ""} eligible for processing`;
+        } catch (e) {
+            $("#process-eligible-count").textContent = "";
+        }
+
+        const archiveName = getArchiveName(currentArchiveId);
+        $("#process-archive-info").textContent = `Process files in "${archiveName}"`;
+        $("#process-auto-future").checked = false;
+        $("#modal-process-archive").classList.add("open");
+    }
+
+    async function confirmProcessArchive() {
+        const profileId = parseInt($("#process-profile-select").value);
+        if (!profileId || !currentArchiveId) return;
+        const options = collectOptions($("#process-profile-options"));
+        const autoProcess = $("#process-auto-future").checked;
+        try {
+            await api("POST", `/api/archives/${currentArchiveId}/process`, {
+                profile_id: profileId,
+                options,
+                auto_process: autoProcess,
+            });
+            addNotification(`Processing queued for "${getArchiveName(currentArchiveId)}"`, "info");
+        } catch (e) {
+            addNotification(`Processing failed: ${e.message}`, "error");
+        }
+        $("#modal-process-archive").classList.remove("open");
+    }
+
+    // --- Processing SSE Events ---
+
+    let processingNotifs = {}; // archive_id -> notif id
+
+    function updateProcessingProgress(data) {
+        const { archive_id, phase } = data;
+        const archiveName = getArchiveName(archive_id);
+
+        if (phase === "starting") {
+            const nid = ++notifIdCounter;
+            processingNotifs[archive_id] = nid;
+            const notif = { id: nid, message: `Processing "${archiveName}": starting...`, type: "info", time: new Date(), progress: 0, processingArchiveId: archive_id };
+            notifications.unshift(notif);
+            renderNotifBadge();
+            renderNotifList();
+            showToast(`Processing started: "${archiveName}"`, "info");
+        } else if (phase === "extracting" || phase === "converting") {
+            const notif = notifications.find(n => n.id === processingNotifs[archive_id]);
+            if (notif) {
+                const pct = data.total > 0 ? Math.round((data.current / data.total) * 100) : -1;
+                const verb = phase === "extracting" ? "Extracting" : "Converting";
+                notif.message = `Processing "${archiveName}": ${verb} ${data.filename || ""}${data.total ? ` (${data.current}/${data.total})` : ""}`;
+                notif.progress = pct;
+                renderNotifList();
+            }
+        } else if (phase === "file_done") {
+            const notif = notifications.find(n => n.id === processingNotifs[archive_id]);
+            if (notif && data.total) {
+                notif.message = `Processing "${archiveName}": ${data.current}/${data.total}`;
+                notif.progress = Math.round((data.current / data.total) * 100);
+                renderNotifList();
+            }
+        } else if (phase === "file_error") {
+            addNotification(`Processing "${archiveName}": ${data.filename} failed — ${data.error}`, "error");
+        } else if (phase === "done") {
+            if (processingNotifs[archive_id]) {
+                notifications = notifications.filter(n => n.id !== processingNotifs[archive_id]);
+                delete processingNotifs[archive_id];
+            }
+            const s = data.summary || {};
+            const parts = [];
+            if (s.processed > 0) parts.push(`${s.processed} converted`);
+            if (s.skipped > 0) parts.push(`${s.skipped} skipped`);
+            if (s.failed > 0) parts.push(`${s.failed} failed`);
+            if (parts.length) {
+                const type = s.failed > 0 ? "warning" : "success";
+                addNotification(`Processing "${archiveName}": ` + parts.join(", "), type);
+            } else {
+                addNotification(`Processing "${archiveName}": no eligible files`, "info");
+            }
+            if (currentArchiveId === archive_id) loadFiles();
+            refreshArchives();
+        } else if (phase === "cancelled") {
+            if (processingNotifs[archive_id]) {
+                notifications = notifications.filter(n => n.id !== processingNotifs[archive_id]);
+                delete processingNotifs[archive_id];
+            }
+            addNotification(`Processing "${archiveName}": cancelled`, "info");
+            if (currentArchiveId === archive_id) loadFiles();
+        } else if (phase === "error") {
+            if (processingNotifs[archive_id]) {
+                notifications = notifications.filter(n => n.id !== processingNotifs[archive_id]);
+                delete processingNotifs[archive_id];
+            }
+            addNotification(`Processing "${archiveName}" failed: ${data.error}`, "error");
+        }
+    }
+
     // --- Init ---
 
     function init() {
@@ -2064,7 +2413,22 @@
         $("#btn-retry-all").addEventListener("click", () => { if (currentArchiveId) retryArchive(currentArchiveId); });
         $("#btn-refresh-meta").addEventListener("click", refreshMetadata);
         $("#btn-scan-files").addEventListener("click", scanExistingFiles);
+        $("#btn-process-archive").addEventListener("click", openProcessArchiveModal);
         $("#btn-clear-changes").addEventListener("click", clearChanges);
+
+        // Process Archive modal
+        $("#btn-process-cancel").addEventListener("click", () => $("#modal-process-archive").classList.remove("open"));
+        $("#btn-process-confirm").addEventListener("click", confirmProcessArchive);
+
+        // Edit Profile modal
+        $("#btn-add-profile").addEventListener("click", () => openEditProfile(null));
+        $("#btn-edit-profile-cancel").addEventListener("click", () => $("#modal-edit-profile").classList.remove("open"));
+        $("#btn-edit-profile-save").addEventListener("click", saveProfile);
+
+        // Tool detection
+        if ($("#btn-detect-tools")) {
+            $("#btn-detect-tools").addEventListener("click", detectAndShowTools);
+        }
         $("#file-sort").addEventListener("change", (e) => {
             currentSort = e.target.value;
             currentSortDir = "";
