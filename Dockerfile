@@ -3,6 +3,7 @@ FROM debian:bookworm AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential cmake ninja-build git ca-certificates \
+        liblz4-dev libuv1-dev zlib1g-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # ── chdman (standalone) ──────────────────────────────────────────────
@@ -33,6 +34,7 @@ RUN sed -i 's/Components: main/Components: main non-free/' \
     && apt-get update && apt-get install -y --no-install-recommends \
         p7zip-full \
         unrar \
+        liblz4-1 libuv1 zlib1g \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy compiled binaries from builder
