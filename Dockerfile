@@ -3,7 +3,6 @@ FROM debian:bookworm AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential cmake ninja-build git ca-certificates \
-        liblz4-dev libuv1-dev zlib1g-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # ── chdman (standalone) ──────────────────────────────────────────────
@@ -15,14 +14,13 @@ RUN git clone --depth 1 \
     && cp build/chdman /usr/local/bin/chdman \
     && rm -rf /tmp/chdman
 
-# ── maxcso ────────────────────────────────────────────────────────────
+# ── maxcso (uses bundled deps, plain Makefile) ───────────────────────
 ARG MAXCSO_VERSION=v1.13.0
 RUN git clone --depth 1 --branch ${MAXCSO_VERSION} \
         https://github.com/unknownbrackets/maxcso.git /tmp/maxcso \
     && cd /tmp/maxcso \
-    && cmake -B build -DCMAKE_BUILD_TYPE=Release \
-    && cmake --build build -j"$(nproc)" \
-    && cp build/maxcso /usr/local/bin/maxcso \
+    && make -j"$(nproc)" \
+    && cp maxcso /usr/local/bin/maxcso \
     && rm -rf /tmp/maxcso
 
 
@@ -35,7 +33,6 @@ RUN sed -i 's/Components: main/Components: main non-free/' \
     && apt-get update && apt-get install -y --no-install-recommends \
         p7zip-full \
         unrar \
-        liblz4-1 libuv1 zlib1g \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy compiled binaries from builder
