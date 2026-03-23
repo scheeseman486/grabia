@@ -850,6 +850,30 @@ main {
 .file-status.proc-failed { background: rgba(255, 107, 107, 0.15); color: var(--danger); }
 .file-status.proc-active { background: rgba(52, 152, 219, 0.15); color: #3498db; }
 
+/* Processed file expandable rows */
+tr.processed-expandable { cursor: pointer; }
+tr.processed-expandable:hover td { background: var(--bg-secondary); }
+tr.processed-detail-row td { padding: 0 !important; }
+.processed-detail-cell {
+    background: var(--bg-secondary);
+    border-top: 1px solid var(--border);
+}
+.processed-output-list {
+    list-style: none;
+    margin: 0;
+    padding: 6px 12px 6px 36px;
+    font-size: 0.85em;
+    color: var(--text-secondary);
+}
+.processed-output-list li {
+    padding: 2px 0;
+    font-family: var(--mono, monospace);
+}
+.processed-output-list li::before {
+    content: "\2192 ";
+    color: #3498db;
+}
+
 /* Processing profiles list */
 .profile-row {
     display: flex;

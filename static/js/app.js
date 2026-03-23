@@ -1315,6 +1315,16 @@
             }
 
             fileListEl.appendChild(tr);
+
+            // Processed file: click row to expand/collapse output file list
+            if (procStatus === "completed") {
+                tr.classList.add("processed-expandable");
+                tr.addEventListener("click", (e) => {
+                    // Don't toggle when clicking checkbox or buttons
+                    if (e.target.closest("input, button, .file-error-hint")) return;
+                    toggleProcessedDetail(tr, f, isPriority);
+                });
+            }
         });
 
         // Pagination
@@ -1364,18 +1374,48 @@
         }
         // Show processing status if present
         if (f.processing_status && f.processing_status !== "") {
-            if (f.processing_status === "completed") {
-                const pf = f.processed_filename || "";
-                if (pf.endsWith("/") || pf.endsWith("\\")) return "extracted";
-                const ext = pf.split(".").pop().toUpperCase();
-                return ext ? `${ext}` : "processed";
-            }
+            if (f.processing_status === "completed") return "processed";
             if (f.processing_status === "processing") return "processing...";
             if (f.processing_status === "queued") return "proc. queued";
             if (f.processing_status === "failed") return "proc. failed";
             if (f.processing_status === "skipped") return "proc. skipped";
         }
         return f.download_status;
+    }
+
+    function toggleProcessedDetail(tr, f, isPriority) {
+        // If already expanded, collapse
+        const existing = tr.nextElementSibling;
+        if (existing && existing.classList.contains("processed-detail-row")) {
+            existing.remove();
+            tr.classList.remove("expanded");
+            return;
+        }
+
+        // Build list of output files
+        let outputFiles = [];
+        // Multi-file output (extraction)
+        if (f.processed_files_json) {
+            try { outputFiles = JSON.parse(f.processed_files_json); } catch (e) {}
+        }
+        // Single-file output (CHD, CSO, etc.)
+        if (outputFiles.length === 0 && f.processed_filename) {
+            outputFiles = [f.processed_filename];
+        }
+
+        if (outputFiles.length === 0) return;
+
+        const colCount = isPriority ? 7 : 5;
+        const detailTr = document.createElement("tr");
+        detailTr.classList.add("processed-detail-row");
+        let listHtml = '<ul class="processed-output-list">';
+        for (const name of outputFiles) {
+            listHtml += `<li>${escapeHtml(name)}</li>`;
+        }
+        listHtml += "</ul>";
+        detailTr.innerHTML = `<td colspan="${colCount}" class="processed-detail-cell">${listHtml}</td>`;
+        tr.after(detailTr);
+        tr.classList.add("expanded");
     }
 
     function updateFileRow(fileId, updates) {
