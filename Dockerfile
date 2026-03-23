@@ -13,9 +13,9 @@ ARG MAME_VERSION=mame0273
 RUN git clone --depth 1 --branch ${MAME_VERSION} \
         https://github.com/mamedev/mame.git /tmp/mame \
     && cd /tmp/mame \
-    && make TOOLS=1 EMULATOR=0 USE_QTDEBUGGER=0 REGENIE=1 -j"$(nproc)" \
-    && find build -name chdman -type f | head -5 \
-    && cp $(find build -name chdman -type f | head -1) /usr/local/bin/chdman \
+    && make TOOLS=1 USE_QTDEBUGGER=0 REGENIE=1 -j"$(nproc)" \
+    && ls -la build/release/bin/ \
+    && cp build/release/bin/chdman /usr/local/bin/chdman \
     && rm -rf /tmp/mame
 
 # ── maxcso (uses bundled deps, plain Makefile) ───────────────────────
