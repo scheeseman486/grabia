@@ -25,7 +25,7 @@ Grab**ia** is a lightweight, browser-based download manager specifically for Int
 - **Retry logic** for failed downloads with configurable retries and delay
 - **Drag-and-drop reordering** of archives and files to set download priority
 - **Metadata refresh** to detect new, changed, or removed files on the archive
-- **Post-download processing** — convert disc images to CHD (with auto CD/DVD detection), compress ISOs to CSO, or extract archives in place
+- **Post-download processing** to convert disc images to CHD (with auto CD/DVD detection), compress ISOs to CSO, or extract archives in place
 - **Compression presets** for CHD conversion (default, lzma, zlib, flac, none) with transparent codec labels
 - **Dark and light themes**
 - **Password-protected** web UI (Is it secure? Probably not! Needs an audit, in the mean time don't open the port up to the internet)
@@ -68,7 +68,7 @@ python -m venv .venv
 .venv/bin/python app.py
 ```
 
-For file processing to work outside Docker, you'll need to install the relevant tools yourself: `chdman` (from MAME), `maxcso`, `7z` (`p7zip-full`), and/or `unrar`. Grabia detects them on your PATH automatically — check Settings to see what's available.
+For file processing to work outside Docker, you'll need to install the relevant tools yourself: `chdman` (from MAME), `maxcso`, `7z` (`p7zip-full`), and/or `unrar`. Grabia detects them on your PATH automatically, check Settings to see what's available.
 
 ### Internet Archive credentials
 
@@ -97,4 +97,5 @@ Nothing fancy: Flask, SQLite, vanilla JS, and plain CSS.
 
 ## License
 
-GPL-2.0 — see [LICENSE](LICENSE) for details.
+GPL-2.0
+See [LICENSE](LICENSE) for details.
