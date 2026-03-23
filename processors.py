@@ -958,3 +958,92 @@ class CISOProcessor(BaseProcessor):
         if result.returncode != 0:
             err = (result.stderr or result.stdout or "").strip()
             raise ProcessingError(f"maxcso failed: {err[:500]}")
+
+
+# ---------------------------------------------------------------------------
+# Extract Processor
+# ---------------------------------------------------------------------------
+
+@register_processor
+class ExtractProcessor(BaseProcessor):
+    type_id = "extract"
+    label = "Extract"
+    description = "Extract archive contents without recompression"
+    input_extensions = [".zip", ".7z", ".rar"]
+    options_schema = [
+        {
+            "key": "delete_archive",
+            "label": "Delete archive after extraction",
+            "type": "select",
+            "default": "yes",
+            "choices": [
+                {"value": "yes", "label": "Yes"},
+                {"value": "no", "label": "No — keep original archive"},
+            ],
+        },
+    ]
+
+    def process(self, file_path, download_dir):
+        base_name = os.path.splitext(os.path.basename(file_path))[0]
+
+        # Extract to a temp location first so we can inspect contents
+        temp_dir = self.get_temp_dir(file_path)
+        try:
+            self._progress(phase="extracting", filename=os.path.basename(file_path))
+            self._check_cancel()
+            extracted = _extract_archive(file_path, temp_dir, self._cancel_check)
+            self._check_cancel()
+
+            if not extracted:
+                return {"skipped": True, "reason": "Archive is empty"}
+
+            # Determine output location:
+            # Single file  -> extract alongside the archive
+            # Multiple files -> extract into a subfolder named after the archive
+            if len(extracted) == 1:
+                dest_dir = download_dir
+            else:
+                dest_dir = os.path.join(download_dir, base_name)
+                os.makedirs(dest_dir, exist_ok=True)
+
+            created = []
+            all_relative = []  # paths relative to download_dir for DB tracking
+            for i, rel in enumerate(extracted):
+                self._check_cancel()
+                self._progress(
+                    phase="extracting",
+                    filename=os.path.basename(rel),
+                    current=i + 1,
+                    total=len(extracted),
+                )
+                src = os.path.join(temp_dir, rel)
+                if not os.path.isfile(src):
+                    continue
+
+                # Preserve subdirectory structure from the archive
+                dest = os.path.join(dest_dir, rel)
+                os.makedirs(os.path.dirname(dest), exist_ok=True)
+                shutil.move(src, dest)
+                created.append(dest)
+                all_relative.append(os.path.relpath(dest, download_dir))
+
+            if not created:
+                return {"skipped": True, "reason": "No files extracted"}
+
+            # Primary display name: the folder if multi-file, the file if single
+            if len(extracted) == 1:
+                processed_filename = all_relative[0]
+            else:
+                processed_filename = base_name + os.sep
+
+            delete_archive = self.options.get("delete_archive", "yes") == "yes"
+
+            return {
+                "processed_filename": processed_filename,
+                "processed_files": all_relative,
+                "files_created": created,
+                "files_to_delete": [file_path] if delete_archive else [],
+                "skipped": False,
+            }
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)

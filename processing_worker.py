@@ -256,6 +256,7 @@ def _run_processing(job):
                     file_id, "completed",
                     processed_filename=result["processed_filename"],
                     processor_type=profile["processor_type"],
+                    processed_files=result.get("processed_files"),
                 )
                 summary["processed"] += 1
 

@@ -1365,10 +1365,12 @@
         // Show processing status if present
         if (f.processing_status && f.processing_status !== "") {
             if (f.processing_status === "completed") {
-                const ext = (f.processed_filename || "").split(".").pop().toUpperCase();
+                const pf = f.processed_filename || "";
+                if (pf.endsWith("/") || pf.endsWith("\\")) return "extracted";
+                const ext = pf.split(".").pop().toUpperCase();
                 return ext ? `${ext}` : "processed";
             }
-            if (f.processing_status === "processing") return "converting...";
+            if (f.processing_status === "processing") return "processing...";
             if (f.processing_status === "queued") return "proc. queued";
             if (f.processing_status === "failed") return "proc. failed";
             if (f.processing_status === "skipped") return "proc. skipped";

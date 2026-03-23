@@ -678,13 +678,7 @@ def _run_scan(archive_id):
     broadcast_sse("scan_progress", {"archive_id": archive_id, "phase": "disk", "current": 0, "total": 0})
 
     # Build a set of known processed filenames so we don't flag them as unknown
-    processed_names = set()
-    for row in conn.execute(
-        "SELECT processed_filename FROM archive_files "
-        "WHERE archive_id = ? AND processing_status = 'completed' AND processed_filename != ''",
-        (archive_id,),
-    ).fetchall():
-        processed_names.add(row["processed_filename"])
+    processed_names = db.get_all_processed_files(archive_id)
 
     unknown_files = []
     for root, _dirs, files in os.walk(base_dir):

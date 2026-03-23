@@ -170,6 +170,12 @@ def init_db():
         conn.execute("ALTER TABLE archive_files ADD COLUMN processor_type TEXT NOT NULL DEFAULT ''")
         conn.execute("ALTER TABLE archive_files ADD COLUMN processing_error TEXT NOT NULL DEFAULT ''")
 
+    # Multi-file processing output tracking (e.g. extraction)
+    try:
+        conn.execute("SELECT processed_files_json FROM archive_files LIMIT 1")
+    except sqlite3.OperationalError:
+        conn.execute("ALTER TABLE archive_files ADD COLUMN processed_files_json TEXT NOT NULL DEFAULT ''")
+
     # Processing profile FK on archives
     try:
         conn.execute("SELECT processing_profile_id FROM archives LIMIT 1")
@@ -904,7 +910,7 @@ def set_archive_processing_profile(archive_id, profile_id):
 
 # --- Processing Status Helpers ---
 
-def set_file_processing_status(file_id, status, processed_filename=None, processor_type=None, error=None):
+def set_file_processing_status(file_id, status, processed_filename=None, processor_type=None, error=None, processed_files=None):
     conn = get_db()
     updates = ["processing_status = ?"]
     params = [status]
@@ -917,10 +923,39 @@ def set_file_processing_status(file_id, status, processed_filename=None, process
     if error is not None:
         updates.append("processing_error = ?")
         params.append(error)
+    if processed_files is not None:
+        updates.append("processed_files_json = ?")
+        params.append(json.dumps(processed_files))
     params.append(file_id)
     conn.execute(f"UPDATE archive_files SET {', '.join(updates)} WHERE id = ?", params)
     conn.commit()
     conn.close()
+
+
+def get_all_processed_files(archive_id):
+    """Return a set of all output filenames (relative to download dir) produced
+    by processing for the given archive.  Includes both single-file outputs
+    (processed_filename) and multi-file outputs (processed_files_json)."""
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT processed_filename, processed_files_json FROM archive_files "
+        "WHERE archive_id = ? AND processing_status = 'completed'",
+        (archive_id,),
+    ).fetchall()
+    conn.close()
+    names = set()
+    for r in rows:
+        pf = r["processed_filename"]
+        if pf:
+            names.add(pf)
+        pj = r["processed_files_json"]
+        if pj:
+            try:
+                for entry in json.loads(pj):
+                    names.add(entry)
+            except (json.JSONDecodeError, TypeError):
+                pass
+    return names
 
 
 def get_processable_files(archive_id, processor_types=None):
