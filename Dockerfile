@@ -14,7 +14,7 @@ RUN git clone --depth 1 --branch ${MAME_VERSION} \
         https://github.com/mamedev/mame.git /tmp/mame \
     && cd /tmp/mame \
     && make TOOLS=1 EMULATOR=0 USE_QTDEBUGGER=0 REGENIE=1 -j"$(nproc)" \
-    && cp build/release/bin/chdman /usr/local/bin/chdman \
+    && find build -name chdman -type f -executable -exec cp {} /usr/local/bin/chdman \; \
     && rm -rf /tmp/mame
 
 # ── maxcso (uses bundled deps, plain Makefile) ───────────────────────
