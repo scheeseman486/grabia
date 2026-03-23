@@ -2,18 +2,18 @@
 FROM debian:bookworm AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        build-essential cmake ninja-build git ca-certificates \
+        build-essential cmake ninja-build git ca-certificates python3 \
         liblz4-dev libuv1-dev zlib1g-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# ── chdman (standalone) ──────────────────────────────────────────────
-RUN git clone --depth 1 \
-        https://github.com/charlesthobe/chdman.git /tmp/chdman \
-    && cd /tmp/chdman \
-    && cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
-    && cmake --build build \
-    && cp build/chdman /usr/local/bin/chdman \
-    && rm -rf /tmp/chdman
+# ── chdman (from MAME, tools-only build) ─────────────────────────────
+ARG MAME_VERSION=mame0273
+RUN git clone --depth 1 --branch ${MAME_VERSION} \
+        https://github.com/mamedev/mame.git /tmp/mame \
+    && cd /tmp/mame \
+    && make TOOLS=1 EMULATOR=0 REGENIE=1 -j"$(nproc)" \
+    && cp build/release/bin/chdman /usr/local/bin/chdman \
+    && rm -rf /tmp/mame
 
 # ── maxcso (uses bundled deps, plain Makefile) ───────────────────────
 ARG MAXCSO_VERSION=v1.13.0
