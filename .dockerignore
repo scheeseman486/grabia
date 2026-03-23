@@ -3,10 +3,11 @@
 .gitignore
 __pycache__/
 *.pyc
-grabia.db
+*.db
 .secret_key
 .sourceartassets/
 Dockerfile
-docker-compose.yml
+docker-compose*.yml
 README.md
 LICENSE
+downloads/

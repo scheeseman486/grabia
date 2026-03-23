@@ -91,8 +91,9 @@ def _get_binary_version(path, version_flag="--version"):
     if not path:
         return None
     try:
+        cmd = [path, version_flag] if version_flag else [path]
         result = subprocess.run(
-            [path, version_flag],
+            cmd,
             capture_output=True, text=True, timeout=10,
         )
         output = (result.stdout or result.stderr or "").strip()
@@ -108,7 +109,7 @@ def detect_tools():
         ("chdman", "tool_chdman_path", "--help"),
         ("maxcso", "tool_maxcso_path", "--version"),
         ("7z", "tool_7z_path", "--help"),
-        ("unrar", "tool_unrar_path", "--version"),
+        ("unrar", "tool_unrar_path", None),
     ]:
         path = _find_binary(name, setting_key)
         version = None
