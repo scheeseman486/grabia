@@ -555,7 +555,32 @@ class CHDAutoProcessor(BaseProcessor):
     label = "CHD (Auto)"
     description = "Auto-detect CD or DVD and convert to CHD using the appropriate chdman command"
     input_extensions = [".zip", ".7z", ".rar", ".iso", ".bin", ".img"]
+    # Maps preset value -> (cd_codecs, dvd_codecs)
+    # cd_codecs passed to chdman createcd -c, dvd_codecs to createdvd -c
+    _COMPRESSION_PRESETS = {
+        "default": (None, None),  # chdman built-in defaults (tries all)
+        "lzma":    ("cdlz", "lzma"),
+        "zlib":    ("cdzl", "zlib"),
+        "flac":    ("cdfl", "flac"),
+        "huff":    (None, "huff"),  # Huffman is DVD-only; CD falls back to default
+        "none":    ("none", "none"),
+    }
+
     options_schema = [
+        {
+            "key": "compression",
+            "label": "Compression",
+            "type": "select",
+            "default": "default",
+            "choices": [
+                {"value": "default", "label": "Default — CD: cdlz+cdzl+cdfl / DVD: lzma+zlib+huff+flac"},
+                {"value": "lzma", "label": "LZMA — CD: cdlz / DVD: lzma (best ratio, slowest)"},
+                {"value": "zlib", "label": "Zlib — CD: cdzl / DVD: zlib (balanced)"},
+                {"value": "flac", "label": "FLAC — CD: cdfl / DVD: flac (lossless audio, fast)"},
+                {"value": "huff", "label": "Huffman — DVD: huff (fastest, larger files)"},
+                {"value": "none", "label": "None — no compression"},
+            ],
+        },
         {
             "key": "num_processors",
             "label": "Threads",
@@ -564,6 +589,13 @@ class CHDAutoProcessor(BaseProcessor):
             "description": "0 = auto (use all cores)",
         },
     ]
+
+    def _get_compression_args(self, disc_type):
+        """Return the -c flag arguments for the chosen compression preset."""
+        preset = self.options.get("compression", "default")
+        mapping = self._COMPRESSION_PRESETS.get(preset, (None, None))
+        codec = mapping[0] if disc_type == "cd" else mapping[1]
+        return ["-c", codec] if codec else []
 
     def process(self, file_path, download_dir):
         chdman = _find_binary("chdman", "tool_chdman_path")
@@ -684,6 +716,7 @@ class CHDAutoProcessor(BaseProcessor):
 
     def _run_chdman_createcd(self, chdman, input_path, output_path):
         cmd = [chdman, "createcd", "-i", input_path, "-o", output_path, "-f"]
+        cmd.extend(self._get_compression_args("cd"))
         num_proc = int(self.options.get("num_processors", 0))
         if num_proc > 0:
             cmd.extend(["-np", str(num_proc)])
@@ -698,6 +731,7 @@ class CHDAutoProcessor(BaseProcessor):
 
     def _run_chdman_createdvd(self, chdman, input_path, output_path):
         cmd = [chdman, "createdvd", "-i", input_path, "-o", output_path, "-f"]
+        cmd.extend(self._get_compression_args("dvd"))
         num_proc = int(self.options.get("num_processors", 0))
         if num_proc > 0:
             cmd.extend(["-np", str(num_proc)])
