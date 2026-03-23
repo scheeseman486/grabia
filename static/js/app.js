@@ -900,14 +900,16 @@
         try {
             const aid = currentArchiveId;
             const resp = await api("POST", `/api/archives/${aid}/scan`);
-            const label = resp.queued ? "queued" : "starting";
-            // Track the notification so we can remove it when progress starts
-            const qid = ++notifIdCounter;
-            scanQueuedNotifs[aid] = qid;
-            notifications.unshift({ id: qid, message: `Scan "${archiveName}": ${label}`, type: "info", time: new Date() });
-            renderNotifBadge();
-            renderNotifList();
-            showToast(`Scan "${archiveName}": ${label}`, "info");
+            if (resp.queued) {
+                // Actually waiting behind another task — show queued notification
+                const qid = ++notifIdCounter;
+                scanQueuedNotifs[aid] = qid;
+                notifications.unshift({ id: qid, message: `Scan "${archiveName}": queued`, type: "info", time: new Date() });
+                renderNotifBadge();
+                renderNotifList();
+                showToast(`Scan "${archiveName}": queued`, "info");
+            }
+            // If not queued, SSE progress events will show the scan notification
             updateScanButton();
         } catch (e) {
             if (e.message && e.message.includes("already queued")) {
@@ -2279,8 +2281,10 @@
                 options,
                 auto_process: autoProcess,
             });
-            const label = resp.queued ? "queued" : "starting";
-            addNotification(`Processing ${label} for "${getArchiveName(currentArchiveId)}"`, "info");
+            if (resp.queued) {
+                addNotification(`Processing queued for "${getArchiveName(currentArchiveId)}"`, "info");
+            }
+            // If not queued, SSE progress events will show the processing notification
         } catch (e) {
             addNotification(`Processing failed: ${e.message}`, "error");
         }
