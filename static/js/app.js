@@ -100,7 +100,9 @@
                 }
             }
             const cancelHtml = n.scanArchiveId
-                ? `<button class="notif-cancel" data-cancel-archive="${n.scanArchiveId}">Cancel</button>`
+                ? `<button class="notif-cancel" data-cancel-type="scan" data-cancel-archive="${n.scanArchiveId}">Cancel</button>`
+                : n.processingArchiveId
+                ? `<button class="notif-cancel" data-cancel-type="process" data-cancel-archive="${n.processingArchiveId}">Cancel</button>`
                 : "";
             div.innerHTML = `
                 <div class="notif-content">
@@ -123,7 +125,12 @@
             if (cancelBtn) {
                 cancelBtn.addEventListener("click", (e) => {
                     e.stopPropagation();
-                    cancelScan(parseInt(cancelBtn.dataset.cancelArchive));
+                    const archiveId = parseInt(cancelBtn.dataset.cancelArchive);
+                    if (cancelBtn.dataset.cancelType === "process") {
+                        cancelProcessing(archiveId);
+                    } else {
+                        cancelScan(archiveId);
+                    }
                 });
             }
             list.appendChild(div);
@@ -925,6 +932,14 @@
             await api("POST", `/api/archives/${archiveId}/scan/cancel`);
         } catch (e) {
             // Scan may have already finished
+        }
+    }
+
+    async function cancelProcessing(archiveId) {
+        try {
+            await api("POST", `/api/archives/${archiveId}/process/cancel`);
+        } catch (e) {
+            // Processing may have already finished
         }
     }
 
