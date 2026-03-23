@@ -2259,6 +2259,7 @@
             renderNotifBadge();
             renderNotifList();
             showToast(`Processing started: "${archiveName}"`, "info");
+            if (currentArchiveId === archive_id) loadFiles();
         } else if (phase === "extracting" || phase === "converting") {
             const notif = notifications.find(n => n.id === processingNotifs[archive_id]);
             if (notif) {
@@ -2275,8 +2276,10 @@
                 notif.progress = Math.round((data.current / data.total) * 100);
                 renderNotifList();
             }
+            if (currentArchiveId === archive_id) loadFiles();
         } else if (phase === "file_error") {
             addNotification(`Processing "${archiveName}": ${data.filename} failed — ${data.error}`, "error");
+            if (currentArchiveId === archive_id) loadFiles();
         } else if (phase === "done") {
             if (processingNotifs[archive_id]) {
                 notifications = notifications.filter(n => n.id !== processingNotifs[archive_id]);
