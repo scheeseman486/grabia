@@ -127,6 +127,79 @@ def detect_tools():
 DISC_IMAGE_EXTS = {".iso", ".bin", ".cue", ".img", ".gdi", ".mdf", ".mds"}
 
 
+def _list_archive_contents(archive_path):
+    """List file names inside an archive without extracting.
+    Returns a list of relative paths, or None if listing is not supported."""
+    ext = os.path.splitext(archive_path)[1].lower()
+    try:
+        if ext == ".zip":
+            with zipfile.ZipFile(archive_path, "r") as zf:
+                # Filter out directory entries
+                return [n for n in zf.namelist() if not n.endswith("/")]
+        elif ext == ".7z":
+            if HAS_PY7ZR:
+                with py7zr.SevenZipFile(archive_path, "r") as sz:
+                    return [n for n in sz.getnames() if not n.endswith("/")]
+            bin_path = _find_binary("7z", "tool_7z_path")
+            if bin_path:
+                result = subprocess.run(
+                    [bin_path, "l", "-slt", archive_path],
+                    capture_output=True, text=True, timeout=60,
+                )
+                if result.returncode == 0:
+                    # Parse -slt output: blocks of "Path = ...\nFolder = ..." etc.
+                    # First Path entry is the archive itself, skip it.
+                    files = []
+                    current_path = None
+                    current_is_dir = False
+                    for line in result.stdout.splitlines():
+                        if line.startswith("Path = "):
+                            # Save previous entry
+                            if current_path is not None and not current_is_dir:
+                                files.append(current_path)
+                            current_path = line[7:]
+                            current_is_dir = False
+                        elif line.startswith("Folder = +"):
+                            current_is_dir = True
+                    # Save last entry
+                    if current_path is not None and not current_is_dir:
+                        files.append(current_path)
+                    # Skip first entry (archive path itself)
+                    return files[1:] if len(files) > 1 else files
+            return None
+        elif ext == ".rar":
+            bin_path = _find_binary("unrar", "tool_unrar_path")
+            if bin_path:
+                result = subprocess.run(
+                    [bin_path, "lb", archive_path],
+                    capture_output=True, text=True, timeout=60,
+                )
+                if result.returncode == 0:
+                    return [l for l in result.stdout.strip().splitlines() if l]
+            return None
+        else:
+            return None
+    except Exception as e:
+        log.debug("extract", "Failed to list contents of %s: %s", os.path.basename(archive_path), e)
+        return None
+
+
+def _archive_has_extensions(archive_path, extensions):
+    """Check if an archive contains any files with the given extensions,
+    without extracting. Returns True/False, or None if listing failed
+    (caller should fall back to extracting)."""
+    contents = _list_archive_contents(archive_path)
+    if contents is None:
+        return None
+    log.debug("extract", "Peeked at %s: %d files", os.path.basename(archive_path), len(contents))
+    for name in contents:
+        if os.path.splitext(name)[1].lower() in extensions:
+            return True
+    log.debug("extract", "No matching extensions %s in %s, skipping extraction",
+              sorted(extensions), os.path.basename(archive_path))
+    return False
+
+
 def _extract_archive(archive_path, dest_dir, cancel_check=None):
     """Extract a compressed archive (zip, 7z, rar) to dest_dir.
     Returns list of extracted file paths relative to dest_dir."""
@@ -476,7 +549,12 @@ class CHDCDProcessor(BaseProcessor):
             log.debug("proc", "CHD CD: %s is a direct disc image, skipping extraction", fname)
             return self._convert_iso_direct(file_path, download_dir, chdman)
 
-        # It's an archive — extract and find disc images
+        # It's an archive — peek first, then extract if worthwhile
+        has_images = _archive_has_extensions(file_path, DISC_IMAGE_EXTS | {".zip", ".7z", ".rar"})
+        if has_images is False:
+            log.info("proc", "CHD CD: %s — no disc images or nested archives found (peeked), skipping", fname)
+            return {"skipped": True, "reason": "No disc images found in archive"}
+
         log.debug("proc", "CHD CD: %s is an archive, extracting to search for disc images", fname)
         temp_dir = self.get_temp_dir(file_path)
         try:
@@ -665,7 +743,12 @@ class CHDAutoProcessor(BaseProcessor):
             log.debug("proc", "CHD Auto: %s is a direct disc image, detected as %s", fname, disc_type.upper())
             return self._convert_direct(file_path, download_dir, chdman, disc_type)
 
-        # Archive — extract and find disc images
+        # Archive — peek first, then extract if worthwhile
+        has_images = _archive_has_extensions(file_path, DISC_IMAGE_EXTS | {".zip", ".7z", ".rar"})
+        if has_images is False:
+            log.info("proc", "CHD Auto: %s — no disc images or nested archives found (peeked), skipping", fname)
+            return {"skipped": True, "reason": "No disc images found in archive"}
+
         log.debug("proc", "CHD Auto: %s is an archive, extracting to search for disc images", fname)
         temp_dir = self.get_temp_dir(file_path)
         try:
@@ -863,6 +946,12 @@ class CHDDVDProcessor(BaseProcessor):
         if ext == ".iso":
             return self._convert_iso(file_path, download_dir, chdman)
 
+        # Peek at archive contents before extracting
+        iso_exts = {".iso", ".img"}
+        has_isos = _archive_has_extensions(file_path, iso_exts)
+        if has_isos is False:
+            return {"skipped": True, "reason": "No ISO images found in archive"}
+
         # Extract archive
         temp_dir = self.get_temp_dir(file_path)
         try:
@@ -872,7 +961,7 @@ class CHDDVDProcessor(BaseProcessor):
             self._check_cancel()
 
             # Find ISO files
-            isos = [f for f in extracted if os.path.splitext(f)[1].lower() in (".iso", ".img")]
+            isos = [f for f in extracted if os.path.splitext(f)[1].lower() in iso_exts]
             if not isos:
                 return {"skipped": True, "reason": "No ISO images found in archive"}
 
@@ -968,6 +1057,12 @@ class CISOProcessor(BaseProcessor):
         if ext == ".iso":
             return self._convert_iso(file_path, download_dir, maxcso)
 
+        # Peek at archive contents before extracting
+        iso_exts = {".iso", ".img"}
+        has_isos = _archive_has_extensions(file_path, iso_exts)
+        if has_isos is False:
+            return {"skipped": True, "reason": "No ISO images found in archive"}
+
         temp_dir = self.get_temp_dir(file_path)
         try:
             self._progress(phase="extracting", filename=os.path.basename(file_path))
@@ -975,7 +1070,7 @@ class CISOProcessor(BaseProcessor):
             extracted = _extract_archive(file_path, temp_dir, self._cancel_check)
             self._check_cancel()
 
-            isos = [f for f in extracted if os.path.splitext(f)[1].lower() in (".iso", ".img")]
+            isos = [f for f in extracted if os.path.splitext(f)[1].lower() in iso_exts]
             if not isos:
                 return {"skipped": True, "reason": "No ISO images found in archive"}
 
@@ -1039,6 +1134,11 @@ class ExtractProcessor(BaseProcessor):
 
     def process(self, file_path, download_dir):
         base_name = os.path.splitext(os.path.basename(file_path))[0]
+
+        # Peek to check for empty archive before extracting
+        contents = _list_archive_contents(file_path)
+        if contents is not None and len(contents) == 0:
+            return {"skipped": True, "reason": "Archive is empty"}
 
         # Extract to a temp location first so we can inspect contents
         temp_dir = self.get_temp_dir(file_path)
