@@ -939,7 +939,7 @@ def get_all_processed_files(archive_id):
     conn = get_db()
     rows = conn.execute(
         "SELECT processed_filename, processed_files_json FROM archive_files "
-        "WHERE archive_id = ? AND processing_status = 'completed'",
+        "WHERE archive_id = ? AND processing_status IN ('completed', 'extracted')",
         (archive_id,),
     ).fetchall()
     conn.close()

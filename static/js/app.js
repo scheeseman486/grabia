@@ -1255,6 +1255,7 @@
             const displayStatus = formatFileStatus(f);
             const procStatus = f.processing_status || "";
             const statusClass = procStatus === "completed" ? "processed"
+                : procStatus === "extracted" ? "processed"
                 : procStatus === "failed" ? "proc-failed"
                 : procStatus === "processing" || procStatus === "queued" ? "proc-active"
                 : displayStatus === "skipped" ? "skipped"
@@ -1319,8 +1320,8 @@
 
             fileListEl.appendChild(tr);
 
-            // Processed file: click row to expand/collapse output file list
-            if (procStatus === "completed") {
+            // Processed/extracted file: click row to expand/collapse output file list
+            if (procStatus === "completed" || procStatus === "extracted") {
                 tr.classList.add("processed-expandable");
                 tr.addEventListener("click", (e) => {
                     // Don't toggle when clicking checkbox or buttons
@@ -1378,6 +1379,7 @@
         // Show processing status if present
         if (f.processing_status && f.processing_status !== "") {
             if (f.processing_status === "completed") return "processed";
+            if (f.processing_status === "extracted") return "extracted";
             if (f.processing_status === "processing") return "processing...";
             if (f.processing_status === "queued") return "proc. queued";
             if (f.processing_status === "failed") return "proc. failed";

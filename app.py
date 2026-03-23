@@ -553,17 +553,19 @@ def _run_scan(archive_id):
             _abort()
             return
 
-        # Check if a previously processed file still exists on disk
-        if info.get("processing_status") == "completed":
+        # Check if a previously processed/extracted file still exists on disk
+        if info.get("processing_status") in ("completed", "extracted"):
             pf = info.get("processed_filename", "")
-            if pf and os.path.isfile(os.path.join(base_dir, pf)):
-                log.debug("scan", "%s: processed file %s exists, matched", name, pf)
+            pf_path = os.path.join(base_dir, pf) if pf else ""
+            # processed_filename can be a file or a directory (folder extraction)
+            if pf_path and (os.path.isfile(pf_path) or os.path.isdir(pf_path)):
+                log.debug("scan", "%s: processed output %s exists, matched", name, pf)
                 summary["matched"] += 1
                 processed += 1
                 _progress()
                 continue
-            # Processed file is gone — reset processing state so it can be re-downloaded/re-processed
-            log.info("scan", "%s: processed file %s missing, resetting processing state", name, pf)
+            # Processed output is gone — reset processing state
+            log.info("scan", "%s: processed output %s missing, resetting processing state", name, pf)
             pending_writes.append((
                 "UPDATE archive_files SET processing_status = '', processed_filename = '', "
                 "processed_files_json = '', processor_type = '', processing_error = '' WHERE id = ?",

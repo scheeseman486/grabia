@@ -261,16 +261,19 @@ def _run_processing(job):
                 summary["skipped"] += 1
             else:
                 # Delete original files if option allows
-                if merged_options.get("delete_original", "yes") == "yes":
+                delete_original = merged_options.get("delete_original", "yes") == "yes"
+                if delete_original:
                     for to_delete in result.get("files_to_delete", []):
                         try:
                             os.remove(to_delete)
                         except OSError:
                             pass
 
-                log.info("worker", "Completed %s -> %s", filename, result["processed_filename"])
+                # Use "extracted" status when original is kept, "completed" when deleted
+                proc_status = "completed" if delete_original else "extracted"
+                log.info("worker", "%s %s -> %s", proc_status.capitalize(), filename, result["processed_filename"])
                 db.set_file_processing_status(
-                    file_id, "completed",
+                    file_id, proc_status,
                     processed_filename=result["processed_filename"],
                     processor_type=profile["processor_type"],
                     processed_files=result.get("processed_files"),
