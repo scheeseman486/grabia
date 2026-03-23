@@ -542,15 +542,20 @@ def _run_scan(archive_id):
             _abort()
             return
 
-        # Skip files that have been successfully processed — don't overwrite their state
+        # Check if a previously processed file still exists on disk
         if info.get("processing_status") == "completed":
-            # Verify the processed file still exists on disk
             pf = info.get("processed_filename", "")
             if pf and os.path.isfile(os.path.join(base_dir, pf)):
                 summary["matched"] += 1
                 processed += 1
                 _progress()
                 continue
+            # Processed file is gone — reset processing state so it can be re-downloaded/re-processed
+            pending_writes.append((
+                "UPDATE archive_files SET processing_status = '', processed_filename = '', "
+                "processed_files_json = '', processor_type = '', processing_error = '' WHERE id = ?",
+                (info["id"],),
+            ))
 
         local_path = os.path.realpath(os.path.join(base_dir, name))
         if not local_path.startswith(base_dir + os.sep) and local_path != base_dir:
@@ -574,6 +579,10 @@ def _run_scan(archive_id):
                     found_processed = True
                     break
             if not found_processed:
+                pending_writes.append((
+                    "UPDATE archive_files SET download_status = 'pending', downloaded_bytes = 0 WHERE id = ?",
+                    (info["id"],),
+                ))
                 summary["missing"] += 1
             processed += 1
             if len(pending_writes) >= BATCH_SIZE:
