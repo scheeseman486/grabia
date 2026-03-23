@@ -1,24 +1,11 @@
-# ── Stage 1: Build chdman and maxcso from source ──────────────────────
+# ── Stage 1: Build maxcso from source ─────────────────────────────────
 FROM debian:bookworm AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        build-essential cmake ninja-build git ca-certificates python3 \
-        pkg-config libsdl2-dev libsdl2-ttf-dev libfontconfig-dev \
-        qtbase5-dev \
+        build-essential git ca-certificates \
         liblz4-dev libuv1-dev zlib1g-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# ── chdman (from MAME, tools-only build) ─────────────────────────────
-ARG MAME_VERSION=mame0273
-RUN git clone --depth 1 --branch ${MAME_VERSION} \
-        https://github.com/mamedev/mame.git /tmp/mame \
-    && cd /tmp/mame \
-    && make TOOLS=1 USE_QTDEBUGGER=0 REGENIE=1 -j"$(nproc)" \
-    && ls -la build/release/bin/ \
-    && cp build/release/bin/chdman /usr/local/bin/chdman \
-    && rm -rf /tmp/mame
-
-# ── maxcso (uses bundled deps, plain Makefile) ───────────────────────
 ARG MAXCSO_VERSION=v1.13.0
 RUN git clone --depth 1 --branch ${MAXCSO_VERSION} \
         https://github.com/unknownbrackets/maxcso.git /tmp/maxcso \
@@ -31,17 +18,17 @@ RUN git clone --depth 1 --branch ${MAXCSO_VERSION} \
 # ── Stage 2: Runtime image ────────────────────────────────────────────
 FROM python:3.11-slim-bookworm
 
-# Add non-free for unrar, install runtime deps
+# Add non-free for unrar; mame-tools provides chdman
 RUN sed -i 's/Components: main/Components: main non-free/' \
         /etc/apt/sources.list.d/debian.sources \
     && apt-get update && apt-get install -y --no-install-recommends \
+        mame-tools \
         p7zip-full \
         unrar \
         liblz4-1 libuv1 zlib1g \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy compiled binaries from builder
-COPY --from=builder /usr/local/bin/chdman /usr/local/bin/chdman
+# Copy maxcso from builder
 COPY --from=builder /usr/local/bin/maxcso /usr/local/bin/maxcso
 
 WORKDIR /app
