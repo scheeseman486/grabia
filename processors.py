@@ -51,7 +51,7 @@ def get_processor_types():
         tid: {
             "label": cls.label,
             "description": cls.description,
-            "options_schema": cls.options_schema,
+            "options_schema": cls.options_schema + _COMMON_OPTIONS,
             "input_extensions": cls.input_extensions,
         }
         for tid, cls in _PROCESSOR_REGISTRY.items()
@@ -333,6 +333,20 @@ class ProcessingCancelled(Exception):
 # ---------------------------------------------------------------------------
 # Base processor
 # ---------------------------------------------------------------------------
+
+_COMMON_OPTIONS = [
+    {
+        "key": "delete_original",
+        "label": "Delete original after processing",
+        "type": "select",
+        "default": "yes",
+        "choices": [
+            {"value": "yes", "label": "Yes"},
+            {"value": "no", "label": "No — keep original file"},
+        ],
+    },
+]
+
 
 class BaseProcessor:
     """Base class for file processors."""
@@ -970,18 +984,7 @@ class ExtractProcessor(BaseProcessor):
     label = "Extract"
     description = "Extract archive contents without recompression"
     input_extensions = [".zip", ".7z", ".rar"]
-    options_schema = [
-        {
-            "key": "delete_archive",
-            "label": "Delete archive after extraction",
-            "type": "select",
-            "default": "yes",
-            "choices": [
-                {"value": "yes", "label": "Yes"},
-                {"value": "no", "label": "No — keep original archive"},
-            ],
-        },
-    ]
+    options_schema = []
 
     def process(self, file_path, download_dir):
         base_name = os.path.splitext(os.path.basename(file_path))[0]
@@ -1036,13 +1039,11 @@ class ExtractProcessor(BaseProcessor):
             else:
                 processed_filename = base_name + os.sep
 
-            delete_archive = self.options.get("delete_archive", "yes") == "yes"
-
             return {
                 "processed_filename": processed_filename,
                 "processed_files": all_relative,
                 "files_created": created,
-                "files_to_delete": [file_path] if delete_archive else [],
+                "files_to_delete": [file_path],
                 "skipped": False,
             }
         finally:

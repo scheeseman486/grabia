@@ -245,12 +245,13 @@ def _run_processing(job):
                 )
                 summary["skipped"] += 1
             else:
-                # Delete original files
-                for to_delete in result.get("files_to_delete", []):
-                    try:
-                        os.remove(to_delete)
-                    except OSError:
-                        pass
+                # Delete original files if option allows
+                if merged_options.get("delete_original", "yes") == "yes":
+                    for to_delete in result.get("files_to_delete", []):
+                        try:
+                            os.remove(to_delete)
+                        except OSError:
+                            pass
 
                 db.set_file_processing_status(
                     file_id, "completed",
