@@ -676,6 +676,16 @@ def _run_scan(archive_id):
 
     # Scan for unknown files on disk
     broadcast_sse("scan_progress", {"archive_id": archive_id, "phase": "disk", "current": 0, "total": 0})
+
+    # Build a set of known processed filenames so we don't flag them as unknown
+    processed_names = set()
+    for row in conn.execute(
+        "SELECT processed_filename FROM archive_files "
+        "WHERE archive_id = ? AND processing_status = 'completed' AND processed_filename != ''",
+        (archive_id,),
+    ).fetchall():
+        processed_names.add(row["processed_filename"])
+
     unknown_files = []
     for root, _dirs, files in os.walk(base_dir):
         if _cancelled():
@@ -684,7 +694,7 @@ def _run_scan(archive_id):
         for fname in files:
             full = os.path.join(root, fname)
             rel = os.path.relpath(full, base_dir)
-            if rel not in manifest:
+            if rel not in manifest and rel not in processed_names:
                 unknown_files.append(rel)
                 summary["unknown"] += 1
 
