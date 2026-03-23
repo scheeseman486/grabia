@@ -104,6 +104,14 @@ def init_db():
             username TEXT NOT NULL,
             password_hash TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS processing_profiles (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            processor_type TEXT NOT NULL,
+            options_json TEXT NOT NULL DEFAULT '{}',
+            position INTEGER NOT NULL DEFAULT 0
+        );
     """)
 
     # Default settings
@@ -152,6 +160,27 @@ def init_db():
         conn.execute("SELECT origin FROM archive_files LIMIT 1")
     except sqlite3.OperationalError:
         conn.execute("ALTER TABLE archive_files ADD COLUMN origin TEXT NOT NULL DEFAULT 'manifest'")
+
+    # Processing pipeline columns on archive_files
+    try:
+        conn.execute("SELECT processing_status FROM archive_files LIMIT 1")
+    except sqlite3.OperationalError:
+        conn.execute("ALTER TABLE archive_files ADD COLUMN processing_status TEXT NOT NULL DEFAULT ''")
+        conn.execute("ALTER TABLE archive_files ADD COLUMN processed_filename TEXT NOT NULL DEFAULT ''")
+        conn.execute("ALTER TABLE archive_files ADD COLUMN processor_type TEXT NOT NULL DEFAULT ''")
+        conn.execute("ALTER TABLE archive_files ADD COLUMN processing_error TEXT NOT NULL DEFAULT ''")
+
+    # Multi-file processing output tracking (e.g. extraction)
+    try:
+        conn.execute("SELECT processed_files_json FROM archive_files LIMIT 1")
+    except sqlite3.OperationalError:
+        conn.execute("ALTER TABLE archive_files ADD COLUMN processed_files_json TEXT NOT NULL DEFAULT ''")
+
+    # Processing profile FK on archives
+    try:
+        conn.execute("SELECT processing_profile_id FROM archives LIMIT 1")
+    except sqlite3.OperationalError:
+        conn.execute("ALTER TABLE archives ADD COLUMN processing_profile_id INTEGER DEFAULT NULL REFERENCES processing_profiles(id) ON DELETE SET NULL")
 
     # Fix any scan-inserted rows incorrectly tagged as 'manifest'.
     # Real IA files always have at least one metadata field populated;
@@ -813,3 +842,144 @@ def change_password(old_password, new_password):
     conn.commit()
     conn.close()
     return True
+
+
+# --- Processing Profiles ---
+
+def get_processing_profiles():
+    conn = get_db()
+    rows = conn.execute("SELECT * FROM processing_profiles ORDER BY position ASC").fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_processing_profile(profile_id):
+    conn = get_db()
+    row = conn.execute("SELECT * FROM processing_profiles WHERE id = ?", (profile_id,)).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def add_processing_profile(name, processor_type, options=None):
+    conn = get_db()
+    max_pos = conn.execute("SELECT COALESCE(MAX(position), -1) FROM processing_profiles").fetchone()[0]
+    conn.execute(
+        "INSERT INTO processing_profiles (name, processor_type, options_json, position) VALUES (?, ?, ?, ?)",
+        (name, processor_type, json.dumps(options or {}), max_pos + 1),
+    )
+    profile_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+    conn.commit()
+    conn.close()
+    return profile_id
+
+
+def update_processing_profile(profile_id, name=None, processor_type=None, options=None):
+    conn = get_db()
+    updates, params = [], []
+    if name is not None:
+        updates.append("name = ?")
+        params.append(name)
+    if processor_type is not None:
+        updates.append("processor_type = ?")
+        params.append(processor_type)
+    if options is not None:
+        updates.append("options_json = ?")
+        params.append(json.dumps(options))
+    if updates:
+        params.append(profile_id)
+        conn.execute(f"UPDATE processing_profiles SET {', '.join(updates)} WHERE id = ?", params)
+        conn.commit()
+    conn.close()
+
+
+def delete_processing_profile(profile_id):
+    conn = get_db()
+    # Unlink any archives using this profile
+    conn.execute("UPDATE archives SET processing_profile_id = NULL WHERE processing_profile_id = ?", (profile_id,))
+    conn.execute("DELETE FROM processing_profiles WHERE id = ?", (profile_id,))
+    conn.commit()
+    conn.close()
+
+
+def set_archive_processing_profile(archive_id, profile_id):
+    conn = get_db()
+    conn.execute("UPDATE archives SET processing_profile_id = ? WHERE id = ?", (profile_id, archive_id))
+    conn.commit()
+    conn.close()
+
+
+# --- Processing Status Helpers ---
+
+def set_file_processing_status(file_id, status, processed_filename=None, processor_type=None, error=None, processed_files=None):
+    conn = get_db()
+    updates = ["processing_status = ?"]
+    params = [status]
+    if processed_filename is not None:
+        updates.append("processed_filename = ?")
+        params.append(processed_filename)
+    if processor_type is not None:
+        updates.append("processor_type = ?")
+        params.append(processor_type)
+    if error is not None:
+        updates.append("processing_error = ?")
+        params.append(error)
+    if processed_files is not None:
+        updates.append("processed_files_json = ?")
+        params.append(json.dumps(processed_files))
+    params.append(file_id)
+    conn.execute(f"UPDATE archive_files SET {', '.join(updates)} WHERE id = ?", params)
+    conn.commit()
+    conn.close()
+
+
+def get_all_processed_files(archive_id):
+    """Return a set of all output filenames (relative to download dir) produced
+    by processing for the given archive.  Includes both single-file outputs
+    (processed_filename) and multi-file outputs (processed_files_json)."""
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT processed_filename, processed_files_json FROM archive_files "
+        "WHERE archive_id = ? AND processing_status IN ('completed', 'extracted')",
+        (archive_id,),
+    ).fetchall()
+    conn.close()
+    names = set()
+    for r in rows:
+        pf = r["processed_filename"]
+        if pf:
+            names.add(pf)
+        pj = r["processed_files_json"]
+        if pj:
+            try:
+                for entry in json.loads(pj):
+                    names.add(entry)
+            except (json.JSONDecodeError, TypeError):
+                pass
+    return names
+
+
+def get_processable_files(archive_id, processor_types=None):
+    """Get files eligible for processing: completed downloads, not already processed.
+    Optionally filter by file extensions matching processor input types."""
+    conn = get_db()
+    rows = conn.execute(
+        """SELECT * FROM archive_files
+           WHERE archive_id = ? AND download_status = 'completed'
+             AND processing_status IN ('', 'failed')
+             AND origin = 'manifest'
+           ORDER BY download_priority ASC""",
+        (archive_id,),
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_processing_queue_files(archive_id):
+    """Get files currently queued or being processed for an archive."""
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT * FROM archive_files WHERE archive_id = ? AND processing_status IN ('queued', 'processing')",
+        (archive_id,),
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]

@@ -28,6 +28,7 @@ from flask import Flask, render_template, request, jsonify, Response, session, r
 import database as db
 import ia_client
 from downloader import download_manager
+from logger import log, configure as configure_logging
 
 app = Flask(__name__)
 
@@ -236,7 +237,10 @@ def update_settings():
     allowed = ["ia_email", "ia_password", "download_dir", "max_retries",
                "retry_delay", "bandwidth_limit", "theme", "files_per_page",
                "speed_schedule", "use_http", "confirm_reset_order",
-               "default_enable_archive", "default_select_all"]
+               "default_enable_archive", "default_select_all", "sse_update_rate",
+               "tool_chdman_path", "tool_maxcso_path", "tool_7z_path",
+               "tool_unrar_path", "processing_temp_dir",
+               "debug_enabled", "debug_log_file"]
     credentials_changed = False
     for key in allowed:
         if key in data:
@@ -251,6 +255,12 @@ def update_settings():
     # Update bandwidth limit in running manager
     if "bandwidth_limit" in data:
         download_manager.bandwidth_limit = int(data["bandwidth_limit"])
+    # Reconfigure debug logging if changed
+    if "debug_enabled" in data or "debug_log_file" in data:
+        configure_logging(
+            enabled=db.get_setting("debug_enabled", "0") == "1",
+            log_file=db.get_setting("debug_log_file", ""),
+        )
     broadcast_sse("settings_updated", db.get_all_settings())
     return jsonify({"ok": True})
 
@@ -459,9 +469,11 @@ _scan_thread.start()
 
 def _run_scan(archive_id):
     """Execute the actual scan logic in a background thread."""
+    log.info("scan", "Starting scan for archive %d", archive_id)
     cancel_evt = _scan_cancel.get(archive_id)
     archive = db.get_archive(archive_id)
     if not archive:
+        log.warning("scan", "Archive %d not found, aborting scan", archive_id)
         return
 
     # Read update rate from settings (milliseconds -> seconds)
@@ -508,11 +520,12 @@ def _run_scan(archive_id):
 
     # Ground truth
     rows = conn.execute(
-        "SELECT id, name, size, md5, download_status FROM archive_files "
+        "SELECT id, name, size, md5, download_status, processing_status, processed_filename FROM archive_files "
         "WHERE archive_id = ? AND origin = 'manifest'",
         (archive_id,),
     ).fetchall()
     manifest = {r["name"]: dict(r) for r in rows}
+    log.debug("scan", "Manifest has %d files for %s", len(manifest), archive["identifier"])
 
     summary = {"matched": 0, "conflict": 0, "unknown": 0, "missing": 0, "partial": 0}
 
@@ -540,13 +553,55 @@ def _run_scan(archive_id):
             _abort()
             return
 
+        # Check if a previously processed/extracted file still exists on disk
+        if info.get("processing_status") in ("completed", "extracted"):
+            pf = info.get("processed_filename", "")
+            pf_path = os.path.join(base_dir, pf) if pf else ""
+            # processed_filename can be a file or a directory (folder extraction)
+            if pf_path and (os.path.isfile(pf_path) or os.path.isdir(pf_path)):
+                log.debug("scan", "%s: processed output %s exists, matched", name, pf)
+                summary["matched"] += 1
+                processed += 1
+                _progress()
+                continue
+            # Processed output is gone — reset processing state
+            log.info("scan", "%s: processed output %s missing, resetting processing state", name, pf)
+            pending_writes.append((
+                "UPDATE archive_files SET processing_status = '', processed_filename = '', "
+                "processed_files_json = '', processor_type = '', processing_error = '' WHERE id = ?",
+                (info["id"],),
+            ))
+
         local_path = os.path.realpath(os.path.join(base_dir, name))
         if not local_path.startswith(base_dir + os.sep) and local_path != base_dir:
             continue
 
         if not os.path.isfile(local_path):
-            summary["missing"] += 1
+            # Check if a processed version exists (e.g., game.zip → game.chd)
+            base_no_ext = os.path.splitext(name)[0]
+            found_processed = False
+            for proc_ext in (".chd", ".cso"):
+                proc_path = os.path.join(base_dir, base_no_ext + proc_ext)
+                if os.path.isfile(proc_path):
+                    proc_filename = base_no_ext + proc_ext
+                    pending_writes.append((
+                        "UPDATE archive_files SET download_status = 'completed', "
+                        "processing_status = 'completed', processed_filename = ?, "
+                        "downloaded_bytes = ? WHERE id = ?",
+                        (proc_filename, os.path.getsize(proc_path), info["id"]),
+                    ))
+                    summary["matched"] += 1
+                    found_processed = True
+                    break
+            if not found_processed:
+                pending_writes.append((
+                    "UPDATE archive_files SET download_status = 'pending', downloaded_bytes = 0 WHERE id = ?",
+                    (info["id"],),
+                ))
+                summary["missing"] += 1
             processed += 1
+            if len(pending_writes) >= BATCH_SIZE:
+                _flush_writes()
             _progress()
             continue
 
@@ -645,6 +700,10 @@ def _run_scan(archive_id):
 
     # Scan for unknown files on disk
     broadcast_sse("scan_progress", {"archive_id": archive_id, "phase": "disk", "current": 0, "total": 0})
+
+    # Build a set of known processed filenames so we don't flag them as unknown
+    processed_names = db.get_all_processed_files(archive_id)
+
     unknown_files = []
     for root, _dirs, files in os.walk(base_dir):
         if _cancelled():
@@ -653,7 +712,7 @@ def _run_scan(archive_id):
         for fname in files:
             full = os.path.join(root, fname)
             rel = os.path.relpath(full, base_dir)
-            if rel not in manifest:
+            if rel not in manifest and rel not in processed_names:
                 unknown_files.append(rel)
                 summary["unknown"] += 1
 
@@ -680,9 +739,13 @@ def _run_scan(archive_id):
     conn.commit()
     conn.close()
 
+    if unknown_files:
+        log.debug("scan", "%d unknown files found on disk", len(unknown_files))
+
     db.recompute_archive_file_count(archive_id)
     db.recompute_archive_status(archive_id)
     updated = db.get_archive(archive_id)
+    log.info("scan", "Scan complete for %s: %s", archive["identifier"], summary)
     broadcast_sse("scan_progress", {
         "archive_id": archive_id, "phase": "done",
         "current": total_manifest, "total": total_manifest,
@@ -710,8 +773,9 @@ def scan_existing_files(archive_id):
         evt = threading.Event()
         _scan_cancel[archive_id] = evt
 
+    pending = _scan_queue.qsize()
     _scan_queue.put(archive_id)
-    return jsonify({"ok": True, "queued": True})
+    return jsonify({"ok": True, "queued": pending > 0})
 
 
 @app.route("/api/archives/<int:archive_id>/scan/cancel", methods=["POST"])
@@ -910,11 +974,143 @@ def set_bandwidth():
     return jsonify({"bandwidth_limit": download_manager.bandwidth_limit})
 
 
+# --- Processing API ---
+
+@app.route("/api/processing/profiles", methods=["GET"])
+@login_required
+def list_processing_profiles():
+    profiles = db.get_processing_profiles()
+    import json as _json
+    for p in profiles:
+        p["options"] = _json.loads(p.get("options_json", "{}"))
+    return jsonify(profiles)
+
+
+@app.route("/api/processing/profiles", methods=["POST"])
+@login_required
+def create_processing_profile():
+    data = request.json
+    name = data.get("name", "").strip()
+    processor_type = data.get("processor_type", "")
+    options = data.get("options", {})
+    if not name:
+        return jsonify({"error": "Name is required"}), 400
+    from processors import get_processor_types
+    if processor_type not in get_processor_types():
+        return jsonify({"error": f"Unknown processor type: {processor_type}"}), 400
+    profile_id = db.add_processing_profile(name, processor_type, options)
+    return jsonify({"ok": True, "id": profile_id})
+
+
+@app.route("/api/processing/profiles/<int:profile_id>", methods=["PUT"])
+@login_required
+def update_processing_profile_endpoint(profile_id):
+    data = request.json
+    db.update_processing_profile(
+        profile_id,
+        name=data.get("name"),
+        processor_type=data.get("processor_type"),
+        options=data.get("options"),
+    )
+    return jsonify({"ok": True})
+
+
+@app.route("/api/processing/profiles/<int:profile_id>", methods=["DELETE"])
+@login_required
+def delete_processing_profile_endpoint(profile_id):
+    db.delete_processing_profile(profile_id)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/processing/types", methods=["GET"])
+@login_required
+def list_processor_types():
+    from processors import get_processor_types
+    return jsonify(get_processor_types())
+
+
+@app.route("/api/processing/tools", methods=["GET"])
+@login_required
+def detect_processing_tools():
+    from processors import detect_tools
+    return jsonify(detect_tools())
+
+
+@app.route("/api/archives/<int:archive_id>/process", methods=["POST"])
+@login_required
+def process_archive(archive_id):
+    data = request.json or {}
+    profile_id = data.get("profile_id")
+    if not profile_id:
+        return jsonify({"error": "profile_id is required"}), 400
+    file_ids = data.get("file_ids")
+    options_override = data.get("options", {})
+    auto_process = data.get("auto_process", False)
+
+    # Optionally set auto-processing on this archive
+    if auto_process:
+        db.set_archive_processing_profile(archive_id, profile_id)
+
+    from processing_worker import queue_archive_processing
+    ok, queued = queue_archive_processing(archive_id, profile_id, file_ids, options_override)
+    if not ok:
+        return jsonify({"error": queued}), 409
+    return jsonify({"ok": True, "queued": queued})
+
+
+@app.route("/api/archives/<int:archive_id>/process/cancel", methods=["POST"])
+@login_required
+def cancel_processing(archive_id):
+    from processing_worker import cancel_archive_processing
+    if cancel_archive_processing(archive_id):
+        return jsonify({"ok": True})
+    return jsonify({"error": "No active processing for this archive"}), 404
+
+
+@app.route("/api/archives/<int:archive_id>/processable", methods=["GET"])
+@login_required
+def get_processable(archive_id):
+    """Return count and list of files eligible for processing."""
+    files = db.get_processable_files(archive_id)
+    return jsonify({
+        "count": len(files),
+        "files": [{"id": f["id"], "name": f["name"], "size": f["size"]} for f in files],
+    })
+
+
+@app.route("/api/files/<int:file_id>/process", methods=["POST"])
+@login_required
+def process_single_file(file_id):
+    """Queue processing for a single file."""
+    data = request.json or {}
+    profile_id = data.get("profile_id")
+    if not profile_id:
+        return jsonify({"error": "profile_id is required"}), 400
+    conn = db.get_db()
+    row = conn.execute("SELECT archive_id FROM archive_files WHERE id = ?", (file_id,)).fetchone()
+    conn.close()
+    if not row:
+        return jsonify({"error": "File not found"}), 404
+    from processing_worker import queue_archive_processing
+    ok, queued = queue_archive_processing(row["archive_id"], profile_id, [file_id], data.get("options"))
+    if not ok:
+        return jsonify({"error": queued}), 409
+    return jsonify({"ok": True, "queued": queued})
+
+
 # --- Init ---
 
 def create_app():
     db.init_db()
     db.reset_downloading_files()
+    # Configure debug logging from saved settings
+    configure_logging(
+        enabled=db.get_setting("debug_enabled", "0") == "1",
+        log_file=db.get_setting("debug_log_file", ""),
+    )
+    # Start processing worker
+    from processing_worker import init_processing_worker
+    init_processing_worker(broadcast_sse)
     # Load saved bandwidth limit (-1 = unlimited, 0 = paused, >0 = throttle)
     # One-time migration: old "0 = unlimited" → new "-1 = unlimited"
     if not db.get_setting("bw_migrated", ""):
