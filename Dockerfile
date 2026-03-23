@@ -3,7 +3,8 @@ FROM debian:bookworm AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential cmake ninja-build git ca-certificates python3 \
-        pkg-config libsdl2-dev libfontconfig-dev qtbase5-dev \
+        pkg-config libsdl2-dev libsdl2-ttf-dev libfontconfig-dev \
+        qtbase5-dev \
         liblz4-dev libuv1-dev zlib1g-dev \
     && rm -rf /var/lib/apt/lists/*
 
