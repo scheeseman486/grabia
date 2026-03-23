@@ -63,13 +63,14 @@ def queue_archive_processing(archive_id, profile_id, file_ids=None, options_over
         evt = threading.Event()
         _cancel_events[archive_id] = evt
 
+    pending = _processing_queue.qsize()
     _processing_queue.put({
         "archive_id": archive_id,
         "profile_id": profile_id,
         "file_ids": file_ids,
         "options_override": options_override,
     })
-    return True, "Queued"
+    return True, pending > 0
 
 
 def cancel_archive_processing(archive_id):

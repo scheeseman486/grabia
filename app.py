@@ -754,8 +754,9 @@ def scan_existing_files(archive_id):
         evt = threading.Event()
         _scan_cancel[archive_id] = evt
 
+    pending = _scan_queue.qsize()
     _scan_queue.put(archive_id)
-    return jsonify({"ok": True, "queued": True})
+    return jsonify({"ok": True, "queued": pending > 0})
 
 
 @app.route("/api/archives/<int:archive_id>/scan/cancel", methods=["POST"])
@@ -1032,10 +1033,10 @@ def process_archive(archive_id):
         db.set_archive_processing_profile(archive_id, profile_id)
 
     from processing_worker import queue_archive_processing
-    ok, msg = queue_archive_processing(archive_id, profile_id, file_ids, options_override)
+    ok, queued = queue_archive_processing(archive_id, profile_id, file_ids, options_override)
     if not ok:
-        return jsonify({"error": msg}), 409
-    return jsonify({"ok": True, "queued": True})
+        return jsonify({"error": queued}), 409
+    return jsonify({"ok": True, "queued": queued})
 
 
 @app.route("/api/archives/<int:archive_id>/process/cancel", methods=["POST"])
@@ -1072,10 +1073,10 @@ def process_single_file(file_id):
     if not row:
         return jsonify({"error": "File not found"}), 404
     from processing_worker import queue_archive_processing
-    ok, msg = queue_archive_processing(row["archive_id"], profile_id, [file_id], data.get("options"))
+    ok, queued = queue_archive_processing(row["archive_id"], profile_id, [file_id], data.get("options"))
     if not ok:
-        return jsonify({"error": msg}), 409
-    return jsonify({"ok": True, "queued": True})
+        return jsonify({"error": queued}), 409
+    return jsonify({"ok": True, "queued": queued})
 
 
 # --- Init ---

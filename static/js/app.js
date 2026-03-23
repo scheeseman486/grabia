@@ -899,14 +899,15 @@
         const archiveName = getArchiveName(currentArchiveId);
         try {
             const aid = currentArchiveId;
-            await api("POST", `/api/archives/${aid}/scan`);
-            // Scan is now queued — track the queued notification so we can remove it when progress starts
+            const resp = await api("POST", `/api/archives/${aid}/scan`);
+            const label = resp.queued ? "queued" : "starting";
+            // Track the notification so we can remove it when progress starts
             const qid = ++notifIdCounter;
             scanQueuedNotifs[aid] = qid;
-            notifications.unshift({ id: qid, message: `Scan "${archiveName}": queued`, type: "info", time: new Date() });
+            notifications.unshift({ id: qid, message: `Scan "${archiveName}": ${label}`, type: "info", time: new Date() });
             renderNotifBadge();
             renderNotifList();
-            showToast(`Scan "${archiveName}": queued`, "info");
+            showToast(`Scan "${archiveName}": ${label}`, "info");
             updateScanButton();
         } catch (e) {
             if (e.message && e.message.includes("already queued")) {
@@ -2273,12 +2274,13 @@
         const options = collectOptions($("#process-profile-options"));
         const autoProcess = $("#process-auto-future").checked;
         try {
-            await api("POST", `/api/archives/${currentArchiveId}/process`, {
+            const resp = await api("POST", `/api/archives/${currentArchiveId}/process`, {
                 profile_id: profileId,
                 options,
                 auto_process: autoProcess,
             });
-            addNotification(`Processing queued for "${getArchiveName(currentArchiveId)}"`, "info");
+            const label = resp.queued ? "queued" : "starting";
+            addNotification(`Processing ${label} for "${getArchiveName(currentArchiveId)}"`, "info");
         } catch (e) {
             addNotification(`Processing failed: ${e.message}`, "error");
         }
