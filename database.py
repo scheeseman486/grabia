@@ -81,7 +81,7 @@ def init_db():
             format TEXT NOT NULL DEFAULT '',
             source TEXT NOT NULL DEFAULT '',
             mtime TEXT NOT NULL DEFAULT '',
-            selected INTEGER NOT NULL DEFAULT 1,
+            queued INTEGER NOT NULL DEFAULT 1,
             download_status TEXT NOT NULL DEFAULT 'pending',
             downloaded_bytes INTEGER NOT NULL DEFAULT 0,
             error_message TEXT NOT NULL DEFAULT '',
@@ -193,6 +193,18 @@ def init_db():
     except sqlite3.OperationalError:
         conn.execute("ALTER TABLE archives ADD COLUMN processing_profile_id INTEGER DEFAULT NULL REFERENCES processing_profiles(id) ON DELETE SET NULL")
 
+    # Rename 'selected' column to 'queued' (clearer intent, avoids confusion
+    # with UI checkbox selection).  ALTER TABLE ... RENAME COLUMN is safe and
+    # non-destructive — it keeps all data, indexes, and constraints intact.
+    try:
+        conn.execute("SELECT queued FROM archive_files LIMIT 1")
+    except sqlite3.OperationalError:
+        # Column still has the old name — rename it
+        try:
+            conn.execute("ALTER TABLE archive_files RENAME COLUMN selected TO queued")
+        except sqlite3.OperationalError:
+            pass  # Shouldn't happen, but don't break startup
+
     # Fix any scan-inserted rows incorrectly tagged as 'manifest'.
     # Real IA files always have at least one metadata field populated;
     # scan-inserted files have md5, sha1, format, source, and mtime all empty.
@@ -200,6 +212,13 @@ def init_db():
         UPDATE archive_files SET origin = 'scan'
         WHERE origin = 'manifest'
           AND md5 = '' AND sha1 = '' AND format = '' AND source = '' AND mtime = ''
+    """)
+
+    # Dequeue files that have already completed or hit a conflict — they should
+    # not remain queued since they don't need downloading.
+    conn.execute("""
+        UPDATE archive_files SET queued = 0
+        WHERE queued = 1 AND download_status IN ('completed', 'conflict')
     """)
 
     # Fix archives stuck on 'downloading' or 'queued' from a previous session.
@@ -217,15 +236,16 @@ def init_db():
                 SUM(CASE WHEN download_status = 'failed' THEN 1 ELSE 0 END) as failed,
                 SUM(CASE WHEN download_status = 'conflict' THEN 1 ELSE 0 END) as conflict
             FROM archive_files
-            WHERE archive_id = ? AND selected = 1 AND origin = 'manifest'
+            WHERE archive_id = ? AND (queued = 1 OR download_status IN ('completed', 'conflict'))
         """, (aid,)).fetchone()
-        if counts["total"] > 0:
-            if counts["completed"] == counts["total"]:
-                conn.execute("UPDATE archives SET status = 'completed' WHERE id = ?", (aid,))
-            elif counts["completed"] + counts["failed"] + counts["conflict"] == counts["total"]:
-                conn.execute("UPDATE archives SET status = 'partial' WHERE id = ?", (aid,))
-            else:
-                conn.execute("UPDATE archives SET status = 'idle' WHERE id = ?", (aid,))
+        if counts["total"] == 0:
+            conn.execute("UPDATE archives SET status = 'idle' WHERE id = ?", (aid,))
+        elif counts["completed"] == counts["total"]:
+            conn.execute("UPDATE archives SET status = 'completed' WHERE id = ?", (aid,))
+        elif counts["completed"] + counts["failed"] + counts["conflict"] == counts["total"]:
+            conn.execute("UPDATE archives SET status = 'partial' WHERE id = ?", (aid,))
+        else:
+            conn.execute("UPDATE archives SET status = 'idle' WHERE id = ?", (aid,))
 
     conn.commit()
     conn.close()
@@ -282,7 +302,7 @@ def add_archive_files(archive_id, files):
             for i, f in enumerate(files):
                 conn.execute(
                     """INSERT OR IGNORE INTO archive_files
-                       (archive_id, name, size, md5, sha1, format, source, mtime, selected, download_priority)
+                       (archive_id, name, size, md5, sha1, format, source, mtime, queued, download_priority)
                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)""",
                     (archive_id, f["name"], int(f.get("size", 0) or 0),
                      f.get("md5", ""), f.get("sha1", ""), f.get("format", ""),
@@ -302,10 +322,10 @@ def _enrich_archives_with_progress(archives, conn):
     placeholders = ",".join("?" * len(ids))
     rows = conn.execute(f"""
         SELECT archive_id,
-               SUM(CASE WHEN selected = 1 AND download_status = 'completed' THEN 1 ELSE 0 END) AS completed_files,
-               SUM(CASE WHEN selected = 1 THEN 1 ELSE 0 END) AS selected_files,
-               SUM(CASE WHEN selected = 1 THEN size ELSE 0 END) AS selected_size,
-               SUM(CASE WHEN selected = 1 THEN downloaded_bytes ELSE 0 END) AS downloaded_bytes
+               SUM(CASE WHEN download_status = 'completed' THEN 1 ELSE 0 END) AS completed_files,
+               SUM(CASE WHEN queued = 1 OR download_status = 'completed' THEN 1 ELSE 0 END) AS selected_files,
+               SUM(CASE WHEN queued = 1 OR download_status = 'completed' THEN size ELSE 0 END) AS selected_size,
+               SUM(CASE WHEN queued = 1 OR download_status = 'completed' THEN downloaded_bytes ELSE 0 END) AS downloaded_bytes
         FROM archive_files WHERE archive_id IN ({placeholders})
         GROUP BY archive_id
     """, ids).fetchall()
@@ -323,10 +343,10 @@ def get_archive_progress(archive_id):
     """Return download progress stats for a single archive."""
     with _db() as conn:
         row = conn.execute("""
-            SELECT SUM(CASE WHEN selected = 1 AND download_status = 'completed' THEN 1 ELSE 0 END) AS completed_files,
-                   SUM(CASE WHEN selected = 1 THEN 1 ELSE 0 END) AS selected_files,
-                   SUM(CASE WHEN selected = 1 THEN size ELSE 0 END) AS selected_size,
-                   SUM(CASE WHEN selected = 1 THEN downloaded_bytes ELSE 0 END) AS downloaded_bytes
+            SELECT SUM(CASE WHEN download_status = 'completed' THEN 1 ELSE 0 END) AS completed_files,
+                   SUM(CASE WHEN queued = 1 OR download_status = 'completed' THEN 1 ELSE 0 END) AS selected_files,
+                   SUM(CASE WHEN queued = 1 OR download_status = 'completed' THEN size ELSE 0 END) AS selected_size,
+                   SUM(CASE WHEN queued = 1 OR download_status = 'completed' THEN downloaded_bytes ELSE 0 END) AS downloaded_bytes
             FROM archive_files WHERE archive_id = ?
         """, (archive_id,)).fetchone()
         if row:
@@ -414,7 +434,7 @@ def recompute_archive_status(archive_id, fallback=None):
                 SUM(CASE WHEN download_status = 'failed' THEN 1 ELSE 0 END) as failed,
                 SUM(CASE WHEN download_status = 'conflict' THEN 1 ELSE 0 END) as conflict
             FROM archive_files
-            WHERE archive_id = ? AND selected = 1 AND origin = 'manifest'
+            WHERE archive_id = ? AND (queued = 1 OR download_status IN ('completed', 'conflict'))
         """, (archive_id,)).fetchone()
         if row["total"] == 0:
             status = "idle"
@@ -461,7 +481,7 @@ _FILE_SORT_MAP = {
 }
 
 # Effective status mirrors the JS formatFileStatus logic:
-# processing_status takes priority, then selected+download_status determines "skipped"
+# processing_status takes priority, then queued+download_status determines "skipped"
 _EFFECTIVE_STATUS_EXPR = """CASE
     WHEN processing_status = 'completed' THEN 'processed'
     WHEN processing_status = 'extracted' THEN 'extracted'
@@ -469,7 +489,7 @@ _EFFECTIVE_STATUS_EXPR = """CASE
     WHEN processing_status = 'queued' THEN 'proc_queued'
     WHEN processing_status = 'failed' THEN 'proc_failed'
     WHEN processing_status = 'skipped' THEN 'proc_skipped'
-    WHEN selected = 0 AND download_status = 'pending' THEN 'skipped'
+    WHEN queued = 0 AND download_status = 'pending' THEN 'skipped'
     ELSE download_status
 END"""
 
@@ -480,7 +500,7 @@ def get_archive_files(archive_id, page=1, per_page=50, sort="name", sort_dir=Non
         col, default_dir = _FILE_SORT_MAP.get(sort, _FILE_SORT_MAP["name"])
         direction = sort_dir.upper() if sort_dir in ("asc", "desc") else default_dir
         if sort == "priority":
-            order = f"selected DESC, download_priority {direction}"
+            order = f"queued DESC, download_priority {direction}"
         elif sort == "status":
             order = f"({_EFFECTIVE_STATUS_EXPR}) {direction}, name ASC"
         else:
@@ -539,24 +559,24 @@ def reset_file_priorities(archive_id):
         conn.commit()
 
 
-def count_unselected_files(archive_id):
+def count_unqueued_files(archive_id):
     with _db() as conn:
         count = conn.execute(
-            "SELECT COUNT(*) FROM archive_files WHERE archive_id = ? AND selected = 0",
+            "SELECT COUNT(*) FROM archive_files WHERE archive_id = ? AND queued = 0",
             (archive_id,),
         ).fetchone()[0]
         return count
 
 
-def set_file_selected(file_id, selected):
+def set_file_queued(file_id, queued):
     with _db() as conn:
-        conn.execute("UPDATE archive_files SET selected = ? WHERE id = ?", (1 if selected else 0, file_id))
+        conn.execute("UPDATE archive_files SET queued = ? WHERE id = ?", (1 if queued else 0, file_id))
         conn.commit()
 
 
-def set_all_files_selected(archive_id, selected):
+def set_all_files_queued(archive_id, queued):
     with _db() as conn:
-        conn.execute("UPDATE archive_files SET selected = ? WHERE archive_id = ?", (1 if selected else 0, archive_id))
+        conn.execute("UPDATE archive_files SET queued = ? WHERE archive_id = ?", (1 if queued else 0, archive_id))
         conn.commit()
 
 
@@ -570,6 +590,9 @@ def set_file_download_status(file_id, status, downloaded_bytes=None, error_messa
         if error_message is not None:
             updates.append("error_message = ?")
             params.append(error_message)
+        # Dequeue files that have reached a terminal state
+        if status in ("completed", "conflict"):
+            updates.append("queued = 0")
         params.append(file_id)
         conn.execute(f"UPDATE archive_files SET {', '.join(updates)} WHERE id = ?", params)
         conn.commit()
@@ -591,7 +614,7 @@ def get_next_download_file():
             FROM archive_files af
             JOIN archives a ON af.archive_id = a.id
             WHERE a.download_enabled = 1
-              AND af.selected = 1
+              AND af.queued = 1
               AND (af.download_status = 'pending'
                    OR (af.download_status = 'failed' AND af.retry_count < ?))
             ORDER BY a.position ASC,
@@ -612,12 +635,12 @@ def get_download_progress():
                 SUM(CASE WHEN download_status = 'completed' THEN 1 ELSE 0 END) as completed_files,
                 SUM(CASE WHEN download_status = 'downloading' THEN 1 ELSE 0 END) as active_files,
                 SUM(CASE WHEN download_status = 'failed' THEN 1 ELSE 0 END) as failed_files,
-                SUM(CASE WHEN selected = 1 AND download_status IN ('pending', 'failed') THEN 1 ELSE 0 END) as queued_files,
+                SUM(CASE WHEN download_status IN ('pending', 'failed') THEN 1 ELSE 0 END) as queued_files,
                 SUM(size) as total_size,
                 SUM(downloaded_bytes) as downloaded_bytes
             FROM archive_files af
             JOIN archives a ON af.archive_id = a.id
-            WHERE a.download_enabled = 1 AND af.selected = 1
+            WHERE a.download_enabled = 1 AND (af.queued = 1 OR af.download_status = 'completed')
         """).fetchone()
         if row:
             return dict(row)
@@ -733,7 +756,7 @@ def refresh_archive_metadata(archive_id, new_files_list):
                 conn.execute(
                     """INSERT INTO archive_files
                        (archive_id, name, size, md5, sha1, format, source, mtime,
-                        selected, change_status, change_detail)
+                        queued, change_status, change_detail)
                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 'new', 'Newly added to Internet Archive since last check')""",
                     (archive_id, name, int(new_f.get("size", 0) or 0),
                      new_f.get("md5", ""), new_f.get("sha1", ""), new_f.get("format", ""),

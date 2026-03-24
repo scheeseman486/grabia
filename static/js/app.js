@@ -1007,16 +1007,22 @@
     async function archiveBatchDeleteFolders() {
         if (selectedArchiveIds.size === 0) return;
         const count = selectedArchiveIds.size;
-        if (!confirm(`Delete download folder(s) for ${count} selected archive(s)?\n\nThis will remove the downloaded files from disk but keep the archives in the list.`)) return;
-        const ids = Array.from(selectedArchiveIds);
-        let deleted = 0;
-        for (const aid of ids) {
-            try { const r = await api("POST", `/api/archives/${aid}/delete-folder`); if (r.ok) deleted++; } catch (e) {}
-        }
-        addNotification(`Deleted ${deleted} folder(s)`, "info");
-        selectedArchiveIds.clear();
-        updateArchiveBatchActions();
-        await refreshArchives();
+        confirmAction(
+            "confirm_delete_folders",
+            "Delete Download Folders",
+            `Delete download folder(s) for <strong>${count}</strong> selected archive(s)?<br><br>This will remove the downloaded files from disk but keep the archives in the list.`,
+            async () => {
+                const ids = Array.from(selectedArchiveIds);
+                let deleted = 0;
+                for (const aid of ids) {
+                    try { const r = await api("POST", `/api/archives/${aid}/delete-folder`); if (r.ok) deleted++; } catch (e) {}
+                }
+                addNotification(`Deleted folders for ${deleted}/${ids.length} archives`, "info");
+                selectedArchiveIds.clear();
+                renderArchiveList();
+            },
+            { confirmText: "Delete Folders" }
+        );
     }
 
     async function moveArchive(fromIdx, toIdx) {
@@ -1404,7 +1410,7 @@
     // --- Render file list ---
 
     function renderFiles(data) {
-        const { files, total, page, per_page, total_pages, all_selected } = data;
+        const { files, total, page, per_page, total_pages, all_queued } = data;
         const isPriority = currentSort === "priority";
 
         rebuildTableHeader();
@@ -1421,19 +1427,19 @@
             return;
         }
 
-        // In priority mode, identify the boundary between queued (selected) and non-queued
+        // In priority mode, identify the boundary between queued and non-queued
         // queuedFiles excludes unknown files for priority button indexing
-        const queuedFiles = isPriority ? files.filter((f) => f.selected && f.download_status !== "unknown") : [];
+        const queuedFiles = isPriority ? files.filter((f) => f.queued && f.download_status !== "unknown") : [];
         const lastQueuedIdx = isPriority ? queuedFiles.length - 1 : -1;
         let dividerInserted = false;
-        const hasQueued = isPriority && files.some((f) => f.selected);
-        const hasUnqueued = isPriority && files.some((f) => !f.selected);
+        const hasQueued = isPriority && files.some((f) => f.queued);
+        const hasUnqueued = isPriority && files.some((f) => !f.queued);
         const needsDivider = hasQueued && hasUnqueued;
 
         let hasChanges = false;
         files.forEach((f, idx) => {
             // In priority mode, insert divider at the boundary between queued and non-queued files
-            if (needsDivider && !dividerInserted && !f.selected) {
+            if (needsDivider && !dividerInserted && !f.queued) {
                 dividerInserted = true;
                 const divTr = document.createElement("tr");
                 divTr.className = "queue-divider-row";
@@ -1463,7 +1469,7 @@
 
             // Grip column (priority mode only, queued files only)
             if (isPriority) {
-                html += (f.selected && !isUnknown) ? buildGripCell() : '<td class="col-grip"></td>';
+                html += (f.queued && !isUnknown) ? buildGripCell() : '<td class="col-grip"></td>';
             }
 
             // Processing status (needed early for queue and name logic)
@@ -1476,7 +1482,7 @@
             const hideQueue = isUnknown || (hasProcessedOutput && !sourceDeleted);
             if (hideQueue) {
                 html += '<td class="col-queue"></td>';
-            } else if (f.selected) {
+            } else if (f.queued) {
                 html += `<td class="col-queue"><button class="queue-toggle queue-remove" data-queue-id="${f.id}" title="Remove from queue">` +
                     `<svg viewBox="0 0 16 16" width="14" height="14"><rect x="3" y="7" width="10" height="2" rx="1" fill="currentColor"/></svg></button></td>`;
             } else {
@@ -1508,7 +1514,7 @@
             html += `<td class="col-size" style="text-align:right">${formatBytes(f.size)}</td>`;
             html += `<td class="col-modified">${formatDate(f.mtime)}</td>`;
             const displayStatus = formatFileStatus(f);
-            const isSkipped = !f.selected && f.download_status === "pending";
+            const isSkipped = !f.queued && f.download_status === "pending";
             const statusClass = procStatus === "completed" ? "processed"
                 : procStatus === "extracted" ? "processed"
                 : procStatus === "failed" ? "proc-failed"
@@ -1529,7 +1535,7 @@
 
             // Priority buttons (priority mode only, queued files only)
             if (isPriority) {
-                if (f.selected && !isUnknown) {
+                if (f.queued && !isUnknown) {
                     const selIdx = queuedFiles.indexOf(f);
                     html += buildPriorityCell(f.id, selIdx === 0, selIdx === lastQueuedIdx);
                 } else {
@@ -1557,7 +1563,7 @@
                     e.stopPropagation();
                     const fid = parseInt(queueBtn.dataset.queueId);
                     const adding = queueBtn.classList.contains("queue-add");
-                    api("POST", `/api/files/${fid}/select`, { selected: adding }).then(() => loadFiles());
+                    api("POST", `/api/files/${fid}/queue`, { queued: adding }).then(() => loadFiles());
                 });
             }
 
@@ -1590,7 +1596,7 @@
             });
 
             // Priority mode: drag & priority button handlers for queued files
-            if (isPriority && f.selected && !isUnknown) {
+            if (isPriority && f.queued && !isUnknown) {
                 attachPriorityDrag(tr, f.id);
                 const upBtn = tr.querySelector(`[data-move-up="${f.id}"]`);
                 const downBtn = tr.querySelector(`[data-move-down="${f.id}"]`);
@@ -1661,7 +1667,7 @@
             if (f.processing_status === "failed") return "proc. failed";
             if (f.processing_status === "skipped") return "proc. skipped";
         }
-        if (!f.selected && f.download_status === "pending") {
+        if (!f.queued && f.download_status === "pending") {
             if (f.downloaded_bytes > 0 && f.size > 0) {
                 const pct = ((f.downloaded_bytes / f.size) * 100).toFixed(1);
                 return `${pct}%`;
@@ -1753,14 +1759,14 @@
                 const name = li.dataset.name;
                 const action = btn.dataset.ptreeAction;
                 if (action === "delete") {
-                    if (!confirm(`Delete "${name}"?`)) return;
-                    api("POST", `/api/files/${f.id}/delete-processed`, { filename: path }).then(() => {
-                        addNotification(`Deleted "${name}"`, "info");
-                        // Collapse and re-expand to refresh tree
-                        detailTr.remove();
-                        tr.classList.remove("expanded");
-                        loadFiles();
-                    }).catch((e2) => addNotification("Delete failed: " + e2.message, "error"));
+                    confirmAction("confirm_delete_processed", "Delete Processed File", `Delete &ldquo;${escapeHtml(name)}&rdquo;?`, () => {
+                        api("POST", `/api/files/${f.id}/delete-processed`, { filename: path }).then(() => {
+                            addNotification(`Deleted "${name}"`, "info");
+                            detailTr.remove();
+                            tr.classList.remove("expanded");
+                            loadFiles();
+                        }).catch((e2) => addNotification("Delete failed: " + e2.message, "error"));
+                    }, { confirmText: "Delete" });
                 } else if (action === "rename") {
                     startProcessedRename(li, f.id, path, name);
                 }
@@ -1772,13 +1778,14 @@
         if (deleteAllBtn) {
             deleteAllBtn.addEventListener("click", (e) => {
                 e.stopPropagation();
-                if (!confirm("Delete all processed output files for this item?")) return;
-                api("POST", `/api/files/${f.id}/delete-processed`, { delete_all: true }).then(() => {
-                    addNotification("Deleted all processed files", "info");
-                    detailTr.remove();
-                    tr.classList.remove("expanded");
-                    loadFiles();
-                }).catch((e2) => addNotification("Delete failed: " + e2.message, "error"));
+                confirmAction("confirm_delete_processed", "Delete All Processed Files", "Delete all processed output files for this item?", () => {
+                    api("POST", `/api/files/${f.id}/delete-processed`, { delete_all: true }).then(() => {
+                        addNotification("Deleted all processed files", "info");
+                        detailTr.remove();
+                        tr.classList.remove("expanded");
+                        loadFiles();
+                    }).catch((e2) => addNotification("Delete failed: " + e2.message, "error"));
+                }, { confirmText: "Delete All" });
             });
         }
 
@@ -1870,8 +1877,13 @@
             activeRenameCancel = null;
             const newName = input.value.trim();
             if (newName && newName !== currentName) {
-                await api("POST", `/api/files/${fileId}/rename`, { name: newName });
-                loadFiles();
+                try {
+                    await api("POST", `/api/files/${fileId}/rename`, { name: newName });
+                    loadFiles();
+                } catch (e) {
+                    addNotification("Rename failed: " + e.message, "error");
+                    restore();
+                }
             } else {
                 restore();
             }
@@ -1905,14 +1917,15 @@
     function confirmDeleteFile(fileId, fileName, origin) {
         const removeFromDb = (origin === "scan" || origin === "unknown");
         const msg = removeFromDb
-            ? `Delete "${fileName}"?\n\nThis will remove the file from disk and from the archive list.`
-            : `Delete "${fileName}" from disk?\n\nThe file will be removed from disk but kept in the archive list.`;
-        if (!confirm(msg)) return;
-        api("POST", `/api/files/${fileId}/delete`, { remove_from_db: removeFromDb }).then(() => {
-            addNotification(`Deleted "${fileName}"`, "info");
-            loadFiles();
-            refreshArchives();
-        }).catch((e) => addNotification("Delete failed: " + e.message, "error"));
+            ? `Delete &ldquo;${escapeHtml(fileName)}&rdquo;?<br><br>This will remove the file from disk and from the archive list.`
+            : `Delete &ldquo;${escapeHtml(fileName)}&rdquo; from disk?<br><br>The file will be removed from disk but kept in the archive list.`;
+        confirmAction("confirm_delete_file", "Delete File", msg, () => {
+            api("POST", `/api/files/${fileId}/delete`, { remove_from_db: removeFromDb }).then(() => {
+                addNotification(`Deleted "${fileName}"`, "info");
+                loadFiles();
+                refreshArchives();
+            }).catch((e) => addNotification("Delete failed: " + e.message, "error"));
+        }, { confirmText: "Delete" });
     }
 
     // --- Batch actions ---
@@ -1955,17 +1968,24 @@
     async function batchDeleteFiles() {
         if (!currentArchiveId || selectedFileIds.size === 0) return;
         const count = selectedFileIds.size;
-        if (!confirm(`Delete ${count} selected file(s)?\n\nThis will remove them from the archive list and delete them from disk if present.`)) return;
-        const ids = Array.from(selectedFileIds);
-        try {
-            const result = await api("POST", `/api/archives/${currentArchiveId}/files/batch-delete`, { file_ids: ids });
-            addNotification(`Deleted ${result.deleted} files`, "info");
-            selectedFileIds.clear();
-            loadFiles();
-            refreshArchives();
-        } catch (e) {
-            addNotification("Batch delete failed: " + e.message, "error");
-        }
+        confirmAction(
+            "confirm_batch_delete_files",
+            "Delete Files",
+            `Delete <strong>${count}</strong> selected file(s)?<br><br>This will remove them from the archive list and delete them from disk if present.`,
+            async () => {
+                const ids = Array.from(selectedFileIds);
+                try {
+                    const result = await api("POST", `/api/archives/${currentArchiveId}/files/batch-delete`, { file_ids: ids });
+                    addNotification(`Deleted ${result.deleted} files`, "info");
+                    selectedFileIds.clear();
+                    loadFiles();
+                    refreshArchives();
+                } catch (e) {
+                    addNotification("Batch delete failed: " + e.message, "error");
+                }
+            },
+            { confirmText: "Delete Files" }
+        );
     }
 
     function updateFileRow(fileId, updates) {
@@ -2140,7 +2160,7 @@
             sse_update_rate: $("#set-sse-update-rate").value,
             theme: $("#set-theme").value,
             use_http: $("#set-use-http").checked,
-            confirm_reset_order: $("#set-confirm-reset-order").checked,
+            ...Object.fromEntries(Object.keys(CONFIRM_KEYS).map(k => [k, $(`#set-${k.replace(/_/g, "-")}`).checked])),
             default_enable_archive: $("#set-default-enable-archive").checked,
             default_select_all: $("#set-default-select-all").checked,
             schedule: JSON.stringify(collectScheduleRules()),
@@ -2170,7 +2190,11 @@
             $("#set-theme").value = s.theme || "dark";
             $("#set-use-http").checked = s.use_http === "1";
             $("#http-warning").style.display = s.use_http === "1" ? "block" : "none";
-            $("#set-confirm-reset-order").checked = s.confirm_reset_order !== "0";
+            // Confirmation warning checkboxes
+            for (const key of Object.keys(CONFIRM_KEYS)) {
+                const el = $(`#set-${key.replace(/_/g, "-")}`);
+                if (el) el.checked = s[key] !== "0";
+            }
             $("#set-default-enable-archive").checked = s.default_enable_archive === "1";
             $("#set-default-select-all").checked = s.default_select_all !== "0";
             $("#set-old-password").value = "";
@@ -2223,7 +2247,7 @@
             sse_update_rate: $("#set-sse-update-rate").value,
             theme: $("#set-theme").value,
             use_http: $("#set-use-http").checked ? "1" : "0",
-            confirm_reset_order: $("#set-confirm-reset-order").checked ? "1" : "0",
+            ...Object.fromEntries(Object.keys(CONFIRM_KEYS).map(k => [k, $(`#set-${k.replace(/_/g, "-")}`).checked ? "1" : "0"])),
             default_enable_archive: $("#set-default-enable-archive").checked ? "1" : "0",
             default_select_all: $("#set-default-select-all").checked ? "1" : "0",
             speed_schedule: JSON.stringify(collectScheduleRules()),
@@ -2234,6 +2258,10 @@
         try {
             await api("POST", "/api/settings", data);
             applyTheme(data.theme);
+            // Sync runtime confirmation settings
+            for (const key of Object.keys(CONFIRM_KEYS)) {
+                confirmSettings[key] = data[key] === "1";
+            }
             closeSettings();
         } catch (e) {
             alert("Failed to save settings: " + e.message);
@@ -2376,18 +2404,76 @@
         updateBatchActions();
     }
 
-    // --- Reset Download Order ---
+    // --- Confirmation System ---
 
-    let confirmResetSetting = true; // loaded from settings on init
+    // Keys and their default-enabled state (true = warn by default)
+    const CONFIRM_KEYS = {
+        confirm_reset_order:         { label: "Warn before resetting download order",              default: true },
+        confirm_delete_file:         { label: "Warn before deleting a file",                       default: true },
+        confirm_batch_delete_files:  { label: "Warn before batch-deleting files",                  default: true },
+        confirm_delete_folders:      { label: "Warn before deleting download folders",             default: true },
+        confirm_delete_processed:    { label: "Warn before deleting processed output files",       default: true },
+        confirm_delete_profile:      { label: "Warn before deleting a processing profile",         default: true },
+    };
+
+    // Runtime state — loaded from settings on init
+    let confirmSettings = {};
+    for (const k of Object.keys(CONFIRM_KEYS)) confirmSettings[k] = CONFIRM_KEYS[k].default;
+
+    /**
+     * Generic confirmation dialog.
+     * If the warning for `key` is suppressed, calls onConfirm() immediately.
+     * Otherwise shows a styled modal with title, message, suppress checkbox, and Cancel/Confirm buttons.
+     * @param {string} key           - Setting key from CONFIRM_KEYS
+     * @param {string} title         - Modal heading
+     * @param {string} message       - Modal body (HTML allowed)
+     * @param {Function} onConfirm   - Called when the user confirms
+     * @param {object} [opts]        - Optional: { confirmText, confirmClass }
+     */
+    function confirmAction(key, title, message, onConfirm, opts = {}) {
+        if (!confirmSettings[key]) {
+            onConfirm();
+            return;
+        }
+        const modal = $("#modal-confirm-action");
+        $("#confirm-action-title").textContent = title;
+        $("#confirm-action-message").innerHTML = message;
+        $("#confirm-action-suppress").checked = false;
+        const confirmBtn = $("#btn-confirm-action-confirm");
+        confirmBtn.textContent = opts.confirmText || "Confirm";
+        confirmBtn.className = "action-btn " + (opts.confirmClass || "danger");
+
+        // Clean up old listeners by replacing nodes
+        const newConfirm = confirmBtn.cloneNode(true);
+        confirmBtn.parentNode.replaceChild(newConfirm, confirmBtn);
+        const cancelBtn = $("#btn-confirm-action-cancel");
+        const newCancel = cancelBtn.cloneNode(true);
+        cancelBtn.parentNode.replaceChild(newCancel, cancelBtn);
+
+        newCancel.addEventListener("click", () => modal.classList.remove("open"));
+        newConfirm.addEventListener("click", () => {
+            modal.classList.remove("open");
+            if ($("#confirm-action-suppress").checked) {
+                confirmSettings[key] = false;
+                api("POST", "/api/settings", { [key]: "0" });
+            }
+            onConfirm();
+        });
+
+        modal.classList.add("open");
+    }
+
+    // --- Reset Download Order ---
 
     function confirmResetOrder() {
         if (!currentArchiveId) return;
-        if (!confirmResetSetting) {
-            doResetOrder();
-            return;
-        }
-        $("#reset-queue-order-suppress").checked = false;
-        $("#modal-reset-queue-order").classList.add("open");
+        confirmAction(
+            "confirm_reset_order",
+            "Reset Queue Order",
+            "This will reset the download priority of all files in this archive back to alphabetical order by filename. Any custom ordering you have set will be lost.",
+            doResetOrder,
+            { confirmText: "Reset Queue Order" }
+        );
     }
 
     async function doResetOrder() {
@@ -2690,11 +2776,11 @@
             btn.addEventListener("click", () => openEditProfile(parseInt(btn.dataset.editProfile)));
         });
         list.querySelectorAll("[data-delete-profile]").forEach(btn => {
-            btn.addEventListener("click", async () => {
-                if (confirm("Delete this profile?")) {
+            btn.addEventListener("click", () => {
+                confirmAction("confirm_delete_profile", "Delete Profile", "Delete this processing profile? This cannot be undone.", async () => {
                     await api("DELETE", `/api/processing/profiles/${btn.dataset.deleteProfile}`);
                     renderProfilesList();
-                }
+                }, { confirmText: "Delete Profile" });
             });
         });
     }
@@ -3028,16 +3114,6 @@
 
         // Reset download order
         $("#btn-reset-queue-order").addEventListener("click", confirmResetOrder);
-        $("#btn-reset-queue-order-cancel").addEventListener("click", () => $("#modal-reset-queue-order").classList.remove("open"));
-        $("#btn-reset-queue-order-confirm").addEventListener("click", () => {
-            const suppress = $("#reset-queue-order-suppress").checked;
-            $("#modal-reset-queue-order").classList.remove("open");
-            if (suppress) {
-                confirmResetSetting = false;
-                api("POST", "/api/settings", { confirm_reset_order: "0" });
-            }
-            doResetOrder();
-        });
 
         // Detail
         $("#btn-back").addEventListener("click", closeDetail);
@@ -3118,10 +3194,12 @@
         refreshStatus();
         connectSSE();
 
-        // Set initial lock indicator and reset-order confirmation state
+        // Set initial lock indicator and confirmation settings
         api("GET", "/api/settings").then((s) => {
             updateLockIndicator(s.use_http === "1");
-            confirmResetSetting = s.confirm_reset_order !== "0";
+            for (const key of Object.keys(CONFIRM_KEYS)) {
+                confirmSettings[key] = s[key] !== "0";
+            }
         }).catch(() => {});
     }
 

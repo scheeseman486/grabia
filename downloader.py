@@ -527,7 +527,7 @@ class DownloadManager:
                     SUM(CASE WHEN download_status = 'failed' THEN 1 ELSE 0 END) as failed,
                     SUM(CASE WHEN download_status = 'conflict' THEN 1 ELSE 0 END) as conflict
                 FROM archive_files
-                WHERE archive_id = ? AND selected = 1
+                WHERE archive_id = ? AND (queued = 1 OR download_status IN ('completed', 'conflict'))
             """, (archive_id,)).fetchone()
         finally:
             conn.close()

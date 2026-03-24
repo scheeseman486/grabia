@@ -236,7 +236,10 @@ def update_settings():
     data = request.json
     allowed = ["ia_email", "ia_password", "download_dir", "max_retries",
                "retry_delay", "bandwidth_limit", "theme", "files_per_page",
-               "speed_schedule", "use_http", "confirm_reset_order",
+               "speed_schedule", "use_http",
+               "confirm_reset_order", "confirm_delete_file",
+               "confirm_batch_delete_files", "confirm_delete_folders",
+               "confirm_delete_processed", "confirm_delete_profile",
                "default_enable_archive", "default_select_all", "sse_update_rate",
                "processing_temp_dir",
                "debug_enabled", "debug_log_file"]
@@ -391,7 +394,7 @@ def add_archive():
     if enable:
         db.set_archive_download_enabled(archive_id, True)
     if not select_all:
-        db.set_all_files_selected(archive_id, False)
+        db.set_all_files_queued(archive_id, False)
     if group_id:
         db.set_archive_group(archive_id, group_id)
 
@@ -666,7 +669,7 @@ def _run_scan(archive_id):
         if has_size and local_size != expected_size:
             if local_size < expected_size:
                 pending_writes.append((
-                    "UPDATE archive_files SET download_status = 'pending', downloaded_bytes = ?, selected = 1, "
+                    "UPDATE archive_files SET download_status = 'pending', downloaded_bytes = ?, queued = 1, "
                     "error_message = 'Partial download detected by scan' WHERE id = ?",
                     (local_size, info["id"]),
                 ))
@@ -718,7 +721,7 @@ def _run_scan(archive_id):
                 continue
 
         pending_writes.append((
-            "UPDATE archive_files SET download_status = 'completed', downloaded_bytes = ?, selected = 1 WHERE id = ?",
+            "UPDATE archive_files SET download_status = 'completed', downloaded_bytes = ? WHERE id = ?",
             (local_size, info["id"]),
         ))
         summary["matched"] += 1
@@ -763,7 +766,7 @@ def _run_scan(archive_id):
         conn.execute(
             """INSERT OR IGNORE INTO archive_files
                (archive_id, name, size, md5, sha1, format, source, mtime,
-                selected, download_status, downloaded_bytes, error_message, download_priority, origin)
+                queued, download_status, downloaded_bytes, error_message, download_priority, origin)
                VALUES (?, ?, ?, '', '', '', '', '', 0, 'unknown', ?, 'File found on disk but not in archive manifest', ?, 'scan')""",
             (archive_id, rel_name, local_size, local_size, max_pri + 1 + i),
         )
@@ -846,7 +849,7 @@ def force_resume_file(file_id):
 
     conn.execute(
         "UPDATE archive_files SET download_status = 'pending', downloaded_bytes = ?, "
-        "selected = 1, error_message = '' WHERE id = ?",
+        "queued = 1, error_message = '' WHERE id = ?",
         (local_size, file_id),
     )
     conn.commit()
@@ -905,36 +908,56 @@ def list_archive_files(archive_id):
     search = request.args.get("search", "").strip()
     per_page = int(db.get_setting("files_per_page", "50"))
     files, total = db.get_archive_files(archive_id, page, per_page, sort=sort, sort_dir=sort_dir, search=search)
-    unselected = db.count_unselected_files(archive_id)
+    unqueued = db.count_unqueued_files(archive_id)
     progress = db.get_archive_progress(archive_id)
     return jsonify({
         "files": files,
         "total": total,
         "page": page,
         "per_page": per_page,
-        "total_pages": max(1, (total + per_page - 1) // per_page),
-        "all_selected": unselected == 0,
+        "all_queued": unqueued == 0,
         "progress": progress,
     })
 
 
-@app.route("/api/files/<int:file_id>/select", methods=["POST"])
+@app.route("/api/files/<int:file_id>/queue", methods=["POST"])
 @login_required
-def toggle_file_select(file_id):
+def toggle_file_queue(file_id):
     data = request.json
-    selected = data.get("selected", True)
-    db.set_file_selected(file_id, selected)
-    # If deselecting, cancel the download if this file is currently downloading
-    if not selected:
+    queued = data.get("queued", True)
+    db.set_file_queued(file_id, queued)
+    # If dequeuing, cancel the download if this file is currently downloading
+    if not queued:
         download_manager.skip_current_file(file_id)
     return jsonify({"ok": True})
 
 
+# Keep old endpoint as alias for backwards compatibility
+@app.route("/api/files/<int:file_id>/select", methods=["POST"])
+@login_required
+def toggle_file_select_compat(file_id):
+    data = request.json
+    queued = data.get("queued", data.get("selected", True))
+    db.set_file_queued(file_id, queued)
+    if not queued:
+        download_manager.skip_current_file(file_id)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/archives/<int:archive_id>/files/queue-all", methods=["POST"])
+@login_required
+def queue_all_files(archive_id):
+    data = request.json
+    db.set_all_files_queued(archive_id, data.get("queued", True))
+    return jsonify({"ok": True})
+
+
+# Keep old endpoint as alias for backwards compatibility
 @app.route("/api/archives/<int:archive_id>/files/select-all", methods=["POST"])
 @login_required
-def select_all_files(archive_id):
+def select_all_files_compat(archive_id):
     data = request.json
-    db.set_all_files_selected(archive_id, data.get("selected", True))
+    db.set_all_files_queued(archive_id, data.get("queued", data.get("selected", True)))
     return jsonify({"ok": True})
 
 
@@ -1359,8 +1382,8 @@ def scan_single_file(file_id):
         if expected_size > 0 and local_size != expected_size:
             if local_size < expected_size:
                 db.set_file_download_status(file_id, "pending", downloaded_bytes=local_size, error_message="Partial download detected by scan")
-                if not f["selected"]:
-                    db.set_file_selected(file_id, True)
+                if not f["queued"]:
+                    db.set_file_queued(file_id, True)
                 result = {"status": "partial"}
             else:
                 db.set_file_download_status(file_id, "conflict", error_message=f"Size mismatch: local {local_size} vs expected {expected_size}")
@@ -1377,13 +1400,9 @@ def scan_single_file(file_id):
                     result = {"status": "conflict"}
                 else:
                     db.set_file_download_status(file_id, "completed", downloaded_bytes=local_size)
-                    if not f["selected"]:
-                        db.set_file_selected(file_id, True)
                     result = {"status": "completed"}
             else:
                 db.set_file_download_status(file_id, "completed", downloaded_bytes=local_size)
-                if not f["selected"]:
-                    db.set_file_selected(file_id, True)
                 result = {"status": "completed"}
     else:
         # Check for processed version
