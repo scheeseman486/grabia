@@ -15,7 +15,7 @@ RUN git clone --depth 1 --branch ${MAXCSO_VERSION} \
     && rm -rf /tmp/maxcso
 
 
-# ── Stage 2: Fetch chdman from Arch Linux packages ───────────────────
+# ── Stage 2: Fetch chdman + deps from Arch Linux packages ────────────
 FROM debian:bookworm-slim AS chdman-fetch
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -25,38 +25,52 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 ARG TARGETARCH
 ARG CHDMAN_VERSION=0.286
 
-# Arch Linux x86_64 uses .pkg.tar.zst; Arch Linux ARM aarch64 uses .pkg.tar.xz
-# Package revisions may differ between architectures — try -2 then -1
-RUN set -e; \
-    if [ "$TARGETARCH" = "amd64" ]; then \
-        ARCH_PKG="x86_64"; \
-        MIRROR="https://geo.mirror.pkgbuild.com/extra/os/x86_64"; \
-        for REV in 2 1; do \
-            URL="${MIRROR}/mame-tools-${CHDMAN_VERSION}-${REV}-${ARCH_PKG}.pkg.tar.zst"; \
-            echo "Trying ${URL}"; \
-            if curl -fSL "$URL" -o /tmp/mame-tools.pkg.tar.zst; then \
-                zstd -d /tmp/mame-tools.pkg.tar.zst -o /tmp/mame-tools.pkg.tar; \
-                break; \
-            fi; \
-        done; \
-    elif [ "$TARGETARCH" = "arm64" ]; then \
-        ARCH_PKG="aarch64"; \
-        MIRROR="http://mirror.archlinuxarm.org/aarch64/extra"; \
-        for REV in 2 1; do \
-            URL="${MIRROR}/mame-tools-${CHDMAN_VERSION}-${REV}-${ARCH_PKG}.pkg.tar.xz"; \
-            echo "Trying ${URL}"; \
-            if curl -fSL "$URL" -o /tmp/mame-tools.pkg.tar.xz; then \
-                xz -d /tmp/mame-tools.pkg.tar.xz; \
-                break; \
-            fi; \
-        done; \
-    else \
-        echo "Unsupported architecture: ${TARGETARCH}" >&2; exit 1; \
-    fi; \
-    tar xf /tmp/mame-tools.pkg.tar -C /tmp usr/bin/chdman \
-    && mv /tmp/usr/bin/chdman /usr/local/bin/chdman \
-    && chmod +x /usr/local/bin/chdman \
-    && rm -rf /tmp/mame-tools.pkg.tar /tmp/usr
+# Helper: download an Arch package, trying revision -2 then -1.
+# Arch x86_64 uses .pkg.tar.zst; Arch ARM aarch64 uses .pkg.tar.xz.
+# Usage: fetch_arch_pkg <package-name> <version>
+# Outputs: /tmp/<package-name>.pkg.tar
+RUN cat <<'FETCH' > /usr/local/bin/fetch-arch-pkg && chmod +x /usr/local/bin/fetch-arch-pkg
+#!/bin/sh
+set -e
+PKG="$1"; VER="$2"
+if [ "$TARGETARCH" = "amd64" ]; then
+    ARCH=x86_64; EXT=zst
+    MIRROR="https://geo.mirror.pkgbuild.com/extra/os/x86_64"
+elif [ "$TARGETARCH" = "arm64" ]; then
+    ARCH=aarch64; EXT=xz
+    MIRROR="http://mirror.archlinuxarm.org/aarch64/extra"
+else
+    echo "Unsupported architecture: $TARGETARCH" >&2; exit 1
+fi
+for REV in 2 1; do
+    URL="${MIRROR}/${PKG}-${VER}-${REV}-${ARCH}.pkg.tar.${EXT}"
+    echo "Trying ${URL}"
+    if curl -fSL "$URL" -o "/tmp/${PKG}.pkg.tar.${EXT}"; then
+        case "$EXT" in
+            zst) zstd -d "/tmp/${PKG}.pkg.tar.${EXT}" -o "/tmp/${PKG}.pkg.tar" ;;
+            xz)  xz -d "/tmp/${PKG}.pkg.tar.${EXT}" ;;
+        esac
+        return 0
+    fi
+done
+echo "Failed to download ${PKG}" >&2; exit 1
+FETCH
+
+# Fetch chdman binary and its Arch-specific shared libs.
+# Bookworm ships libFLAC.so.12 and libutf8proc.so.2, but chdman needs
+# libFLAC.so.14 (FLAC 1.5.x) and libutf8proc.so.3 from Arch.
+RUN fetch-arch-pkg mame-tools  "$CHDMAN_VERSION" \
+    && fetch-arch-pkg flac       1.5.0 \
+    && fetch-arch-pkg libutf8proc 2.11.3 \
+    && mkdir -p /out/lib \
+    && tar xf /tmp/mame-tools.pkg.tar  -C /tmp usr/bin/chdman \
+    && tar xf /tmp/flac.pkg.tar        -C /tmp usr/lib/libFLAC.so.14 usr/lib/libFLAC.so.14.0.0 \
+    && tar xf /tmp/libutf8proc.pkg.tar -C /tmp usr/lib/libutf8proc.so.3 usr/lib/libutf8proc.so.3.2.3 \
+    && mv /tmp/usr/bin/chdman      /out/ \
+    && mv /tmp/usr/lib/libFLAC*    /out/lib/ \
+    && mv /tmp/usr/lib/libutf8proc* /out/lib/ \
+    && chmod +x /out/chdman \
+    && rm -rf /tmp/*.pkg.tar /tmp/usr
 
 
 # ── Stage 3: Runtime image ────────────────────────────────────────────
@@ -69,14 +83,16 @@ RUN sed -i 's/Components: main/Components: main non-free/' \
         p7zip-full \
         unrar \
         liblz4-1 libuv1 zlib1g \
-        libsdl2-2.0-0 libflac12 libutf8proc2 libogg0 \
+        libsdl2-2.0-0 libogg0 libzstd1 \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy maxcso from builder
 COPY --from=builder /usr/local/bin/maxcso /usr/local/bin/maxcso
 
-# Copy chdman from Arch Linux package
-COPY --from=chdman-fetch /usr/local/bin/chdman /usr/local/bin/chdman
+# Copy chdman and its Arch-sourced shared libs
+COPY --from=chdman-fetch /out/chdman /usr/local/bin/chdman
+COPY --from=chdman-fetch /out/lib/   /usr/local/lib/
+RUN ldconfig
 
 WORKDIR /app
 
