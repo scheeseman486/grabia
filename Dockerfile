@@ -47,7 +47,6 @@ RUN set -e; \
             echo "Trying ${URL}"; \
             if curl -fSL "$URL" -o /tmp/mame-tools.pkg.tar.xz; then \
                 xz -d /tmp/mame-tools.pkg.tar.xz; \
-                mv /tmp/mame-tools.pkg.tar /tmp/mame-tools.pkg.tar; \
                 break; \
             fi; \
         done; \
