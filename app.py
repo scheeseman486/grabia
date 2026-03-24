@@ -1150,6 +1150,25 @@ def get_processed_tree(file_id):
     return jsonify({"tree": tree})
 
 
+@app.route("/api/files/<int:target_file_id>/assign-output", methods=["POST"])
+@login_required
+def assign_output(target_file_id):
+    """Assign an unknown file as processed output of a target file."""
+    data = request.json
+    unknown_file_id = data.get("unknown_file_id")
+    if not unknown_file_id:
+        return jsonify({"error": "Missing unknown_file_id"}), 400
+    ok, err = db.assign_as_processed_output(target_file_id, unknown_file_id)
+    if not ok:
+        return jsonify({"error": err}), 400
+    # Recompute archive status
+    target = db.get_file(target_file_id)
+    if target:
+        db.recompute_archive_status(target["archive_id"])
+        broadcast_sse("archive_updated", db.get_archive(target["archive_id"]))
+    return jsonify({"ok": True})
+
+
 @app.route("/api/files/<int:file_id>/delete-processed", methods=["POST"])
 @login_required
 def delete_processed_file(file_id):

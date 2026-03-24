@@ -1047,6 +1047,48 @@ def reset_failed_files_by_ids(file_ids):
         return affected
 
 
+def assign_as_processed_output(target_file_id, unknown_file_id):
+    """Assign an unknown file as processed output of a target file.
+    Adds the unknown file's name to the target's processed_files_json,
+    sets the target's processing_status to 'completed' if not already,
+    and deletes the unknown file record."""
+    with _db() as conn:
+        unknown = conn.execute("SELECT * FROM archive_files WHERE id = ?", (unknown_file_id,)).fetchone()
+        if not unknown or unknown["download_status"] != "unknown":
+            return False, "Source file is not an unknown file"
+        target = conn.execute("SELECT * FROM archive_files WHERE id = ?", (target_file_id,)).fetchone()
+        if not target:
+            return False, "Target file not found"
+        if unknown["archive_id"] != target["archive_id"]:
+            return False, "Files must be in the same archive"
+
+        # Add unknown file's name to target's processed_files_json
+        existing = []
+        if target["processed_files_json"]:
+            try:
+                existing = json.loads(target["processed_files_json"])
+            except (json.JSONDecodeError, TypeError):
+                existing = []
+        if unknown["name"] not in existing:
+            existing.append(unknown["name"])
+
+        # Update target: set processing_status and processed_files_json
+        updates = ["processed_files_json = ?"]
+        params = [json.dumps(existing)]
+        if target["processing_status"] not in ("completed", "extracted"):
+            updates.append("processing_status = 'completed'")
+        if not target["processed_filename"]:
+            updates.append("processed_filename = ?")
+            params.append(unknown["name"])
+        params.append(target_file_id)
+        conn.execute(f"UPDATE archive_files SET {', '.join(updates)} WHERE id = ?", params)
+
+        # Delete the unknown file record
+        conn.execute("DELETE FROM archive_files WHERE id = ?", (unknown_file_id,))
+        conn.commit()
+        return True, None
+
+
 def get_processable_files(archive_id, processor_types=None):
     """Get files eligible for processing: completed downloads, not already processed.
     Optionally filter by file extensions matching processor input types."""

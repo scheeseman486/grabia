@@ -1809,6 +1809,73 @@
         });
     }
 
+    // --- Unknown file drag-and-drop (assign as processed output) ---
+
+    let unknownDragSrcId = null;
+    let unknownDragActive = false;
+
+    function attachUnknownDrag(tr, fileId) {
+        const grip = tr.querySelector(".unknown-grip");
+        if (!grip) return;
+        grip.draggable = true;
+        grip.addEventListener("dragstart", (e) => {
+            e.stopPropagation();
+            unknownDragSrcId = fileId;
+            unknownDragActive = true;
+            tr.classList.add("file-row-dragging");
+            e.dataTransfer.effectAllowed = "move";
+            e.dataTransfer.setData("text/plain", String(fileId));
+            e.dataTransfer.setDragImage(tr, 0, 0);
+        });
+        grip.addEventListener("dragend", () => {
+            setTimeout(() => {
+                unknownDragSrcId = null;
+                unknownDragActive = false;
+                tr.classList.remove("file-row-dragging");
+                fileListEl.querySelectorAll(".file-row-drop-target").forEach((r) => r.classList.remove("file-row-drop-target"));
+            }, 0);
+        });
+    }
+
+    function attachOutputDropTarget(tr, targetFileId) {
+        let dragOverCount = 0;
+        tr.addEventListener("dragover", (e) => {
+            if (unknownDragSrcId === null) return;
+            e.preventDefault();
+            e.dataTransfer.dropEffect = "move";
+        });
+        tr.addEventListener("dragenter", (e) => {
+            if (unknownDragSrcId === null) return;
+            e.preventDefault();
+            dragOverCount++;
+            tr.classList.add("file-row-drop-target");
+        });
+        tr.addEventListener("dragleave", () => {
+            dragOverCount--;
+            if (dragOverCount <= 0) {
+                dragOverCount = 0;
+                tr.classList.remove("file-row-drop-target");
+            }
+        });
+        tr.addEventListener("drop", async (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            dragOverCount = 0;
+            tr.classList.remove("file-row-drop-target");
+            const srcId = unknownDragSrcId;
+            unknownDragSrcId = null;
+            unknownDragActive = false;
+            if (srcId === null || srcId === targetFileId) return;
+            try {
+                await api("POST", `/api/files/${targetFileId}/assign-output`, { unknown_file_id: srcId });
+                addNotification("File assigned as processed output", "success");
+                loadFiles();
+            } catch (err) {
+                addNotification("Assign failed: " + err.message, "error");
+            }
+        });
+    }
+
     // --- Render file list ---
 
     // --- Virtual-scrolled file list ---
@@ -1888,7 +1955,14 @@
         const rescanBtn =
             `<button class="file-action-btn" data-action="rescan" data-file-id="${f.id}" title="Re-scan file">` +
             `<svg viewBox="0 0 16 16" width="13" height="13"><path d="M8 2.5V1L5.5 3.5 8 6V4.5a3.5 3.5 0 11-3.16 5" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg></button>`;
+        const unknownGrip = isUnknown
+            ? `<div class="unknown-grip" title="Drag onto a file to assign as output">` +
+              `<div class="grip-dots"><span></span><span></span></div>` +
+              `<div class="grip-dots"><span></span><span></span></div>` +
+              `<div class="grip-dots"><span></span><span></span></div></div>`
+            : "";
         html += `<td class="col-name"><div class="file-name-wrap">` +
+            unknownGrip +
             renderFileName(f.name, sourceDeleted ? "file-name-deleted" : "") + changeIcon +
             `<span class="file-actions">` +
             renameBtn + processBtn + rescanBtn + deleteBtn +
@@ -1981,11 +2055,23 @@
             });
         }
 
+        // Unknown files: draggable source for assign-as-output
+        if (isUnknown) {
+            attachUnknownDrag(tr, f.id);
+        }
+        // Completed, processed, and skipped files: drop targets for unknown files
+        const canReceiveOutput = f.download_status === "completed" || hasProcessedOutput || isSkipped;
+        if (canReceiveOutput && !isUnknown) {
+            attachOutputDropTarget(tr, f.id);
+        }
+
         return tr;
     }
 
     // Render only the visible slice of rows in the virtual-scrolled file table.
     function vsRenderVisible() {
+        // Don't rebuild rows during drag — it destroys drop targets
+        if (unknownDragActive || fileDragSrcId !== null) return;
         const wrap = $(".file-table-wrap");
         if (!wrap || vsFiles.length === 0) return;
 
