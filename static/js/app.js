@@ -79,7 +79,7 @@
     }
 
     function clearAllNotifications() {
-        notifications = notifications.filter((n) => n.scanArchiveId || n.processingArchiveId);
+        notifications = notifications.filter((n) => n.scanArchiveId || n.processingArchiveId || n.addingArchive);
         renderNotifBadge();
         renderNotifList();
     }
@@ -2565,6 +2565,7 @@
         input.focus();
         $("#add-error").textContent = "";
         $("#add-loading").style.display = "none";
+        $("#btn-add-confirm").disabled = false;
         // Apply defaults from settings
         api("GET", "/api/settings").then((s) => {
             $("#add-enable-archive").checked = s.default_enable_archive === "1";
@@ -2597,7 +2598,7 @@
         $("#modal-add").classList.remove("open");
     }
 
-    async function addArchive() {
+    function addArchive() {
         const isBatch = $("#add-batch-mode").checked;
         const enable = $("#add-enable-archive").checked;
         const selectAll = $("#add-select-all-files").checked;
@@ -2610,67 +2611,82 @@
                 $("#add-error").textContent = "Please enter at least one URL or identifier.";
                 return;
             }
-            $("#add-error").textContent = "";
-            $("#add-loading").style.display = "flex";
-            $("#btn-add-confirm").disabled = true;
-
-            let succeeded = 0;
-            let failed = 0;
-            const errors = [];
-            for (let i = 0; i < lines.length; i++) {
-                $("#add-loading-text").textContent = `Processing ${i + 1} of ${lines.length}...`;
-                try {
-                    await api("POST", "/api/archives", {
-                        url: lines[i],
-                        enable,
-                        select_all: selectAll,
-                        group_id: groupId,
-                    });
-                    succeeded++;
-                } catch (e) {
-                    failed++;
-                    errors.push(`${lines[i]}: ${e.message}`);
-                }
-            }
-
-            $("#add-loading").style.display = "none";
-            $("#add-loading-text").textContent = "Fetching metadata...";
-            $("#btn-add-confirm").disabled = false;
-            await refreshArchives();
-
-            if (failed === 0) {
-                addNotification(`Batch add: ${succeeded} archive${succeeded !== 1 ? "s" : ""} added`, "success");
-                closeAddModal();
-            } else {
-                addNotification(`Batch add: ${succeeded} added, ${failed} failed`, "warning");
-                $("#add-error").innerHTML = errors.map((e) => escapeHtml(e)).join("<br>");
-            }
+            closeAddModal();
+            addArchiveBatch(lines, enable, selectAll, groupId);
         } else {
             const url = $("#input-add-url").value.trim();
             if (!url) {
                 $("#add-error").textContent = "Please enter a URL or identifier.";
                 return;
             }
-            $("#add-error").textContent = "";
-            $("#add-loading").style.display = "flex";
-            $("#btn-add-confirm").disabled = true;
+            closeAddModal();
+            addArchiveSingle(url, enable, selectAll, groupId);
+        }
+    }
 
+    async function addArchiveSingle(url, enable, selectAll, groupId) {
+        // Create persistent notification with indeterminate progress
+        const nid = ++notifIdCounter;
+        const label = url.length > 40 ? url.substring(0, 37) + "..." : url;
+        const notif = { id: nid, message: `Adding "${label}": fetching metadata...`, type: "info", time: new Date(), progress: -1, addingArchive: true };
+        notifications.unshift(notif);
+        renderNotifBadge();
+        renderNotifList();
+
+        try {
+            const result = await api("POST", "/api/archives", { url, enable, select_all: selectAll, group_id: groupId });
+            // Replace progress notification with success
+            notifications = notifications.filter(n => n.id !== nid);
+            const title = result.title || result.identifier || url;
+            addNotification(`Added "${title}"`, "success");
+            refreshArchives();
+        } catch (e) {
+            // Replace progress notification with error
+            notifications = notifications.filter(n => n.id !== nid);
+            addNotification(`Failed to add "${label}": ${e.message}`, "error");
+        }
+    }
+
+    async function addArchiveBatch(lines, enable, selectAll, groupId) {
+        // Create persistent notification with progress bar
+        const nid = ++notifIdCounter;
+        const total = lines.length;
+        const notif = { id: nid, message: `Batch add: 0/${total}`, type: "info", time: new Date(), progress: 0, addingArchive: true };
+        notifications.unshift(notif);
+        renderNotifBadge();
+        renderNotifList();
+
+        let succeeded = 0;
+        let failed = 0;
+        const errors = [];
+
+        for (let i = 0; i < lines.length; i++) {
             try {
-                await api("POST", "/api/archives", {
-                    url,
-                    enable,
-                    select_all: selectAll,
-                    group_id: groupId,
-                });
-                closeAddModal();
-                await refreshArchives();
+                await api("POST", "/api/archives", { url: lines[i], enable, select_all: selectAll, group_id: groupId });
+                succeeded++;
             } catch (e) {
-                $("#add-error").textContent = e.message;
-            } finally {
-                $("#add-loading").style.display = "none";
-                $("#btn-add-confirm").disabled = false;
+                failed++;
+                errors.push(`${lines[i]}: ${e.message}`);
+            }
+            // Update progress notification
+            const done = i + 1;
+            const active = notifications.find(n => n.id === nid);
+            if (active) {
+                active.progress = Math.round((done / total) * 100);
+                active.message = `Batch add: ${done}/${total}`;
+                renderNotifList();
             }
         }
+
+        // Replace progress notification with final result
+        notifications = notifications.filter(n => n.id !== nid);
+        if (failed === 0) {
+            addNotification(`Batch add: ${succeeded} archive${succeeded !== 1 ? "s" : ""} added`, "success");
+        } else {
+            addNotification(`Batch add: ${succeeded} added, ${failed} failed`, "warning");
+            errors.forEach(err => addNotification(err, "error"));
+        }
+        refreshArchives();
     }
 
     // --- Delete Archive ---
