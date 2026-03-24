@@ -26,6 +26,27 @@ import zipfile
 
 from logger import log
 
+
+def _safe_relpath(rel, dest_dir):
+    """Validate that a relative path stays within dest_dir when joined.
+
+    Returns the normalised relative path, or None if it would escape.
+    Rejects absolute paths, '..' traversal, and null bytes.
+    """
+    if not rel or "\x00" in rel:
+        return None
+    # Normalise: collapse redundant separators and resolve ..
+    normed = os.path.normpath(rel)
+    # Reject absolute paths or any leading .. that escapes the root
+    if os.path.isabs(normed) or normed.startswith(".."):
+        return None
+    # Double-check with realpath against the actual destination
+    full = os.path.realpath(os.path.join(dest_dir, normed))
+    dest_real = os.path.realpath(dest_dir)
+    if not (full == dest_real or full.startswith(dest_real + os.sep)):
+        return None
+    return normed
+
 # Optional extraction libraries
 try:
     import py7zr
@@ -69,15 +90,8 @@ def get_processor(type_id):
 # Tool detection
 # ---------------------------------------------------------------------------
 
-def _find_binary(name, setting_key=None):
-    """Find an external binary by name.  Checks settings override first,
-    then falls back to PATH lookup via shutil.which."""
-    import database as db
-    if setting_key:
-        custom = db.get_setting(setting_key, "")
-        if custom and os.path.isfile(custom) and os.access(custom, os.X_OK):
-            log.debug("tools", "%s: using custom path %s", name, custom)
-            return custom
+def _find_binary(name):
+    """Find an external binary by name on $PATH via shutil.which."""
     path = shutil.which(name)
     if path:
         log.debug("tools", "%s: found on PATH at %s", name, path)
@@ -105,13 +119,13 @@ def _get_binary_version(path, version_flag="--version"):
 def detect_tools():
     """Detect all external tools and return status dict."""
     tools = {}
-    for name, setting_key, version_flag in [
-        ("chdman", "tool_chdman_path", "--help"),
-        ("maxcso", "tool_maxcso_path", "--version"),
-        ("7z", "tool_7z_path", "--help"),
-        ("unrar", "tool_unrar_path", None),
+    for name, version_flag in [
+        ("chdman", "--help"),
+        ("maxcso", "--version"),
+        ("7z", "--help"),
+        ("unrar", None),
     ]:
-        path = _find_binary(name, setting_key)
+        path = _find_binary(name)
         version = None
         if path:
             version = _get_binary_version(path, version_flag)
@@ -140,7 +154,7 @@ def _list_archive_contents(archive_path):
             if HAS_PY7ZR:
                 with py7zr.SevenZipFile(archive_path, "r") as sz:
                     return [n for n in sz.getnames() if not n.endswith("/")]
-            bin_path = _find_binary("7z", "tool_7z_path")
+            bin_path = _find_binary("7z")
             if bin_path:
                 result = subprocess.run(
                     [bin_path, "l", "-slt", archive_path],
@@ -168,7 +182,7 @@ def _list_archive_contents(archive_path):
                     return files[1:] if len(files) > 1 else files
             return None
         elif ext == ".rar":
-            bin_path = _find_binary("unrar", "tool_unrar_path")
+            bin_path = _find_binary("unrar")
             if bin_path:
                 result = subprocess.run(
                     [bin_path, "lb", archive_path],
@@ -222,17 +236,37 @@ def _extract_archive(archive_path, dest_dir, cancel_check=None):
 
 def _extract_zip(path, dest_dir):
     with zipfile.ZipFile(path, "r") as zf:
-        zf.extractall(dest_dir)
-        return zf.namelist()
+        safe_names = []
+        for info in zf.infolist():
+            if info.is_dir():
+                continue
+            checked = _safe_relpath(info.filename, dest_dir)
+            if checked is None:
+                log.warning("extract", "Skipping unsafe zip entry: %s", info.filename)
+                continue
+            safe_names.append(info)
+        for info in safe_names:
+            zf.extract(info, dest_dir)
+        return [_safe_relpath(i.filename, dest_dir) for i in safe_names]
 
 
 def _extract_7z(path, dest_dir):
     if HAS_PY7ZR:
         with py7zr.SevenZipFile(path, "r") as sz:
+            # Validate names before extracting
+            unsafe = [n for n in sz.getnames() if _safe_relpath(n, dest_dir) is None]
+            for u in unsafe:
+                log.warning("extract", "Skipping unsafe 7z entry: %s", u)
             sz.extractall(dest_dir)
-            return sz.getnames()
+            # Return only safe entries, and remove any unsafe files that were extracted
+            safe = []
+            for n in sz.getnames():
+                checked = _safe_relpath(n, dest_dir)
+                if checked is not None:
+                    safe.append(checked)
+            return safe
     # Fallback to 7z binary
-    bin_path = _find_binary("7z", "tool_7z_path")
+    bin_path = _find_binary("7z")
     if not bin_path:
         raise ProcessingError("No 7z extraction tool available (install py7zr or 7z)")
     result = subprocess.run(
@@ -241,16 +275,18 @@ def _extract_7z(path, dest_dir):
     )
     if result.returncode != 0:
         raise ProcessingError(f"7z extraction failed: {result.stderr[:500]}")
-    # Walk extracted files
+    # Walk extracted files — only return safe paths
     extracted = []
     for root, _, files in os.walk(dest_dir):
         for f in files:
-            extracted.append(os.path.relpath(os.path.join(root, f), dest_dir))
+            rel = os.path.relpath(os.path.join(root, f), dest_dir)
+            if _safe_relpath(rel, dest_dir) is not None:
+                extracted.append(rel)
     return extracted
 
 
 def _extract_rar(path, dest_dir):
-    bin_path = _find_binary("unrar", "tool_unrar_path")
+    bin_path = _find_binary("unrar")
     if not bin_path:
         raise ProcessingError("No RAR extraction tool available (install unrar)")
     result = subprocess.run(
@@ -259,10 +295,13 @@ def _extract_rar(path, dest_dir):
     )
     if result.returncode != 0:
         raise ProcessingError(f"unrar extraction failed: {result.stderr[:500]}")
+    # Walk extracted files — only return safe paths
     extracted = []
     for root, _, files in os.walk(dest_dir):
         for f in files:
-            extracted.append(os.path.relpath(os.path.join(root, f), dest_dir))
+            rel = os.path.relpath(os.path.join(root, f), dest_dir)
+            if _safe_relpath(rel, dest_dir) is not None:
+                extracted.append(rel)
     return extracted
 
 
@@ -333,13 +372,18 @@ def _parse_cue_bins(cue_path, base_dir):
     """Parse a CUE sheet and return absolute paths to referenced BIN/data files."""
     bins = []
     cue_dir = os.path.dirname(cue_path)
+    base_real = os.path.realpath(base_dir)
     try:
         with open(cue_path, "r", errors="replace") as f:
             for line in f:
                 m = re.match(r'^\s*FILE\s+"?([^"]+)"?\s+', line, re.IGNORECASE)
                 if m:
                     bin_name = m.group(1)
-                    bin_path = os.path.join(cue_dir, bin_name)
+                    bin_path = os.path.realpath(os.path.join(cue_dir, bin_name))
+                    # Ensure the resolved path stays within the archive base directory
+                    if not bin_path.startswith(base_real + os.sep):
+                        log.warning("disc", "Skipping CUE reference outside archive dir: %s", bin_name)
+                        continue
                     if os.path.isfile(bin_path):
                         bins.append(bin_path)
     except OSError:
@@ -537,9 +581,9 @@ class CHDCDProcessor(BaseProcessor):
     def process(self, file_path, download_dir):
         fname = os.path.basename(file_path)
         log.info("proc", "CHD CD: processing %s", fname)
-        chdman = _find_binary("chdman", "tool_chdman_path")
+        chdman = _find_binary("chdman")
         if not chdman:
-            raise ProcessingError("chdman not found. Install MAME tools or set the path in settings.")
+            raise ProcessingError("chdman not found. Install MAME tools (mame-tools package).")
 
         ext = os.path.splitext(file_path)[1].lower()
         base_name = os.path.splitext(os.path.basename(file_path))[0]
@@ -629,15 +673,21 @@ class CHDCDProcessor(BaseProcessor):
         archive_exts = {".zip", ".7z", ".rar"}
         new_files = list(file_list)
         for rel in list(file_list):
+            if _safe_relpath(rel, base_dir) is None:
+                continue
             ext = os.path.splitext(rel)[1].lower()
             if ext in archive_exts:
                 nested_path = os.path.join(base_dir, rel)
                 nested_dir = os.path.join(base_dir, os.path.splitext(rel)[0])
+                if _safe_relpath(os.path.splitext(rel)[0], base_dir) is None:
+                    continue
                 os.makedirs(nested_dir, exist_ok=True)
                 try:
                     inner = _extract_archive(nested_path, nested_dir, self._cancel_check)
                     for inner_rel in inner:
-                        new_files.append(os.path.join(os.path.splitext(rel)[0], inner_rel))
+                        combined = os.path.join(os.path.splitext(rel)[0], inner_rel)
+                        if _safe_relpath(combined, base_dir) is not None:
+                            new_files.append(combined)
                     os.remove(nested_path)
                     new_files.remove(rel)
                 except ProcessingError:
@@ -731,9 +781,9 @@ class CHDAutoProcessor(BaseProcessor):
     def process(self, file_path, download_dir):
         fname = os.path.basename(file_path)
         log.info("proc", "CHD Auto: processing %s", fname)
-        chdman = _find_binary("chdman", "tool_chdman_path")
+        chdman = _find_binary("chdman")
         if not chdman:
-            raise ProcessingError("chdman not found. Install MAME tools or set the path in settings.")
+            raise ProcessingError("chdman not found. Install MAME tools (mame-tools package).")
 
         ext = os.path.splitext(file_path)[1].lower()
 
@@ -840,15 +890,21 @@ class CHDAutoProcessor(BaseProcessor):
         archive_exts = {".zip", ".7z", ".rar"}
         new_files = list(file_list)
         for rel in list(file_list):
+            if _safe_relpath(rel, base_dir) is None:
+                continue
             ext = os.path.splitext(rel)[1].lower()
             if ext in archive_exts:
                 nested_path = os.path.join(base_dir, rel)
                 nested_dir = os.path.join(base_dir, os.path.splitext(rel)[0])
+                if _safe_relpath(os.path.splitext(rel)[0], base_dir) is None:
+                    continue
                 os.makedirs(nested_dir, exist_ok=True)
                 try:
                     inner = _extract_archive(nested_path, nested_dir, self._cancel_check)
                     for inner_rel in inner:
-                        new_files.append(os.path.join(os.path.splitext(rel)[0], inner_rel))
+                        combined = os.path.join(os.path.splitext(rel)[0], inner_rel)
+                        if _safe_relpath(combined, base_dir) is not None:
+                            new_files.append(combined)
                     os.remove(nested_path)
                     new_files.remove(rel)
                 except ProcessingError:
@@ -937,9 +993,9 @@ class CHDDVDProcessor(BaseProcessor):
     ]
 
     def process(self, file_path, download_dir):
-        chdman = _find_binary("chdman", "tool_chdman_path")
+        chdman = _find_binary("chdman")
         if not chdman:
-            raise ProcessingError("chdman not found. Install MAME tools or set the path in settings.")
+            raise ProcessingError("chdman not found. Install MAME tools (mame-tools package).")
 
         ext = os.path.splitext(file_path)[1].lower()
 
@@ -1048,9 +1104,9 @@ class CISOProcessor(BaseProcessor):
     ]
 
     def process(self, file_path, download_dir):
-        maxcso = _find_binary("maxcso", "tool_maxcso_path")
+        maxcso = _find_binary("maxcso")
         if not maxcso:
-            raise ProcessingError("maxcso not found. Install maxcso or set the path in settings.")
+            raise ProcessingError("maxcso not found. Install maxcso.")
 
         ext = os.path.splitext(file_path)[1].lower()
 
@@ -1170,8 +1226,16 @@ class ExtractProcessor(BaseProcessor):
                     current=i + 1,
                     total=len(extracted),
                 )
+                # Validate source stays in temp_dir and dest stays in dest_dir
+                if _safe_relpath(rel, temp_dir) is None or _safe_relpath(rel, dest_dir) is None:
+                    log.warning("extract", "Skipping unsafe extracted path: %s", rel)
+                    continue
                 src = os.path.join(temp_dir, rel)
                 if not os.path.isfile(src):
+                    continue
+                # Reject symlinks — they could point outside the directory
+                if os.path.islink(src):
+                    log.warning("extract", "Skipping symlink in extraction: %s", rel)
                     continue
 
                 # Preserve subdirectory structure from the archive

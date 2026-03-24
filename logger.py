@@ -70,16 +70,29 @@ def configure(enabled=False, log_file=""):
         _console_handler.setFormatter(_format())
         _logger.addHandler(_console_handler)
 
-        # Optional file handler
+        # Optional file handler — validate the path stays within the data directory
+        # to prevent writing logs to arbitrary system files.
         if log_file:
             log_file = os.path.expanduser(log_file)
-            try:
-                os.makedirs(os.path.dirname(log_file), exist_ok=True)
-                _file_handler = logging.FileHandler(log_file, encoding="utf-8")
-                _file_handler.setFormatter(_format())
-                _logger.addHandler(_file_handler)
-            except OSError as e:
-                _logger.warning("Could not open log file %s: %s", log_file, e)
+            data_dir = os.path.realpath(
+                os.environ.get("GRABIA_DATA_DIR")
+                or os.path.dirname(os.path.abspath(__file__))
+            )
+            log_real = os.path.realpath(log_file)
+            if not (log_real == data_dir or log_real.startswith(data_dir + os.sep)):
+                _logger.warning(
+                    "Rejected log file path outside data directory: %s", log_file
+                )
+            else:
+                try:
+                    parent = os.path.dirname(log_real)
+                    if parent:
+                        os.makedirs(parent, exist_ok=True)
+                    _file_handler = logging.FileHandler(log_real, encoding="utf-8")
+                    _file_handler.setFormatter(_format())
+                    _logger.addHandler(_file_handler)
+                except OSError as e:
+                    _logger.warning("Could not open log file %s: %s", log_file, e)
 
 
 class _Log:

@@ -238,8 +238,7 @@ def update_settings():
                "retry_delay", "bandwidth_limit", "theme", "files_per_page",
                "speed_schedule", "use_http", "confirm_reset_order",
                "default_enable_archive", "default_select_all", "sse_update_rate",
-               "tool_chdman_path", "tool_maxcso_path", "tool_7z_path",
-               "tool_unrar_path", "processing_temp_dir",
+               "processing_temp_dir",
                "debug_enabled", "debug_log_file"]
     credentials_changed = False
     for key in allowed:
@@ -416,6 +415,39 @@ def delete_archive(archive_id):
     db.delete_archive(archive_id)
     broadcast_sse("archive_removed", {"id": archive_id})
     return jsonify({"ok": True})
+
+
+@app.route("/api/archives/<int:archive_id>/delete-folder", methods=["POST"])
+@login_required
+def delete_archive_folder(archive_id):
+    """Delete the download folder for an archive from disk, reset file statuses."""
+    archive = db.get_archive(archive_id)
+    if not archive:
+        return jsonify({"error": "Not found"}), 404
+
+    download_dir = db.get_setting("download_dir", os.path.expanduser("~/ia-downloads"))
+    base_dir = os.path.realpath(os.path.join(download_dir, archive["identifier"]))
+
+    import shutil
+    removed = False
+    if os.path.isdir(base_dir) and base_dir.startswith(os.path.realpath(download_dir) + os.sep):
+        shutil.rmtree(base_dir)
+        removed = True
+
+    # Reset all files to pending
+    conn = db.get_db()
+    conn.execute(
+        "UPDATE archive_files SET download_status = 'pending', downloaded_bytes = 0, "
+        "processing_status = '', processed_filename = '', processed_files_json = '', "
+        "processing_error = '', error_message = '' WHERE archive_id = ?",
+        (archive_id,),
+    )
+    conn.commit()
+    conn.close()
+    db.recompute_archive_status(archive_id)
+    updated = db.get_archive(archive_id)
+    broadcast_sse("archive_updated", updated)
+    return jsonify({"ok": True, "removed": removed})
 
 
 @app.route("/api/archives/<int:archive_id>/refresh", methods=["POST"])
@@ -838,7 +870,7 @@ def toggle_download(archive_id):
     enabled = data.get("enabled", False)
     db.set_archive_download_enabled(archive_id, enabled)
     if enabled:
-        db.set_archive_status(archive_id, "queued")
+        db.recompute_archive_status(archive_id, fallback="queued")
     else:
         db.set_archive_status(archive_id, "idle")
     archive = db.get_archive(archive_id)
@@ -890,7 +922,11 @@ def list_archive_files(archive_id):
 @login_required
 def toggle_file_select(file_id):
     data = request.json
-    db.set_file_selected(file_id, data.get("selected", True))
+    selected = data.get("selected", True)
+    db.set_file_selected(file_id, selected)
+    # If deselecting, cancel the download if this file is currently downloading
+    if not selected:
+        download_manager.skip_current_file(file_id)
     return jsonify({"ok": True})
 
 
@@ -916,6 +952,454 @@ def reorder_files(archive_id):
 def reset_file_order(archive_id):
     db.reset_file_priorities(archive_id)
     return jsonify({"ok": True})
+
+
+@app.route("/api/files/<int:file_id>/rename", methods=["POST"])
+@login_required
+def rename_file(file_id):
+    data = request.json
+    new_name = (data.get("name") or "").strip()
+    if not new_name:
+        return jsonify({"error": "Name is required"}), 400
+
+    f = db.get_file(file_id)
+    if not f:
+        return jsonify({"error": "File not found"}), 404
+
+    old_name = f["name"]
+    if new_name == old_name:
+        return jsonify({"ok": True})
+
+    # Cancel active download if this file is being downloaded
+    download_manager.skip_current_file(file_id)
+
+    # Rename on disk if the file exists
+    archive = db.get_archive(f["archive_id"])
+    if archive:
+        download_dir = db.get_setting("download_dir", os.path.expanduser("~/ia-downloads"))
+        base_dir = os.path.realpath(os.path.join(download_dir, archive["identifier"]))
+        old_path = os.path.join(base_dir, old_name)
+        new_path = os.path.join(base_dir, new_name)
+        # Safety: ensure paths stay within archive dir
+        if os.path.realpath(new_path).startswith(base_dir + os.sep) and os.path.isfile(old_path):
+            os.rename(old_path, new_path)
+
+    db.rename_file(file_id, new_name)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/files/<int:file_id>/delete", methods=["POST"])
+@login_required
+def delete_file(file_id):
+    f = db.get_file(file_id)
+    if not f:
+        return jsonify({"error": "File not found"}), 404
+
+    data = request.json or {}
+    remove_from_db = data.get("remove_from_db", False)
+
+    # Cancel active download if this file is being downloaded
+    download_manager.skip_current_file(file_id)
+
+    # Delete from disk if it exists
+    archive = db.get_archive(f["archive_id"])
+    if archive:
+        download_dir = db.get_setting("download_dir", os.path.expanduser("~/ia-downloads"))
+        base_dir = os.path.realpath(os.path.join(download_dir, archive["identifier"]))
+        local_path = os.path.realpath(os.path.join(base_dir, f["name"]))
+        if local_path.startswith(base_dir + os.sep) and os.path.isfile(local_path):
+            os.remove(local_path)
+
+    if remove_from_db:
+        # Unknown/scan-origin files: remove entirely
+        db.delete_files([file_id])
+        db.recompute_archive_file_count(f["archive_id"])
+    else:
+        # Manifest files: keep in DB but reset download status
+        db.set_file_download_status(file_id, "pending", downloaded_bytes=0, error_message="")
+        # Only reset processing state if there are no processed outputs remaining on disk
+        has_outputs = False
+        if f.get("processing_status") in ("completed", "extracted"):
+            if archive:
+                download_dir = db.get_setting("download_dir", os.path.expanduser("~/ia-downloads"))
+                base_dir = os.path.realpath(os.path.join(download_dir, archive["identifier"]))
+                # Check processed_filename
+                pf = f.get("processed_filename", "")
+                if pf:
+                    pf_abs = os.path.realpath(os.path.join(base_dir, pf.rstrip("/").rstrip(os.sep)))
+                    if pf_abs.startswith(base_dir + os.sep) and (os.path.isfile(pf_abs) or os.path.isdir(pf_abs)):
+                        has_outputs = True
+                # Check processed_files_json entries
+                if not has_outputs and f.get("processed_files_json"):
+                    try:
+                        for p in json.loads(f["processed_files_json"]):
+                            p_abs = os.path.realpath(os.path.join(base_dir, p.rstrip("/").rstrip(os.sep)))
+                            if p_abs.startswith(base_dir + os.sep) and (os.path.isfile(p_abs) or os.path.isdir(p_abs)):
+                                has_outputs = True
+                                break
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+        if not has_outputs:
+            conn = db.get_db()
+            conn.execute(
+                "UPDATE archive_files SET processing_status = '', processed_filename = '', "
+                "processed_files_json = '', processing_error = '', processor_type = '' WHERE id = ?",
+                (file_id,),
+            )
+            conn.commit()
+            conn.close()
+    db.recompute_archive_status(f["archive_id"])
+    return jsonify({"ok": True})
+
+
+@app.route("/api/files/<int:file_id>/processed-tree", methods=["GET"])
+@login_required
+def get_processed_tree(file_id):
+    """Return the on-disk tree of processed output files for a source file."""
+    f = db.get_file(file_id)
+    if not f:
+        return jsonify({"error": "File not found"}), 404
+
+    archive = db.get_archive(f["archive_id"])
+    if not archive:
+        return jsonify({"error": "Archive not found"}), 404
+
+    download_dir = db.get_setting("download_dir", os.path.expanduser("~/ia-downloads"))
+    base_dir = os.path.realpath(os.path.join(download_dir, archive["identifier"]))
+
+    # Build the set of root paths to scan.
+    # processed_filename is the primary output (a file, or a folder ending with /).
+    # processed_files_json lists individual files — but we want the tree from the
+    # root entries, not each leaf, so we prefer processed_filename when it's a folder.
+    root_paths = []
+    pf = (f.get("processed_filename") or "").rstrip("/").rstrip(os.sep)
+    if pf:
+        root_paths.append(pf)
+
+    # For non-folder primary outputs, also include any entries from processed_files_json
+    # that aren't already children of a root
+    if f["processed_files_json"]:
+        try:
+            extra = json.loads(f["processed_files_json"])
+            for p in extra:
+                p = p.rstrip("/").rstrip(os.sep)
+                # Skip if already covered by an existing root (as child)
+                if any(p == r or p.startswith(r + "/") or p.startswith(r + os.sep) for r in root_paths):
+                    continue
+                root_paths.append(p)
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    if not root_paths and f.get("processed_filename"):
+        root_paths = [f["processed_filename"].rstrip("/").rstrip(os.sep)]
+
+    # Build tree from disk (verify each entry actually exists)
+    def _scan_path(rel_path):
+        abs_path = os.path.realpath(os.path.join(base_dir, rel_path))
+        if not abs_path.startswith(base_dir + os.sep):
+            return None
+        if os.path.isfile(abs_path):
+            stat = os.stat(abs_path)
+            return {"name": os.path.basename(rel_path), "path": rel_path, "type": "file",
+                    "size": stat.st_size, "mtime": int(stat.st_mtime)}
+        elif os.path.isdir(abs_path):
+            children = []
+            try:
+                for entry in sorted(os.listdir(abs_path)):
+                    child = _scan_path(os.path.join(rel_path, entry))
+                    if child:
+                        children.append(child)
+            except OSError:
+                pass
+            stat = os.stat(abs_path)
+            return {"name": os.path.basename(rel_path), "path": rel_path, "type": "dir",
+                    "children": children, "mtime": int(stat.st_mtime)}
+        return None
+
+    tree = []
+    seen = set()
+    for p in root_paths:
+        if p in seen:
+            continue
+        seen.add(p)
+        node = _scan_path(p)
+        if node:
+            tree.append(node)
+
+    return jsonify({"tree": tree})
+
+
+@app.route("/api/files/<int:file_id>/delete-processed", methods=["POST"])
+@login_required
+def delete_processed_file(file_id):
+    """Delete one or all processed output files from disk."""
+    import shutil
+    f = db.get_file(file_id)
+    if not f:
+        return jsonify({"error": "File not found"}), 404
+
+    data = request.json or {}
+    filename = data.get("filename", "")
+    delete_all = data.get("delete_all", False)
+
+    archive = db.get_archive(f["archive_id"])
+    if not archive:
+        return jsonify({"error": "Archive not found"}), 404
+
+    download_dir = db.get_setting("download_dir", os.path.expanduser("~/ia-downloads"))
+    base_dir = os.path.realpath(os.path.join(download_dir, archive["identifier"]))
+
+    if delete_all:
+        # Delete every processed output for this file
+        paths_to_delete = []
+        if f["processed_files_json"]:
+            try:
+                paths_to_delete = json.loads(f["processed_files_json"])
+            except (json.JSONDecodeError, TypeError):
+                pass
+        if not paths_to_delete and f.get("processed_filename"):
+            paths_to_delete = [f["processed_filename"]]
+        for p in paths_to_delete:
+            p = p.rstrip("/").rstrip(os.sep)
+            abs_p = os.path.realpath(os.path.join(base_dir, p))
+            if abs_p.startswith(base_dir + os.sep):
+                if os.path.isfile(abs_p):
+                    os.remove(abs_p)
+                elif os.path.isdir(abs_p):
+                    shutil.rmtree(abs_p)
+        # Reset all processing state
+        conn = db.get_db()
+        conn.execute(
+            "UPDATE archive_files SET processing_status = '', processed_filename = '', "
+            "processed_files_json = '', processing_error = '', processor_type = '' WHERE id = ?",
+            (file_id,),
+        )
+        conn.commit()
+        conn.close()
+    elif filename:
+        # Delete a single processed output
+        proc_path = os.path.realpath(os.path.join(base_dir, filename))
+        if proc_path.startswith(base_dir + os.sep):
+            if os.path.isfile(proc_path):
+                os.remove(proc_path)
+            elif os.path.isdir(proc_path):
+                shutil.rmtree(proc_path)
+
+        # Update processed_files_json to remove the deleted entry
+        remaining = []
+        if f["processed_files_json"]:
+            try:
+                all_files = json.loads(f["processed_files_json"])
+                remaining = [p for p in all_files if p.rstrip("/").rstrip(os.sep) != filename.rstrip("/").rstrip(os.sep)
+                             and not p.startswith(filename.rstrip("/") + "/")
+                             and not p.startswith(filename.rstrip(os.sep) + os.sep)]
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        # Check if we deleted the processed_filename itself
+        pf = (f.get("processed_filename") or "").rstrip("/").rstrip(os.sep)
+        deleted_pf = filename.rstrip("/").rstrip(os.sep)
+        pf_was_deleted = pf and (pf == deleted_pf or pf.startswith(deleted_pf + "/") or pf.startswith(deleted_pf + os.sep))
+
+        conn = db.get_db()
+        if not remaining:
+            # No processed files left — clear path fields but keep processing status
+            # so the file still shows as processed/extracted (like automated processing
+            # that deletes the source file)
+            conn.execute(
+                "UPDATE archive_files SET processed_filename = '', "
+                "processed_files_json = '' WHERE id = ?",
+                (file_id,),
+            )
+        else:
+            updates = {"processed_files_json": json.dumps(remaining)}
+            if pf_was_deleted:
+                # The primary processed_filename was deleted; pick the first remaining as new root
+                updates["processed_filename"] = remaining[0]
+            parts = ", ".join(f"{k} = ?" for k in updates)
+            conn.execute(
+                f"UPDATE archive_files SET {parts} WHERE id = ?",
+                (*updates.values(), file_id),
+            )
+        conn.commit()
+        conn.close()
+
+    return jsonify({"ok": True})
+
+
+@app.route("/api/files/<int:file_id>/rename-processed", methods=["POST"])
+@login_required
+def rename_processed_file(file_id):
+    """Rename a processed output file on disk and update the DB record."""
+    f = db.get_file(file_id)
+    if not f:
+        return jsonify({"error": "File not found"}), 404
+
+    data = request.json or {}
+    old_path = data.get("old_path", "").strip()
+    new_name = data.get("new_name", "").strip()
+    if not old_path or not new_name:
+        return jsonify({"error": "old_path and new_name are required"}), 400
+
+    archive = db.get_archive(f["archive_id"])
+    if not archive:
+        return jsonify({"error": "Archive not found"}), 404
+
+    download_dir = db.get_setting("download_dir", os.path.expanduser("~/ia-downloads"))
+    base_dir = os.path.realpath(os.path.join(download_dir, archive["identifier"]))
+
+    old_abs = os.path.realpath(os.path.join(base_dir, old_path))
+    new_rel = os.path.join(os.path.dirname(old_path), new_name)
+    new_abs = os.path.realpath(os.path.join(base_dir, new_rel))
+
+    if not old_abs.startswith(base_dir + os.sep) or not new_abs.startswith(base_dir + os.sep):
+        return jsonify({"error": "Invalid path"}), 400
+
+    if (os.path.isfile(old_abs) or os.path.isdir(old_abs)):
+        os.rename(old_abs, new_abs)
+
+    # Update processed_filename if it matches
+    conn = db.get_db()
+    pf = f.get("processed_filename", "")
+    if pf.rstrip("/").rstrip(os.sep) == old_path.rstrip("/").rstrip(os.sep):
+        suffix = "/" if pf.endswith("/") or pf.endswith(os.sep) else ""
+        conn.execute("UPDATE archive_files SET processed_filename = ? WHERE id = ?",
+                     (new_rel + suffix, file_id))
+
+    # Update processed_files_json entries
+    if f["processed_files_json"]:
+        try:
+            all_files = json.loads(f["processed_files_json"])
+            old_stripped = old_path.rstrip("/").rstrip(os.sep)
+            updated = []
+            for p in all_files:
+                ps = p.rstrip("/").rstrip(os.sep)
+                if ps == old_stripped:
+                    updated.append(new_rel + ("/" if p.endswith("/") else ""))
+                elif ps.startswith(old_stripped + "/") or ps.startswith(old_stripped + os.sep):
+                    updated.append(new_rel + ps[len(old_stripped):])
+                else:
+                    updated.append(p)
+            conn.execute("UPDATE archive_files SET processed_files_json = ? WHERE id = ?",
+                         (json.dumps(updated), file_id))
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True, "new_path": new_rel})
+
+
+@app.route("/api/archives/<int:archive_id>/files/batch-delete", methods=["POST"])
+@login_required
+def batch_delete_files(archive_id):
+    data = request.json
+    file_ids = data.get("file_ids", [])
+    if not file_ids:
+        return jsonify({"error": "No files specified"}), 400
+
+    archive = db.get_archive(archive_id)
+    if not archive:
+        return jsonify({"error": "Archive not found"}), 404
+
+    download_dir = db.get_setting("download_dir", os.path.expanduser("~/ia-downloads"))
+    base_dir = os.path.realpath(os.path.join(download_dir, archive["identifier"]))
+
+    # Delete files from disk
+    for fid in file_ids:
+        f = db.get_file(fid)
+        if f and f["archive_id"] == archive_id:
+            local_path = os.path.realpath(os.path.join(base_dir, f["name"]))
+            if local_path.startswith(base_dir + os.sep) and os.path.isfile(local_path):
+                os.remove(local_path)
+
+    count = db.delete_files(file_ids)
+    db.recompute_archive_file_count(archive_id)
+    return jsonify({"ok": True, "deleted": count})
+
+
+@app.route("/api/archives/<int:archive_id>/files/batch-retry", methods=["POST"])
+@login_required
+def batch_retry_files(archive_id):
+    data = request.json
+    file_ids = data.get("file_ids", [])
+    if not file_ids:
+        return jsonify({"error": "No files specified"}), 400
+    count = db.reset_failed_files_by_ids(file_ids)
+    if count > 0:
+        db.recompute_archive_status(archive_id, fallback="queued")
+    return jsonify({"ok": True, "reset_count": count})
+
+
+@app.route("/api/files/<int:file_id>/scan", methods=["POST"])
+@login_required
+def scan_single_file(file_id):
+    """Re-scan a single file against what's on disk."""
+    f = db.get_file(file_id)
+    if not f:
+        return jsonify({"error": "File not found"}), 404
+
+    archive = db.get_archive(f["archive_id"])
+    if not archive:
+        return jsonify({"error": "Archive not found"}), 404
+
+    download_dir = db.get_setting("download_dir", os.path.expanduser("~/ia-downloads"))
+    base_dir = os.path.realpath(os.path.join(download_dir, archive["identifier"]))
+    local_path = os.path.realpath(os.path.join(base_dir, f["name"]))
+
+    if not local_path.startswith(base_dir + os.sep):
+        return jsonify({"error": "Invalid path"}), 400
+
+    result = {"status": "missing"}
+
+    if os.path.isfile(local_path):
+        local_size = os.path.getsize(local_path)
+        expected_size = f["size"]
+
+        if expected_size > 0 and local_size != expected_size:
+            if local_size < expected_size:
+                db.set_file_download_status(file_id, "pending", downloaded_bytes=local_size, error_message="Partial download detected by scan")
+                if not f["selected"]:
+                    db.set_file_selected(file_id, True)
+                result = {"status": "partial"}
+            else:
+                db.set_file_download_status(file_id, "conflict", error_message=f"Size mismatch: local {local_size} vs expected {expected_size}")
+                result = {"status": "conflict"}
+        else:
+            # MD5 check if available
+            if f["md5"]:
+                md5 = hashlib.md5()
+                with open(local_path, "rb") as fh:
+                    for chunk in iter(lambda: fh.read(8192), b""):
+                        md5.update(chunk)
+                if md5.hexdigest() != f["md5"]:
+                    db.set_file_download_status(file_id, "conflict", error_message=f"MD5 mismatch: local {md5.hexdigest()} vs expected {f['md5']}")
+                    result = {"status": "conflict"}
+                else:
+                    db.set_file_download_status(file_id, "completed", downloaded_bytes=local_size)
+                    if not f["selected"]:
+                        db.set_file_selected(file_id, True)
+                    result = {"status": "completed"}
+            else:
+                db.set_file_download_status(file_id, "completed", downloaded_bytes=local_size)
+                if not f["selected"]:
+                    db.set_file_selected(file_id, True)
+                result = {"status": "completed"}
+    else:
+        # Check for processed version
+        base_no_ext = os.path.splitext(f["name"])[0]
+        for proc_ext in (".chd", ".cso"):
+            proc_path = os.path.join(base_dir, base_no_ext + proc_ext)
+            if os.path.isfile(proc_path):
+                db.set_file_download_status(file_id, "completed", downloaded_bytes=os.path.getsize(proc_path))
+                result = {"status": "completed"}
+                break
+        else:
+            db.set_file_download_status(file_id, "pending", downloaded_bytes=0)
+            result = {"status": "missing"}
+
+    db.recompute_archive_status(f["archive_id"])
+    return jsonify({"ok": True, **result})
 
 
 @app.route("/api/archives/<int:archive_id>/retry", methods=["POST"])
