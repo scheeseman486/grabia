@@ -78,18 +78,23 @@ class DownloadManager:
         self._last_schedule_limit = None   # Track schedule transitions
         self._current_file_info = None
         self._current_speed = 0
+        self._skip_file_event = threading.Event()
         self._lock = threading.Lock()
         self._listeners = []
 
     def add_listener(self, callback):
-        self._listeners.append(callback)
+        with self._lock:
+            self._listeners.append(callback)
 
     def remove_listener(self, callback):
-        if callback in self._listeners:
-            self._listeners.remove(callback)
+        with self._lock:
+            if callback in self._listeners:
+                self._listeners.remove(callback)
 
     def _notify(self, event, data=None):
-        for cb in self._listeners:
+        with self._lock:
+            listeners = list(self._listeners)  # Snapshot to avoid mutation during iteration
+        for cb in listeners:
             try:
                 cb(event, data)
             except Exception:
@@ -97,68 +102,87 @@ class DownloadManager:
 
     @property
     def bandwidth_limit(self):
-        return self._bandwidth_limit
+        with self._lock:
+            return self._bandwidth_limit
 
     @bandwidth_limit.setter
     def bandwidth_limit(self, value):
-        old = self._bandwidth_limit
-        self._bandwidth_limit = int(value)
-        if self._bandwidth_limit < -1:
-            self._bandwidth_limit = -1
-        db.set_setting("bandwidth_limit", str(self._bandwidth_limit))
-        self._schedule_overridden = True
+        notify_state = None
+        with self._lock:
+            old = self._bandwidth_limit
+            self._bandwidth_limit = int(value)
+            if self._bandwidth_limit < -1:
+                self._bandwidth_limit = -1
+            self._schedule_overridden = True
 
-        # 0 = effectively pause downloads
-        if self._bandwidth_limit == 0 and self.state == "running":
-            self._pause_event.clear()
-            self.state = "paused"
-            self._paused_by_bandwidth = True
-            self._notify("state", self.state)
-        # Non-zero: resume if we were paused by bandwidth
-        elif old == 0 and self._bandwidth_limit != 0 and self._paused_by_bandwidth:
-            self._pause_event.set()
-            self.state = "running"
-            self._paused_by_bandwidth = False
-            self._notify("state", self.state)
+            # 0 = effectively pause downloads
+            if self._bandwidth_limit == 0 and self.state == "running":
+                self._pause_event.clear()
+                self.state = "paused"
+                self._paused_by_bandwidth = True
+                notify_state = self.state
+            # Non-zero: resume if we were paused by bandwidth
+            elif old == 0 and self._bandwidth_limit != 0 and self._paused_by_bandwidth:
+                self._pause_event.set()
+                self.state = "running"
+                self._paused_by_bandwidth = False
+                notify_state = self.state
+
+        db.set_setting("bandwidth_limit", str(self._bandwidth_limit))
+        if notify_state is not None:
+            self._notify("state", notify_state)
 
     def start(self):
-        if self.state == "running":
-            return
-        if self.state == "paused":
-            self._pause_event.set()
-            self.state = "running"
-            self._paused_by_bandwidth = False
-            self._notify("state", self.state)
-            return
-        self._stop_event.clear()
-        self._pause_event.set()
-        self.state = "running"
-        self._paused_by_bandwidth = False
-        self._last_schedule_limit = None
-        self._thread = threading.Thread(target=self._download_loop, daemon=True)
-        self._thread.start()
-        self._notify("state", self.state)
+        with self._lock:
+            if self.state == "running":
+                return  # Already running, nothing to notify
+            if self.state == "paused":
+                self._pause_event.set()
+                self.state = "running"
+                self._paused_by_bandwidth = False
+            else:
+                self._stop_event.clear()
+                self._pause_event.set()
+                self.state = "running"
+                self._paused_by_bandwidth = False
+                self._last_schedule_limit = None
+                self._thread = threading.Thread(target=self._download_loop, daemon=True)
+                self._thread.start()
+        self._notify("state", "running")
 
     def pause(self):
-        if self.state == "running":
+        with self._lock:
+            if self.state != "running":
+                return
             self._pause_event.clear()
             self.state = "paused"
-            self._notify("state", self.state)
+        self._notify("state", "paused")
 
     def stop(self):
-        self.state = "stopped"
-        self._stop_event.set()
-        self._pause_event.set()  # Unblock if paused so thread can exit
-        self._paused_by_bandwidth = False
-        self._last_schedule_limit = None
-        if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=10)
-        self._thread = None
-        self._current_file_info = None
-        self._current_speed = 0
+        with self._lock:
+            self.state = "stopped"
+            self._stop_event.set()
+            self._pause_event.set()  # Unblock if paused so thread can exit
+            self._paused_by_bandwidth = False
+            self._last_schedule_limit = None
+            thread = self._thread
+        if thread and thread.is_alive():
+            thread.join(timeout=10)
+        with self._lock:
+            self._thread = None
+            self._current_file_info = None
+            self._current_speed = 0
         # Reset any files stuck in downloading state
         db.reset_downloading_files()
-        self._notify("state", self.state)
+        self._notify("state", "stopped")
+
+    def skip_current_file(self, file_id):
+        """Skip the currently downloading file if it matches file_id."""
+        with self._lock:
+            if self._current_file_info and self._current_file_info.get("file_id") == file_id:
+                self._skip_file_event.set()
+                return True
+        return False
 
     def get_status(self):
         with self._lock:
@@ -195,11 +219,13 @@ class DownloadManager:
 
             self._download_file(file_info)
 
-        self.state = "stopped"
+        # stop() handles state notification after reset_downloading_files(),
+        # so don't notify here to avoid a race where the client refreshes
+        # before the DB has been updated.
         self._current_file_info = None
-        self._notify("state", self.state)
 
     def _download_file(self, file_info):
+        self._skip_file_event.clear()
         file_id = file_info["id"]
         archive_id = file_info["archive_id"]
         identifier = file_info["identifier"]
@@ -278,6 +304,12 @@ class DownloadManager:
             log.debug("download", "Completed: %s", filename)
             db.set_file_download_status(file_id, "completed", downloaded_bytes=expected_size)
             self._notify("file_complete", {"file_id": file_id, "filename": filename, "identifier": identifier})
+        elif self._skip_file_event.is_set():
+            # File was removed from queue mid-download — reset to pending
+            log.debug("download", "Skipped (dequeued): %s", filename)
+            db.set_file_download_status(file_id, "pending", downloaded_bytes=0)
+            self._skip_file_event.clear()
+            self._notify("file_skipped", {"file_id": file_id, "filename": filename, "identifier": identifier})
         elif not self._stop_event.is_set() and not success:
             # Mark failed, increment retry — the download loop will re-pick it
             # if retries remain, after processing other pending files first
@@ -339,12 +371,12 @@ class DownloadManager:
 
         with open(local_path, mode) as f:
             for chunk in resp.iter_content(chunk_size=chunk_size):
-                if self._stop_event.is_set():
+                if self._stop_event.is_set() or self._skip_file_event.is_set():
                     return False
 
                 # Wait if paused
                 self._pause_event.wait()
-                if self._stop_event.is_set():
+                if self._stop_event.is_set() or self._skip_file_event.is_set():
                     return False
 
                 if chunk:
@@ -354,58 +386,73 @@ class DownloadManager:
                     # --- Bandwidth limiting ---
                     # Determine effective limit: schedule takes priority unless manually overridden
                     scheduled = get_scheduled_limit()
+                    bw_notify = None
 
-                    if scheduled is not None:
-                        # A schedule rule is active
-                        if scheduled != self._last_schedule_limit:
-                            # Schedule transition: clear manual override, apply new schedule
-                            self._last_schedule_limit = scheduled
-                            self._schedule_overridden = False
-                            self._notify("bandwidth_update", {"limit": scheduled, "source": "schedule"})
-                        if self._schedule_overridden:
-                            limit = self._bandwidth_limit  # User manually overrode
+                    with self._lock:
+                        if scheduled is not None:
+                            # A schedule rule is active
+                            if scheduled != self._last_schedule_limit:
+                                # Schedule transition: clear manual override, apply new schedule
+                                self._last_schedule_limit = scheduled
+                                self._schedule_overridden = False
+                                bw_notify = {"limit": scheduled, "source": "schedule"}
+                            if self._schedule_overridden:
+                                limit = self._bandwidth_limit  # User manually overrode
+                            else:
+                                limit = scheduled
                         else:
-                            limit = scheduled
-                    else:
-                        # No schedule rule active
-                        if self._last_schedule_limit is not None:
-                            # Transitioning out of schedule
-                            self._last_schedule_limit = None
-                            self._schedule_overridden = False
-                            self._notify("bandwidth_update", {"limit": self._bandwidth_limit, "source": "manual"})
-                        limit = self._bandwidth_limit
+                            # No schedule rule active
+                            if self._last_schedule_limit is not None:
+                                # Transitioning out of schedule
+                                self._last_schedule_limit = None
+                                self._schedule_overridden = False
+                                bw_notify = {"limit": self._bandwidth_limit, "source": "manual"}
+                            limit = self._bandwidth_limit
+
+                    if bw_notify is not None:
+                        self._notify("bandwidth_update", bw_notify)
 
                     # 0 = schedule-driven pause (manual 0 already triggers real pause via setter)
                     if limit == 0:
                         # Pause via event so UI reflects it
-                        if self.state == "running":
-                            self._pause_event.clear()
-                            self.state = "paused"
-                            self._paused_by_bandwidth = True
-                            self._notify("state", self.state)
+                        do_pause_notify = False
+                        with self._lock:
+                            if self.state == "running":
+                                self._pause_event.clear()
+                                self.state = "paused"
+                                self._paused_by_bandwidth = True
+                                do_pause_notify = True
+                        if do_pause_notify:
+                            self._notify("state", "paused")
                         # Block until limit changes
                         while limit == 0 and not self._stop_event.is_set():
                             time.sleep(0.25)
-                            # Check for manual override
-                            if self._schedule_overridden:
-                                limit = self._bandwidth_limit
-                                break
+                            with self._lock:
+                                # Check for manual override
+                                if self._schedule_overridden:
+                                    limit = self._bandwidth_limit
+                                    break
                             # Re-check schedule
                             new_scheduled = get_scheduled_limit()
                             if new_scheduled != scheduled:
-                                self._last_schedule_limit = new_scheduled
-                                if new_scheduled is not None:
-                                    limit = new_scheduled
-                                else:
-                                    limit = self._bandwidth_limit
+                                with self._lock:
+                                    self._last_schedule_limit = new_scheduled
+                                    if new_scheduled is not None:
+                                        limit = new_scheduled
+                                    else:
+                                        limit = self._bandwidth_limit
                                 self._notify("bandwidth_update", {"limit": limit, "source": "schedule" if new_scheduled is not None else "manual"})
                                 break
                         # Resume after schedule-driven pause
-                        if limit != 0 and self._paused_by_bandwidth:
-                            self._pause_event.set()
-                            self.state = "running"
-                            self._paused_by_bandwidth = False
-                            self._notify("state", self.state)
+                        do_resume_notify = False
+                        with self._lock:
+                            if limit != 0 and self._paused_by_bandwidth:
+                                self._pause_event.set()
+                                self.state = "running"
+                                self._paused_by_bandwidth = False
+                                do_resume_notify = True
+                        if do_resume_notify:
+                            self._notify("state", "running")
                         tokens = 0.0
                         token_time = time.time()
                         if self._stop_event.is_set():
@@ -472,26 +519,29 @@ class DownloadManager:
 
     def _check_archive_completion(self, archive_id):
         conn = db.get_db()
-        row = conn.execute("""
-            SELECT
-                COUNT(*) as total,
-                SUM(CASE WHEN download_status = 'completed' THEN 1 ELSE 0 END) as completed,
-                SUM(CASE WHEN download_status = 'failed' THEN 1 ELSE 0 END) as failed,
-                SUM(CASE WHEN download_status = 'conflict' THEN 1 ELSE 0 END) as conflict
-            FROM archive_files
-            WHERE archive_id = ? AND selected = 1
-        """, (archive_id,)).fetchone()
-        conn.close()
+        try:
+            row = conn.execute("""
+                SELECT
+                    COUNT(*) as total,
+                    SUM(CASE WHEN download_status = 'completed' THEN 1 ELSE 0 END) as completed,
+                    SUM(CASE WHEN download_status = 'failed' THEN 1 ELSE 0 END) as failed,
+                    SUM(CASE WHEN download_status = 'conflict' THEN 1 ELSE 0 END) as conflict
+                FROM archive_files
+                WHERE archive_id = ? AND selected = 1
+            """, (archive_id,)).fetchone()
+        finally:
+            conn.close()
 
-        if row["total"] > 0:
-            if row["completed"] == row["total"]:
-                db.set_archive_status(archive_id, "completed")
-            elif row["completed"] + row["failed"] + row["conflict"] == row["total"]:
-                db.set_archive_status(archive_id, "partial")
-            else:
-                # Still has pending files but nothing actively downloading —
-                # set back to queued so it doesn't stay stuck on "downloading"
-                db.set_archive_status(archive_id, "queued")
+        if row["total"] == 0:
+            db.set_archive_status(archive_id, "idle")
+        elif row["completed"] == row["total"]:
+            db.set_archive_status(archive_id, "completed")
+        elif row["completed"] + row["failed"] + row["conflict"] == row["total"]:
+            db.set_archive_status(archive_id, "partial")
+        else:
+            # Still has pending files but nothing actively downloading —
+            # set back to queued so it doesn't stay stuck on "downloading"
+            db.set_archive_status(archive_id, "queued")
 
 
 # Singleton
