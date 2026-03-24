@@ -202,11 +202,11 @@ def init_db():
           AND md5 = '' AND sha1 = '' AND format = '' AND source = '' AND mtime = ''
     """)
 
-    # Fix archives stuck on 'downloading' when nothing is actually downloading.
+    # Fix archives stuck on 'downloading' or 'queued' from a previous session.
     # On startup the downloader is not running, so no files can be in-flight.
-    # Recalculate status for any archive marked 'downloading'.
+    # Recalculate status for any archive marked 'downloading' or 'queued'.
     stuck = conn.execute(
-        "SELECT id FROM archives WHERE status = 'downloading'"
+        "SELECT id FROM archives WHERE status IN ('downloading', 'queued')"
     ).fetchall()
     for row in stuck:
         aid = row["id"]

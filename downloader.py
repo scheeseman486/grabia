@@ -540,8 +540,8 @@ class DownloadManager:
             db.set_archive_status(archive_id, "partial")
         else:
             # Still has pending files but nothing actively downloading —
-            # set back to queued so it doesn't stay stuck on "downloading"
-            db.set_archive_status(archive_id, "queued")
+            # mark idle so it doesn't stay stuck on "downloading" or "queued"
+            db.set_archive_status(archive_id, "idle")
 
 
 # Singleton
