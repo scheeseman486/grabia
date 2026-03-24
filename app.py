@@ -902,19 +902,15 @@ def archive_progress(archive_id):
 @app.route("/api/archives/<int:archive_id>/files", methods=["GET"])
 @login_required
 def list_archive_files(archive_id):
-    page = request.args.get("page", 1, type=int)
     sort = request.args.get("sort", "name")
     sort_dir = request.args.get("sort_dir", "")
     search = request.args.get("search", "").strip()
-    per_page = int(db.get_setting("files_per_page", "50"))
-    files, total = db.get_archive_files(archive_id, page, per_page, sort=sort, sort_dir=sort_dir, search=search)
+    files, total = db.get_archive_files(archive_id, sort=sort, sort_dir=sort_dir, search=search)
     unqueued = db.count_unqueued_files(archive_id)
     progress = db.get_archive_progress(archive_id)
     return jsonify({
         "files": files,
         "total": total,
-        "page": page,
-        "per_page": per_page,
         "all_queued": unqueued == 0,
         "progress": progress,
     })
@@ -1025,6 +1021,7 @@ def delete_file(file_id):
     download_manager.skip_current_file(file_id)
 
     # Delete from disk if it exists
+    deleted_from_disk = False
     archive = db.get_archive(f["archive_id"])
     if archive:
         download_dir = db.get_setting("download_dir", os.path.expanduser("~/ia-downloads"))
@@ -1032,6 +1029,7 @@ def delete_file(file_id):
         local_path = os.path.realpath(os.path.join(base_dir, f["name"]))
         if local_path.startswith(base_dir + os.sep) and os.path.isfile(local_path):
             os.remove(local_path)
+            deleted_from_disk = True
 
     if remove_from_db:
         # Unknown/scan-origin files: remove entirely
@@ -1072,7 +1070,7 @@ def delete_file(file_id):
             conn.commit()
             conn.close()
     db.recompute_archive_status(f["archive_id"])
-    return jsonify({"ok": True})
+    return jsonify({"ok": True, "deleted_from_disk": deleted_from_disk})
 
 
 @app.route("/api/files/<int:file_id>/processed-tree", methods=["GET"])
@@ -1417,6 +1415,7 @@ def scan_single_file(file_id):
             db.set_file_download_status(file_id, "pending", downloaded_bytes=0)
             result = {"status": "missing"}
 
+    result["name"] = f["name"]
     db.recompute_archive_status(f["archive_id"])
     return jsonify({"ok": True, **result})
 
@@ -1444,8 +1443,10 @@ def retry_single_file(file_id):
 @app.route("/api/download/start", methods=["POST"])
 @login_required
 def start_download():
+    # Check if there's anything to download before starting
+    has_work = db.get_next_download_file() is not None
     download_manager.start()
-    return jsonify({"state": download_manager.state})
+    return jsonify({"state": download_manager.state, "has_work": has_work})
 
 
 @app.route("/api/download/pause", methods=["POST"])
@@ -1466,6 +1467,12 @@ def stop_download():
 @login_required
 def download_status():
     return jsonify(download_manager.get_status())
+
+
+@app.route("/api/download/queue", methods=["GET"])
+@login_required
+def download_queue():
+    return jsonify(db.get_download_queue())
 
 
 @app.route("/api/download/bandwidth", methods=["POST"])

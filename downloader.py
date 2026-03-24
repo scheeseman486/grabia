@@ -362,10 +362,11 @@ class DownloadManager:
 
         downloaded = existing_size
         chunk_size = 8192
-        last_update = time.time()
+        update_interval = 0.5
+        next_update = time.monotonic() + update_interval
         # Token bucket for bandwidth limiting
         tokens = 0.0
-        token_time = time.time()
+        token_time = time.monotonic()
         # For speed measurement: track bytes in a rolling window
         speed_samples = []
 
@@ -374,8 +375,11 @@ class DownloadManager:
                 if self._stop_event.is_set() or self._skip_file_event.is_set():
                     return False
 
-                # Wait if paused
-                self._pause_event.wait()
+                # Wait if paused — reset timer on resume to avoid burst
+                if not self._pause_event.is_set():
+                    self._pause_event.wait()
+                    next_update = time.monotonic() + update_interval
+                    token_time = time.monotonic()
                 if self._stop_event.is_set() or self._skip_file_event.is_set():
                     return False
 
@@ -454,13 +458,14 @@ class DownloadManager:
                         if do_resume_notify:
                             self._notify("state", "running")
                         tokens = 0.0
-                        token_time = time.time()
+                        token_time = time.monotonic()
+                        next_update = time.monotonic() + update_interval
                         if self._stop_event.is_set():
                             return False
 
                     # Positive limit: throttle via token bucket
                     if limit > 0:
-                        now = time.time()
+                        now = time.monotonic()
                         elapsed = now - token_time
                         token_time = now
                         tokens += elapsed * limit
@@ -472,13 +477,17 @@ class DownloadManager:
                             if sleep_time > 0.001:
                                 time.sleep(sleep_time)
                             tokens = 0.0
-                            token_time = time.time()
+                            token_time = time.monotonic()
                     # limit == -1: unlimited, no throttling
 
-                    # Update progress every 0.5 seconds
-                    now = time.time()
+                    # Update progress on a fixed interval
+                    now = time.monotonic()
                     speed_samples.append((now, len(chunk)))
-                    if now - last_update >= 0.5:
+                    if now >= next_update:
+                        next_update += update_interval
+                        # Guard against drift: if we fell behind, snap forward
+                        if next_update <= now:
+                            next_update = now + update_interval
                         # Calculate speed from recent samples (last 2 seconds)
                         cutoff = now - 2.0
                         speed_samples = [(t, s) for t, s in speed_samples if t > cutoff]
@@ -499,7 +508,6 @@ class DownloadManager:
                             "size": expected_size,
                             "speed": speed,
                         })
-                        last_update = now
 
         # Verify hash if available — skip for files with no size in metadata,
         # as IA regenerates them dynamically and the stored hash is stale

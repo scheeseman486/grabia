@@ -494,9 +494,8 @@ _EFFECTIVE_STATUS_EXPR = """CASE
 END"""
 
 
-def get_archive_files(archive_id, page=1, per_page=50, sort="name", sort_dir=None, search=""):
+def get_archive_files(archive_id, sort="name", sort_dir=None, search=""):
     with _db() as conn:
-        offset = (page - 1) * per_page
         col, default_dir = _FILE_SORT_MAP.get(sort, _FILE_SORT_MAP["name"])
         direction = sort_dir.upper() if sort_dir in ("asc", "desc") else default_dir
         if sort == "priority":
@@ -514,8 +513,8 @@ def get_archive_files(archive_id, page=1, per_page=50, sort="name", sort_dir=Non
             params.append(f"%{search}%")
         total = conn.execute(f"SELECT COUNT(*) FROM archive_files WHERE {where}", params).fetchone()[0]
         rows = conn.execute(
-            f"SELECT * FROM archive_files WHERE {where} ORDER BY {order} LIMIT ? OFFSET ?",
-            params + [per_page, offset],
+            f"SELECT * FROM archive_files WHERE {where} ORDER BY {order}",
+            params,
         ).fetchall()
         return [dict(r) for r in rows], total
 
@@ -623,6 +622,31 @@ def get_next_download_file():
             LIMIT 1
         """, (max_retries,)).fetchone()
         return dict(row) if row else None
+
+
+def get_download_queue(limit=200):
+    """Get the ordered download queue: files that are pending or retryable, in download order."""
+    with _db() as conn:
+        max_retries = int(get_setting("max_retries") or 3)
+        rows = conn.execute("""
+            SELECT af.id, af.name, af.size, af.download_status, af.downloaded_bytes,
+                   af.download_priority, a.id as archive_id, a.identifier, a.title
+            FROM archive_files af
+            JOIN archives a ON af.archive_id = a.id
+            WHERE a.download_enabled = 1
+              AND af.queued = 1
+              AND (af.download_status IN ('pending', 'downloading')
+                   OR (af.download_status = 'failed' AND af.retry_count < ?))
+            ORDER BY a.position ASC,
+                     CASE af.download_status
+                         WHEN 'downloading' THEN 0
+                         WHEN 'pending' THEN 1
+                         ELSE 2
+                     END,
+                     af.download_priority ASC
+            LIMIT ?
+        """, (max_retries, limit)).fetchall()
+        return [dict(r) for r in rows]
 
 
 def get_download_progress():
