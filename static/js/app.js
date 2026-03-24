@@ -32,8 +32,12 @@
     let fileSearchQuery = "";
     let fileSearchTimer = null;
     let dlState = "stopped";
+    let loadFilesGen = 0;
+    let refreshArchivesGen = 0;
     let dragSrcId = null;
     let dragSrcGroupId = null;
+    let isDragging = false;
+    let renderArchiveListPending = false;
     // Groups collapsed by default; store *expanded* group IDs in localStorage
     let expandedGroups = new Set(
         JSON.parse(localStorage.getItem("grabia_expanded_groups") || "[]")
@@ -394,6 +398,48 @@
         return d.toLocaleDateString() + " " + d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
     }
 
+    /**
+     * Render a filename as two spans for Finder-style middle truncation.
+     * The head (stem) truncates with ellipsis; the tail (extension) never shrinks.
+     * extraClass is optional, e.g. "file-name-deleted".
+     */
+    function renderFileName(name, extraClass) {
+        const escaped = escapeHtml(name);
+        const dotIdx = name.lastIndexOf(".");
+        const cls = "file-name" + (extraClass ? " " + extraClass : "");
+        if (dotIdx > 0 && dotIdx < name.length - 1) {
+            const head = escapeHtml(name.substring(0, dotIdx));
+            const tail = escapeHtml(name.substring(dotIdx));
+            return `<span class="${cls}"><span class="fname-head">${head}</span><span class="fname-tail">${tail}</span></span>`;
+        }
+        return `<span class="${cls}"><span class="fname-head">${escaped}</span></span>`;
+    }
+
+    /** Same middle-truncation for processed tree node names. */
+    function renderPtreeName(name) {
+        const escaped = escapeHtml(name);
+        const dotIdx = name.lastIndexOf(".");
+        if (dotIdx > 0 && dotIdx < name.length - 1) {
+            const head = escapeHtml(name.substring(0, dotIdx));
+            const tail = escapeHtml(name.substring(dotIdx));
+            return `<span class="ptree-name"><span class="fname-head">${head}</span><span class="fname-tail">${tail}</span></span>`;
+        }
+        return `<span class="ptree-name"><span class="fname-head">${escaped}</span></span>`;
+    }
+
+    /** Add title tooltip only to filename spans that are actually truncated. */
+    function applyTruncationTooltips(container) {
+        const selector = ".file-name, .ptree-name";
+        for (const el of (container || document).querySelectorAll(selector)) {
+            const head = el.querySelector(".fname-head");
+            if (head && head.scrollWidth > head.clientWidth) {
+                el.title = el.textContent;
+            } else {
+                el.removeAttribute("title");
+            }
+        }
+    }
+
     async function api(method, path, body) {
         const opts = { method, headers: {} };
         if (body !== undefined) {
@@ -430,6 +476,7 @@
         });
 
         es.addEventListener("state", (e) => {
+            const prevState = dlState;
             const data = JSON.parse(e.data);
             dlState = data;
             updateControlButtons();
@@ -439,9 +486,14 @@
                 speedDisplay.textContent = "";
                 clearSparkline();
             }
+            // Refresh file list when downloader stops so status resets are visible
+            if (prevState === "running" && dlState !== "running" && currentArchiveId) {
+                loadFiles();
+            }
         });
 
         es.addEventListener("file_progress", (e) => {
+            if (dlState !== "running") return;
             const data = JSON.parse(e.data);
             updateFileRow(data.file_id, { download_status: "downloading", downloaded_bytes: data.downloaded, size: data.size });
             speedDisplay.textContent = formatSpeed(data.speed);
@@ -588,8 +640,11 @@
     // --- Archives ---
 
     async function refreshArchives() {
+        const gen = ++refreshArchivesGen;
         try {
-            archives = await api("GET", "/api/archives");
+            const data = await api("GET", "/api/archives");
+            if (gen !== refreshArchivesGen) return; // Stale response
+            archives = data;
             renderArchiveList();
             updateDetailProgress();
         } catch (e) { /* ignore */ }
@@ -621,6 +676,20 @@
     }
 
 
+    // Client-side archive selection (for batch operations)
+    let selectedArchiveIds = new Set();
+
+    function updateArchiveBatchActions() {
+        const bar = $("#archive-batch-actions");
+        if (!bar) return;
+        if (selectedArchiveIds.size > 0) {
+            bar.style.display = "";
+            $("#archive-batch-count").textContent = selectedArchiveIds.size + " selected";
+        } else {
+            bar.style.display = "none";
+        }
+    }
+
     function buildArchiveItem(a, idx, listScope) {
         const li = document.createElement("li");
         li.className = "archive-item";
@@ -632,8 +701,12 @@
                 <div class="grip-dots"><span></span><span></span></div>
                 <div class="grip-dots"><span></span><span></span></div>
             </div>
-            <div class="archive-checkbox" title="Enable download">
-                <input type="checkbox" ${a.download_enabled ? "checked" : ""} data-action="toggle-dl">
+            ${a.download_enabled
+                ? `<button class="queue-toggle queue-remove" data-action="queue-remove" title="Remove from queue"><svg viewBox="0 0 16 16" width="14" height="14"><rect x="3" y="7" width="10" height="2" rx="1" fill="currentColor"/></svg></button>`
+                : `<button class="queue-toggle queue-add" data-action="queue-add" title="Add to queue"><svg viewBox="0 0 16 16" width="14" height="14"><path d="M8 3a1 1 0 011 1v3h3a1 1 0 110 2H9v3a1 1 0 11-2 0V9H4a1 1 0 110-2h3V4a1 1 0 011-1z" fill="currentColor"/></svg></button>`
+            }
+            <div class="archive-checkbox">
+                <input type="checkbox" ${selectedArchiveIds.has(a.id) ? "checked" : ""} data-action="select">
             </div>
             <div class="archive-info" data-action="open">
                 <div class="archive-title">${escapeHtml(a.title || a.identifier)}</div>
@@ -667,8 +740,15 @@
         // Event delegation
         li.addEventListener("click", (e) => {
             const action = e.target.closest("[data-action]")?.dataset.action;
-            if (action === "toggle-dl") {
-                toggleArchiveDownload(a.id, e.target.checked);
+            if (action === "queue-add") {
+                toggleArchiveDownload(a.id, true);
+            } else if (action === "queue-remove") {
+                toggleArchiveDownload(a.id, false);
+            } else if (action === "select") {
+                const cb = li.querySelector("[data-action=select]");
+                if (cb.checked) selectedArchiveIds.add(a.id);
+                else selectedArchiveIds.delete(a.id);
+                updateArchiveBatchActions();
             } else if (action === "open") {
                 openArchiveDetail(a.id);
             } else if (action === "move-up") {
@@ -686,14 +766,20 @@
 
         // Drag and drop
         li.addEventListener("dragstart", (e) => {
+            isDragging = true;
             dragSrcId = a.id;
             dragSrcGroupId = null; // not a group drag
             li.classList.add("dragging");
             e.dataTransfer.effectAllowed = "move";
         });
         li.addEventListener("dragend", () => {
+            isDragging = false;
             li.classList.remove("dragging");
             $$(".archive-item").forEach((el) => el.classList.remove("drag-over"));
+            if (renderArchiveListPending) {
+                renderArchiveListPending = false;
+                renderArchiveList();
+            }
         });
         li.addEventListener("dragover", (e) => {
             if (dragSrcGroupId !== null) return; // don't accept group drags on archives
@@ -724,6 +810,11 @@
     }
 
     function renderArchiveList() {
+        // Suppress re-renders during drag to avoid breaking the DOM mid-drag
+        if (isDragging) {
+            renderArchiveListPending = true;
+            return;
+        }
         if (archives.length === 0 && groups.length === 0) {
             emptyState.style.display = "flex";
             archiveListEl.style.display = "none";
@@ -788,14 +879,20 @@
 
             // Group drag-and-drop
             header.addEventListener("dragstart", (e) => {
+                isDragging = true;
                 dragSrcGroupId = g.id;
                 dragSrcId = null;
                 header.classList.add("dragging");
                 e.dataTransfer.effectAllowed = "move";
             });
             header.addEventListener("dragend", () => {
+                isDragging = false;
                 header.classList.remove("dragging");
                 $$(".group-header").forEach((el) => el.classList.remove("drag-over"));
+                if (renderArchiveListPending) {
+                    renderArchiveListPending = false;
+                    renderArchiveList();
+                }
             });
             header.addEventListener("dragover", (e) => {
                 if (dragSrcGroupId === null) return; // only accept group drags
@@ -822,7 +919,16 @@
 
             // Group's archives (hidden if collapsed)
             if (!collapsed) {
+                let groupDividerInserted = false;
+                const groupQueued = groupArchives.filter((a) => a.download_enabled);
                 groupArchives.forEach((a, idx) => {
+                    if (!groupDividerInserted && groupQueued.length > 0 && !a.download_enabled) {
+                        groupDividerInserted = true;
+                        const div = document.createElement("li");
+                        div.className = "archive-queue-divider in-group";
+                        div.innerHTML = '<div class="queue-divider"><span>Not queued</span></div>';
+                        archiveListEl.appendChild(div);
+                    }
                     const li = buildArchiveItem(a, idx, groupArchives);
                     li.classList.add("in-group");
                     archiveListEl.appendChild(li);
@@ -839,15 +945,78 @@
         }
 
         // Ungrouped archives
+        let looseDividerInserted = false;
+        const looseQueued = looseArchives.filter((a) => a.download_enabled);
         looseArchives.forEach((a, idx) => {
+            if (!looseDividerInserted && looseQueued.length > 0 && !a.download_enabled) {
+                looseDividerInserted = true;
+                const div = document.createElement("li");
+                div.className = "archive-queue-divider";
+                div.innerHTML = '<div class="queue-divider"><span>Not queued</span></div>';
+                archiveListEl.appendChild(div);
+            }
             archiveListEl.appendChild(buildArchiveItem(a, idx, looseArchives));
         });
+
+        updateArchiveBatchActions();
     }
 
     async function toggleArchiveDownload(id, enabled) {
         await api("POST", `/api/archives/${id}/download`, { enabled });
         await refreshArchives();
         refreshStatus();
+    }
+
+    // --- Archive Batch Actions ---
+
+    async function archiveBatchScan() {
+        if (selectedArchiveIds.size === 0) return;
+        let queued = 0;
+        for (const aid of selectedArchiveIds) {
+            try { await api("POST", `/api/archives/${aid}/scan`); queued++; } catch (e) {}
+        }
+        addNotification(`Queued scan for ${queued} archive(s)`, "info");
+        selectedArchiveIds.clear();
+        updateArchiveBatchActions();
+    }
+
+    let pendingBatchArchiveProcessIds = null;
+
+    async function archiveBatchProcess() {
+        if (selectedArchiveIds.size === 0) return;
+        // Store archive IDs and open process modal; on confirm, process all
+        pendingBatchArchiveProcessIds = Array.from(selectedArchiveIds);
+        openProcessArchiveModal();
+    }
+
+    async function archiveBatchRetry() {
+        if (selectedArchiveIds.size === 0) return;
+        let total = 0;
+        for (const aid of selectedArchiveIds) {
+            try {
+                const result = await api("POST", `/api/archives/${aid}/retry`);
+                total += result.reset_count || 0;
+            } catch (e) {}
+        }
+        addNotification(`Retried ${total} failed file(s) across ${selectedArchiveIds.size} archive(s)`, "info");
+        selectedArchiveIds.clear();
+        updateArchiveBatchActions();
+        await refreshArchives();
+    }
+
+    async function archiveBatchDeleteFolders() {
+        if (selectedArchiveIds.size === 0) return;
+        const count = selectedArchiveIds.size;
+        if (!confirm(`Delete download folder(s) for ${count} selected archive(s)?\n\nThis will remove the downloaded files from disk but keep the archives in the list.`)) return;
+        const ids = Array.from(selectedArchiveIds);
+        let deleted = 0;
+        for (const aid of ids) {
+            try { const r = await api("POST", `/api/archives/${aid}/delete-folder`); if (r.ok) deleted++; } catch (e) {}
+        }
+        addNotification(`Deleted ${deleted} folder(s)`, "info");
+        selectedArchiveIds.clear();
+        updateArchiveBatchActions();
+        await refreshArchives();
     }
 
     async function moveArchive(fromIdx, toIdx) {
@@ -1004,6 +1173,7 @@
         currentSort = "priority";
         currentSortDir = "";
         fileSearchQuery = "";
+        selectedFileIds.clear();
         $("#file-sort").value = "priority";
         $("#file-search").value = "";
         pageHome.classList.remove("active");
@@ -1021,6 +1191,8 @@
 
     function closeDetail() {
         currentArchiveId = null;
+        selectedFileIds.clear();
+        updateBatchActions();
         pageDetail.classList.remove("active");
         pageHome.classList.add("active");
         refreshArchives();
@@ -1028,13 +1200,17 @@
 
     async function loadFiles() {
         if (!currentArchiveId) return;
+        const gen = ++loadFilesGen;
+        const archiveId = currentArchiveId;
         try {
             const searchParam = fileSearchQuery ? `&search=${encodeURIComponent(fileSearchQuery)}` : "";
             const dirParam = currentSortDir ? `&sort_dir=${currentSortDir}` : "";
-            const data = await api("GET", `/api/archives/${currentArchiveId}/files?page=${currentPage}&sort=${currentSort}${dirParam}${searchParam}`);
+            const data = await api("GET", `/api/archives/${archiveId}/files?page=${currentPage}&sort=${currentSort}${dirParam}${searchParam}`);
+            if (gen !== loadFilesGen || archiveId !== currentArchiveId) return; // Stale response
             renderFiles(data);
             if (data.progress) updateDetailProgressFromData(data.progress);
         } catch (e) {
+            if (gen !== loadFilesGen || archiveId !== currentArchiveId) return;
             fileListEl.innerHTML = `<tr><td colspan="5" style="text-align:center;padding:20px;color:var(--danger)">${escapeHtml(e.message)}</td></tr>`;
         }
     }
@@ -1081,10 +1257,25 @@
         updateSortArrows();
     }
 
+    // Client-side file selection (independent of download queue)
+    let selectedFileIds = new Set();
+
     function syncSelectAll() {
-        const boxes = fileListEl.querySelectorAll("input[type=checkbox]");
+        const boxes = fileListEl.querySelectorAll("input[type=checkbox][data-select-id]");
         const all = boxes.length > 0 && Array.from(boxes).every((cb) => cb.checked);
         $("#select-all-files").checked = all;
+        updateBatchActions();
+    }
+
+    function updateBatchActions() {
+        const bar = $("#batch-actions");
+        if (!bar) return;
+        if (selectedFileIds.size > 0) {
+            bar.style.display = "";
+            $("#batch-count").textContent = selectedFileIds.size + " selected";
+        } else {
+            bar.style.display = "none";
+        }
     }
 
     // --- File table header (dynamic based on sort mode) ---
@@ -1096,7 +1287,8 @@
         if (isPriority) {
             thead.innerHTML += '<th class="col-grip col-priority-sort" title="Download Order"></th>';
         }
-        thead.innerHTML += '<th class="col-check"><input type="checkbox" id="select-all-files" title="Select / deselect all files"></th>';
+        thead.innerHTML += '<th class="col-queue"></th>';
+        thead.innerHTML += '<th class="col-check"><input type="checkbox" id="select-all-files" title="Select / deselect all"></th>';
         thead.innerHTML += '<th class="col-name">Name</th>';
         thead.innerHTML += '<th class="col-size">Size</th>';
         thead.innerHTML += '<th class="col-modified">Modified</th>';
@@ -1105,7 +1297,7 @@
             thead.innerHTML += '<th class="col-priority"></th>';
         }
         // Show/hide reset order button based on sort mode
-        const resetBtn = $("#btn-reset-order");
+        const resetBtn = $("#btn-reset-queue-order");
         if (resetBtn) resetBtn.style.display = isPriority ? "" : "none";
         // Re-attach handlers
         $("#select-all-files").addEventListener("change", (e) => toggleSelectAll(e.target.checked));
@@ -1127,7 +1319,7 @@
     }
 
     function getColspan() {
-        return currentSort === "priority" ? 7 : 5;
+        return currentSort === "priority" ? 9 : 7;
     }
 
     // --- File drag-and-drop for priority mode ---
@@ -1157,10 +1349,10 @@
         const swapIdx = idx + direction;
         if (swapIdx < 0 || swapIdx >= rows.length) return;
 
-        // Only allow reorder among selected files (the top group in priority mode)
-        const thisSelected = rows[idx].querySelector("input[type=checkbox]").checked;
-        const swapSelected = rows[swapIdx].querySelector("input[type=checkbox]").checked;
-        if (!thisSelected || !swapSelected) return;
+        // Only allow reorder among queued files (the top group in priority mode)
+        const thisQueued = !!rows[idx].querySelector(".queue-remove");
+        const swapQueued = !!rows[swapIdx].querySelector(".queue-remove");
+        if (!thisQueued || !swapQueued) return;
 
         // Build new order of all file IDs from the current page rows
         const order = rows.map((r) => parseInt(r.dataset.fileId));
@@ -1193,9 +1385,9 @@
             tr.classList.remove("file-row-drag-over");
             if (fileDragSrcId === null || fileDragSrcId === fileId) return;
 
-            // Only rearrange among selected rows
+            // Only rearrange among queued rows
             const rows = Array.from(fileListEl.querySelectorAll("tr[data-file-id]"));
-            const selectedRows = rows.filter((r) => r.querySelector("input[type=checkbox]").checked);
+            const selectedRows = rows.filter((r) => !!r.querySelector(".queue-remove"));
             const fromIdx = selectedRows.findIndex((r) => r.dataset.fileId == fileDragSrcId);
             const toIdx = selectedRows.findIndex((r) => r.dataset.fileId == fileId);
             if (fromIdx === -1 || toIdx === -1) return;
@@ -1218,8 +1410,10 @@
         rebuildTableHeader();
         fileListEl.innerHTML = "";
 
-        // Sync the select-all header checkbox with actual state
-        $("#select-all-files").checked = !!all_selected;
+        // Sync the select-all header checkbox (only considers visible files)
+        const allChecked = files.length > 0 && files.every((f) => selectedFileIds.has(f.id));
+        $("#select-all-files").checked = allChecked;
+        updateBatchActions();
 
         if (files.length === 0) {
             fileListEl.innerHTML = `<tr><td colspan="${getColspan()}" style="text-align:center;padding:20px;color:var(--text-muted)">No files found.</td></tr>`;
@@ -1227,13 +1421,26 @@
             return;
         }
 
-        // In priority mode, identify the boundary between selected and unselected
-        // (server already sorts selected DESC, priority ASC)
-        const selectedFiles = isPriority ? files.filter((f) => f.selected && f.download_status !== "unknown") : [];
-        const lastSelectedIdx = isPriority ? selectedFiles.length - 1 : -1;
+        // In priority mode, identify the boundary between queued (selected) and non-queued
+        // queuedFiles excludes unknown files for priority button indexing
+        const queuedFiles = isPriority ? files.filter((f) => f.selected && f.download_status !== "unknown") : [];
+        const lastQueuedIdx = isPriority ? queuedFiles.length - 1 : -1;
+        let dividerInserted = false;
+        const hasQueued = isPriority && files.some((f) => f.selected);
+        const hasUnqueued = isPriority && files.some((f) => !f.selected);
+        const needsDivider = hasQueued && hasUnqueued;
 
         let hasChanges = false;
         files.forEach((f, idx) => {
+            // In priority mode, insert divider at the boundary between queued and non-queued files
+            if (needsDivider && !dividerInserted && !f.selected) {
+                dividerInserted = true;
+                const divTr = document.createElement("tr");
+                divTr.className = "queue-divider-row";
+                divTr.innerHTML = `<td colspan="${getColspan()}"><div class="queue-divider"><span>Not queued</span></div></td>`;
+                fileListEl.appendChild(divTr);
+            }
+
             const tr = document.createElement("tr");
             tr.dataset.fileId = f.id;
 
@@ -1254,26 +1461,59 @@
 
             const isUnknown = f.download_status === "unknown";
 
-            // Grip column (priority mode only, selected files only)
+            // Grip column (priority mode only, queued files only)
             if (isPriority) {
                 html += (f.selected && !isUnknown) ? buildGripCell() : '<td class="col-grip"></td>';
             }
 
-            if (isUnknown) {
-                html += `<td class="col-check"><input type="checkbox" disabled title="Unknown file — not in archive manifest" data-file-id="${f.id}"></td>`;
+            // Processing status (needed early for queue and name logic)
+            const procStatus = f.processing_status || "";
+
+            // Queue +/- column
+            // Don't allow queueing for processed/extracted files unless the source was deleted
+            const sourceDeleted = (f.download_status === "pending" && (procStatus === "completed" || procStatus === "extracted"));
+            const hasProcessedOutput = (procStatus === "completed" || procStatus === "extracted");
+            const hideQueue = isUnknown || (hasProcessedOutput && !sourceDeleted);
+            if (hideQueue) {
+                html += '<td class="col-queue"></td>';
+            } else if (f.selected) {
+                html += `<td class="col-queue"><button class="queue-toggle queue-remove" data-queue-id="${f.id}" title="Remove from queue">` +
+                    `<svg viewBox="0 0 16 16" width="14" height="14"><rect x="3" y="7" width="10" height="2" rx="1" fill="currentColor"/></svg></button></td>`;
             } else {
-                html += `<td class="col-check"><input type="checkbox" ${f.selected ? "checked" : ""} data-file-id="${f.id}"></td>`;
+                html += `<td class="col-queue"><button class="queue-toggle queue-add" data-queue-id="${f.id}" title="Add to queue">` +
+                    `<svg viewBox="0 0 16 16" width="14" height="14"><path d="M8 3a1 1 0 011 1v3h3a1 1 0 110 2H9v3a1 1 0 11-2 0V9H4a1 1 0 110-2h3V4a1 1 0 011-1z" fill="currentColor"/></svg></button></td>`;
             }
-            html += `<td class="col-name"><span class="file-name">${escapeHtml(f.name)}</span>${changeIcon}</td>`;
+
+            // Selection checkbox (client-side only, not tied to download queue)
+            html += `<td class="col-check"><input type="checkbox" ${selectedFileIds.has(f.id) ? "checked" : ""} data-select-id="${f.id}"></td>`;
+
+            // Name cell with hover action icons
+            const renameBtn = isUnknown
+                ? `<button class="file-action-btn" data-action="rename" data-file-id="${f.id}" data-file-name="${escapeHtml(f.name)}" title="Rename">` +
+                  `<svg viewBox="0 0 16 16" width="13" height="13"><path d="M12.15 2.85a1.2 1.2 0 00-1.7 0L3.5 9.8l-.8 3.5 3.5-.8 6.95-6.95a1.2 1.2 0 000-1.7z" fill="none" stroke="currentColor" stroke-width="1.3"/></svg></button>`
+                : "";
+            const deleteTitle = isUnknown ? "Delete file" : "Delete from disk";
+            html += `<td class="col-name"><div class="file-name-wrap">` +
+                renderFileName(f.name, sourceDeleted ? "file-name-deleted" : "") + changeIcon +
+                `<span class="file-actions">` +
+                renameBtn +
+                `<button class="file-action-btn" data-action="process" data-file-id="${f.id}" title="Process file">` +
+                `<svg viewBox="0 0 16 16" width="13" height="13"><path d="M4 2l9 6-9 6V2z" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/></svg></button>` +
+                `<button class="file-action-btn" data-action="rescan" data-file-id="${f.id}" title="Re-scan file">` +
+                `<svg viewBox="0 0 16 16" width="13" height="13"><path d="M8 2.5V1L5.5 3.5 8 6V4.5a3.5 3.5 0 11-3.16 5" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg></button>` +
+                `<button class="file-action-btn file-action-danger" data-action="delete" data-file-id="${f.id}" data-file-name="${escapeHtml(f.name)}" data-file-origin="${f.origin || 'manifest'}" title="${deleteTitle}">` +
+                `<svg viewBox="0 0 16 16" width="13" height="13"><path d="M5.5 2h5M3 4h10M6 4v8m4-8v8M4.5 4l.5 9h6l.5-9" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/></svg></button>` +
+                `</span></div></td>`;
+
             html += `<td class="col-size" style="text-align:right">${formatBytes(f.size)}</td>`;
             html += `<td class="col-modified">${formatDate(f.mtime)}</td>`;
             const displayStatus = formatFileStatus(f);
-            const procStatus = f.processing_status || "";
+            const isSkipped = !f.selected && f.download_status === "pending";
             const statusClass = procStatus === "completed" ? "processed"
                 : procStatus === "extracted" ? "processed"
                 : procStatus === "failed" ? "proc-failed"
                 : procStatus === "processing" || procStatus === "queued" ? "proc-active"
-                : displayStatus === "skipped" ? "skipped"
+                : isSkipped ? "skipped"
                 : f.download_status;
             const hasError = ((f.download_status === "failed" || f.download_status === "conflict" || f.download_status === "unknown") && f.error_message)
                 || (procStatus === "failed" && f.processing_error);
@@ -1287,11 +1527,11 @@
                 (f.download_status === "failed" ? `<button class="retry-file-btn" data-retry-file="${f.id}" title="Retry this file">&#x21bb;</button>` : "") +
                 `</td>`;
 
-            // Priority buttons (priority mode only, selected files only)
+            // Priority buttons (priority mode only, queued files only)
             if (isPriority) {
                 if (f.selected && !isUnknown) {
-                    const selIdx = selectedFiles.indexOf(f);
-                    html += buildPriorityCell(f.id, selIdx === 0, selIdx === lastSelectedIdx);
+                    const selIdx = queuedFiles.indexOf(f);
+                    html += buildPriorityCell(f.id, selIdx === 0, selIdx === lastQueuedIdx);
                 } else {
                     html += '<td class="col-priority"></td>';
                 }
@@ -1299,13 +1539,25 @@
 
             tr.innerHTML = html;
 
-            // Checkbox handler (skip for unknown files)
-            if (!isUnknown) {
-                tr.querySelector("input[type=checkbox]").addEventListener("change", (e) => {
-                    api("POST", `/api/files/${f.id}/select`, { selected: e.target.checked }).then(() => {
-                        if (isPriority) loadFiles(); // re-sort grouping
-                    });
+            // Selection checkbox handler
+            const selectCb = tr.querySelector("input[type=checkbox][data-select-id]");
+            if (selectCb) {
+                selectCb.addEventListener("change", (e) => {
+                    const fid = parseInt(e.target.dataset.selectId);
+                    if (e.target.checked) selectedFileIds.add(fid);
+                    else selectedFileIds.delete(fid);
                     syncSelectAll();
+                });
+            }
+
+            // Queue toggle handler
+            const queueBtn = tr.querySelector(".queue-toggle");
+            if (queueBtn) {
+                queueBtn.addEventListener("click", (e) => {
+                    e.stopPropagation();
+                    const fid = parseInt(queueBtn.dataset.queueId);
+                    const adding = queueBtn.classList.contains("queue-add");
+                    api("POST", `/api/files/${fid}/select`, { selected: adding }).then(() => loadFiles());
                 });
             }
 
@@ -1324,7 +1576,20 @@
                 });
             }
 
-            // Priority mode: drag & priority button handlers for selected files
+            // File action icons (rename, rescan, delete)
+            tr.querySelectorAll(".file-action-btn").forEach((btn) => {
+                btn.addEventListener("click", (e) => {
+                    e.stopPropagation();
+                    const action = btn.dataset.action;
+                    const fid = parseInt(btn.dataset.fileId);
+                    if (action === "rename") startInlineRename(tr, fid, btn.dataset.fileName);
+                    else if (action === "process") { pendingBatchProcessIds = [fid]; openProcessArchiveModal(); }
+                    else if (action === "rescan") rescanFile(fid);
+                    else if (action === "delete") confirmDeleteFile(fid, btn.dataset.fileName, btn.dataset.fileOrigin);
+                });
+            });
+
+            // Priority mode: drag & priority button handlers for queued files
             if (isPriority && f.selected && !isUnknown) {
                 attachPriorityDrag(tr, f.id);
                 const upBtn = tr.querySelector(`[data-move-up="${f.id}"]`);
@@ -1339,8 +1604,8 @@
             if (procStatus === "completed" || procStatus === "extracted") {
                 tr.classList.add("processed-expandable");
                 tr.addEventListener("click", (e) => {
-                    // Don't toggle when clicking checkbox or buttons
-                    if (e.target.closest("input, button, .file-error-hint")) return;
+                    // Don't toggle when clicking checkbox, buttons, or actions
+                    if (e.target.closest("input, button, .file-error-hint, .file-actions")) return;
                     toggleProcessedDetail(tr, f, isPriority);
                 });
             }
@@ -1381,17 +1646,13 @@
 
         // Show/hide clear highlights button
         $("#btn-clear-changes").style.display = hasChanges ? "" : "none";
+
+        // Add tooltips only where filenames are actually truncated
+        applyTruncationTooltips(fileListEl);
     }
 
     function formatFileStatus(f) {
-        if (!f.selected && f.download_status === "pending") {
-            return "skipped";
-        }
-        if (f.download_status === "downloading" && f.size > 0) {
-            const pct = ((f.downloaded_bytes / f.size) * 100).toFixed(1);
-            return `${pct}%`;
-        }
-        // Show processing status if present
+        // Show processing status first — it takes priority over download status
         if (f.processing_status && f.processing_status !== "") {
             if (f.processing_status === "completed") return "processed";
             if (f.processing_status === "extracted") return "extracted";
@@ -1400,10 +1661,25 @@
             if (f.processing_status === "failed") return "proc. failed";
             if (f.processing_status === "skipped") return "proc. skipped";
         }
+        if (!f.selected && f.download_status === "pending") {
+            if (f.downloaded_bytes > 0 && f.size > 0) {
+                const pct = ((f.downloaded_bytes / f.size) * 100).toFixed(1);
+                return `${pct}%`;
+            }
+            return "skipped";
+        }
+        if (f.download_status === "downloading" && f.size > 0) {
+            const pct = ((f.downloaded_bytes / f.size) * 100).toFixed(1);
+            return `${pct}%`;
+        }
+        if (f.download_status === "pending" && f.downloaded_bytes > 0 && f.size > 0) {
+            const pct = ((f.downloaded_bytes / f.size) * 100).toFixed(1);
+            return `${pct}%`;
+        }
         return f.download_status;
     }
 
-    function toggleProcessedDetail(tr, f, isPriority) {
+    async function toggleProcessedDetail(tr, f, isPriority) {
         // If already expanded, collapse
         const existing = tr.nextElementSibling;
         if (existing && existing.classList.contains("processed-detail-row")) {
@@ -1412,30 +1688,284 @@
             return;
         }
 
-        // Build list of output files
-        let outputFiles = [];
-        // Multi-file output (extraction)
-        if (f.processed_files_json) {
-            try { outputFiles = JSON.parse(f.processed_files_json); } catch (e) {}
-        }
-        // Single-file output (CHD, CSO, etc.)
-        if (outputFiles.length === 0 && f.processed_filename) {
-            outputFiles = [f.processed_filename];
+        // Fetch the actual on-disk tree from the server
+        let tree = [];
+        try {
+            const data = await api("GET", `/api/files/${f.id}/processed-tree`);
+            tree = data.tree || [];
+        } catch (e) {
+            // Fallback to DB data
+            let outputFiles = [];
+            if (f.processed_files_json) {
+                try { outputFiles = JSON.parse(f.processed_files_json); } catch (e2) {}
+            }
+            if (outputFiles.length === 0 && f.processed_filename) {
+                outputFiles = [f.processed_filename];
+            }
+            tree = outputFiles.map((p) => ({ name: p, path: p, type: "file", size: 0 }));
         }
 
-        if (outputFiles.length === 0) return;
+        if (tree.length === 0) return;
 
-        const colCount = isPriority ? 7 : 5;
+        const colCount = getColspan();
         const detailTr = document.createElement("tr");
         detailTr.classList.add("processed-detail-row");
-        let listHtml = '<ul class="processed-output-list">';
-        for (const name of outputFiles) {
-            listHtml += `<li>${escapeHtml(name)}</li>`;
+
+        function buildTreeHtml(nodes, depth) {
+            let html = `<ul class="processed-tree" style="padding-left:${depth > 0 ? 16 : 0}px">`;
+            for (const node of nodes) {
+                const icon = node.type === "dir"
+                    ? `<svg class="ptree-icon" viewBox="0 0 16 16" width="13" height="13"><path d="M14 4H8L6.5 2.5h-5l-.5.5v10l.5.5h13l.5-.5V4.5L14 4zM13 12H2V4h4l1.5 1.5H13V12z" fill="currentColor"/></svg>`
+                    : `<svg class="ptree-icon" viewBox="0 0 16 16" width="13" height="13"><path d="M3 1h6l4 4v10H3V1zm6 0v4h4" fill="none" stroke="currentColor" stroke-width="1.2"/></svg>`;
+                const sizeStr = node.size != null && node.size > 0 ? `<span class="ptree-size">${formatBytes(node.size)}</span>` : `<span class="ptree-size"></span>`;
+                const mtimeStr = node.mtime ? `<span class="ptree-mtime">${new Date(node.mtime * 1000).toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" })}</span>` : `<span class="ptree-mtime"></span>`;
+                const nameHtml = renderPtreeName(node.name);
+                html += `<li class="ptree-node" data-path="${escapeHtml(node.path)}" data-type="${node.type}" data-name="${escapeHtml(node.name)}">` +
+                    `<div class="ptree-row">${icon}${nameHtml}` +
+                    `<span class="ptree-actions">` +
+                    `<button class="ptree-btn" data-ptree-action="rename" title="Rename"><svg viewBox="0 0 16 16" width="11" height="11"><path d="M12.15 2.85a1.2 1.2 0 00-1.7 0L3.5 9.8l-.8 3.5 3.5-.8 6.95-6.95a1.2 1.2 0 000-1.7z" fill="none" stroke="currentColor" stroke-width="1.3"/></svg></button>` +
+                    `<button class="ptree-btn ptree-btn-danger" data-ptree-action="delete" title="Delete"><svg viewBox="0 0 16 16" width="11" height="11"><path d="M5.5 2h5M3 4h10M6 4v8m4-8v8M4.5 4l.5 9h6l.5-9" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/></svg></button>` +
+                    `</span>${sizeStr}${mtimeStr}</div>`;
+                if (node.type === "dir" && node.children && node.children.length > 0) {
+                    html += buildTreeHtml(node.children, depth + 1);
+                }
+                html += "</li>";
+            }
+            html += "</ul>";
+            return html;
         }
-        listHtml += "</ul>";
-        detailTr.innerHTML = `<td colspan="${colCount}" class="processed-detail-cell">${listHtml}</td>`;
+
+        let cellHtml = `<div class="processed-tree-wrap">` +
+            `<div class="processed-tree-header">` +
+            `<span class="processed-tree-label">Processed output</span>` +
+            `<button class="ptree-delete-all" data-file-id="${f.id}" title="Delete all processed files">Delete all</button>` +
+            `</div>` +
+            buildTreeHtml(tree, 0) +
+            `</div>`;
+        detailTr.innerHTML = `<td colspan="${colCount}" class="processed-detail-cell">${cellHtml}</td>`;
+
+        // Attach handlers
+        detailTr.querySelectorAll(".ptree-btn").forEach((btn) => {
+            btn.addEventListener("click", (e) => {
+                e.stopPropagation();
+                const li = btn.closest(".ptree-node");
+                const path = li.dataset.path;
+                const name = li.dataset.name;
+                const action = btn.dataset.ptreeAction;
+                if (action === "delete") {
+                    if (!confirm(`Delete "${name}"?`)) return;
+                    api("POST", `/api/files/${f.id}/delete-processed`, { filename: path }).then(() => {
+                        addNotification(`Deleted "${name}"`, "info");
+                        // Collapse and re-expand to refresh tree
+                        detailTr.remove();
+                        tr.classList.remove("expanded");
+                        loadFiles();
+                    }).catch((e2) => addNotification("Delete failed: " + e2.message, "error"));
+                } else if (action === "rename") {
+                    startProcessedRename(li, f.id, path, name);
+                }
+            });
+        });
+
+        // Delete all button
+        const deleteAllBtn = detailTr.querySelector(".ptree-delete-all");
+        if (deleteAllBtn) {
+            deleteAllBtn.addEventListener("click", (e) => {
+                e.stopPropagation();
+                if (!confirm("Delete all processed output files for this item?")) return;
+                api("POST", `/api/files/${f.id}/delete-processed`, { delete_all: true }).then(() => {
+                    addNotification("Deleted all processed files", "info");
+                    detailTr.remove();
+                    tr.classList.remove("expanded");
+                    loadFiles();
+                }).catch((e2) => addNotification("Delete failed: " + e2.message, "error"));
+            });
+        }
+
         tr.after(detailTr);
         tr.classList.add("expanded");
+        applyTruncationTooltips(detailTr);
+    }
+
+    // Track active rename so only one edit box is open at a time
+    let activeRenameCancel = null;
+
+    function cancelActiveRename() {
+        if (activeRenameCancel) {
+            const fn = activeRenameCancel;
+            activeRenameCancel = null;
+            fn();
+        }
+    }
+
+    function startProcessedRename(li, fileId, path, currentName) {
+        cancelActiveRename();
+        const row = li.querySelector(".ptree-row");
+        // Save original child nodes (with their event listeners intact)
+        const origChildren = Array.from(row.childNodes).map(n => n.cloneNode ? n : n);
+        origChildren.forEach(n => row.removeChild(n));
+
+        row.innerHTML = `<div class="inline-rename">` +
+            `<input type="text" class="rename-input" value="${escapeHtml(currentName)}">` +
+            `<button class="rename-confirm" title="Confirm"><svg viewBox="0 0 16 16" width="14" height="14"><path d="M3 8l3.5 3.5L13 5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></button>` +
+            `<button class="rename-cancel" title="Cancel"><svg viewBox="0 0 16 16" width="14" height="14"><path d="M4 4l8 8M12 4l-8 8" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></button>` +
+            `</div>`;
+        const input = row.querySelector(".rename-input");
+        input.focus();
+        input.select();
+
+        const restore = () => { row.innerHTML = ""; origChildren.forEach(n => row.appendChild(n)); };
+
+        const doRename = async () => {
+            activeRenameCancel = null;
+            const newName = input.value.trim();
+            if (newName && newName !== currentName) {
+                try {
+                    await api("POST", `/api/files/${fileId}/rename-processed`, { old_path: path, new_name: newName });
+                    loadFiles();
+                } catch (e) {
+                    addNotification("Rename failed: " + e.message, "error");
+                    restore();
+                }
+            } else {
+                restore();
+            }
+        };
+        const doCancel = () => { activeRenameCancel = null; restore(); };
+        activeRenameCancel = doCancel;
+
+        row.querySelector(".rename-confirm").addEventListener("click", (e) => { e.stopPropagation(); doRename(); });
+        row.querySelector(".rename-cancel").addEventListener("click", (e) => { e.stopPropagation(); doCancel(); });
+        input.addEventListener("keydown", (e) => {
+            if (e.key === "Enter") { e.preventDefault(); doRename(); }
+            else if (e.key === "Escape") { e.preventDefault(); doCancel(); }
+        });
+        input.addEventListener("click", (e) => e.stopPropagation());
+    }
+
+    // --- Inline Rename ---
+
+    function startInlineRename(tr, fileId, currentName) {
+        cancelActiveRename();
+        const nameCell = tr.querySelector(".col-name");
+        const wrap = nameCell.querySelector(".file-name-wrap");
+        // Save original child nodes (with their event listeners intact)
+        const origChildren = Array.from(wrap.childNodes);
+        origChildren.forEach(n => wrap.removeChild(n));
+
+        wrap.innerHTML = `<div class="inline-rename">` +
+            `<input type="text" class="rename-input" value="${escapeHtml(currentName)}">` +
+            `<button class="rename-confirm" title="Confirm">` +
+            `<svg viewBox="0 0 16 16" width="14" height="14"><path d="M3 8l3.5 3.5L13 5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></button>` +
+            `<button class="rename-cancel" title="Cancel">` +
+            `<svg viewBox="0 0 16 16" width="14" height="14"><path d="M4 4l8 8M12 4l-8 8" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></button>` +
+            `</div>`;
+        const input = wrap.querySelector(".rename-input");
+        input.focus();
+        input.select();
+
+        const restore = () => { wrap.innerHTML = ""; origChildren.forEach(n => wrap.appendChild(n)); };
+
+        const doRename = async () => {
+            activeRenameCancel = null;
+            const newName = input.value.trim();
+            if (newName && newName !== currentName) {
+                await api("POST", `/api/files/${fileId}/rename`, { name: newName });
+                loadFiles();
+            } else {
+                restore();
+            }
+        };
+        const doCancel = () => { activeRenameCancel = null; restore(); };
+        activeRenameCancel = doCancel;
+
+        wrap.querySelector(".rename-confirm").addEventListener("click", (e) => { e.stopPropagation(); doRename(); });
+        wrap.querySelector(".rename-cancel").addEventListener("click", (e) => { e.stopPropagation(); doCancel(); });
+        input.addEventListener("keydown", (e) => {
+            if (e.key === "Enter") { e.preventDefault(); doRename(); }
+            else if (e.key === "Escape") { e.preventDefault(); doCancel(); }
+        });
+        input.addEventListener("click", (e) => e.stopPropagation());
+    }
+
+    // --- Re-scan single file ---
+
+    async function rescanFile(fileId) {
+        try {
+            const result = await api("POST", `/api/files/${fileId}/scan`);
+            addNotification(`File scan: ${result.status}`, result.status === "completed" ? "success" : "warning");
+            loadFiles();
+        } catch (e) {
+            addNotification("File scan failed: " + e.message, "error");
+        }
+    }
+
+    // --- Delete single file ---
+
+    function confirmDeleteFile(fileId, fileName, origin) {
+        const removeFromDb = (origin === "scan" || origin === "unknown");
+        const msg = removeFromDb
+            ? `Delete "${fileName}"?\n\nThis will remove the file from disk and from the archive list.`
+            : `Delete "${fileName}" from disk?\n\nThe file will be removed from disk but kept in the archive list.`;
+        if (!confirm(msg)) return;
+        api("POST", `/api/files/${fileId}/delete`, { remove_from_db: removeFromDb }).then(() => {
+            addNotification(`Deleted "${fileName}"`, "info");
+            loadFiles();
+            refreshArchives();
+        }).catch((e) => addNotification("Delete failed: " + e.message, "error"));
+    }
+
+    // --- Batch actions ---
+
+    async function batchScanFiles() {
+        if (!currentArchiveId || selectedFileIds.size === 0) return;
+        const ids = Array.from(selectedFileIds);
+        let done = 0;
+        for (const fid of ids) {
+            try { await api("POST", `/api/files/${fid}/scan`); done++; } catch (e) {}
+        }
+        addNotification(`Scanned ${done}/${ids.length} files`, "info");
+        selectedFileIds.clear();
+        loadFiles();
+    }
+
+    async function batchProcessFiles() {
+        if (!currentArchiveId || selectedFileIds.size === 0) return;
+        // Open the process modal with file_ids pre-set
+        pendingBatchProcessIds = Array.from(selectedFileIds);
+        openProcessArchiveModal();
+    }
+
+    let pendingBatchProcessIds = null;
+
+    async function batchRetryFiles() {
+        if (!currentArchiveId || selectedFileIds.size === 0) return;
+        const ids = Array.from(selectedFileIds);
+        try {
+            const result = await api("POST", `/api/archives/${currentArchiveId}/files/batch-retry`, { file_ids: ids });
+            addNotification(`Retried ${result.reset_count} failed files`, "info");
+            selectedFileIds.clear();
+            loadFiles();
+            refreshArchives();
+        } catch (e) {
+            addNotification("Retry failed: " + e.message, "error");
+        }
+    }
+
+    async function batchDeleteFiles() {
+        if (!currentArchiveId || selectedFileIds.size === 0) return;
+        const count = selectedFileIds.size;
+        if (!confirm(`Delete ${count} selected file(s)?\n\nThis will remove them from the archive list and delete them from disk if present.`)) return;
+        const ids = Array.from(selectedFileIds);
+        try {
+            const result = await api("POST", `/api/archives/${currentArchiveId}/files/batch-delete`, { file_ids: ids });
+            addNotification(`Deleted ${result.deleted} files`, "info");
+            selectedFileIds.clear();
+            loadFiles();
+            refreshArchives();
+        } catch (e) {
+            addNotification("Batch delete failed: " + e.message, "error");
+        }
     }
 
     function updateFileRow(fileId, updates) {
@@ -1614,10 +2144,6 @@
             default_enable_archive: $("#set-default-enable-archive").checked,
             default_select_all: $("#set-default-select-all").checked,
             schedule: JSON.stringify(collectScheduleRules()),
-            tool_chdman: $("#set-tool-chdman").value,
-            tool_maxcso: $("#set-tool-maxcso").value,
-            tool_7z: $("#set-tool-7z").value,
-            tool_unrar: $("#set-tool-unrar").value,
             processing_temp_dir: $("#set-processing-temp-dir").value,
             debug_enabled: $("#set-debug-enabled").checked,
             debug_log_file: $("#set-debug-log-file").value,
@@ -1650,11 +2176,6 @@
             $("#set-old-password").value = "";
             $("#set-new-password").value = "";
             $("#pw-change-error").textContent = "";
-            // Tool paths
-            $("#set-tool-chdman").value = s.tool_chdman_path || "";
-            $("#set-tool-maxcso").value = s.tool_maxcso_path || "";
-            $("#set-tool-7z").value = s.tool_7z_path || "";
-            $("#set-tool-unrar").value = s.tool_unrar_path || "";
             $("#set-processing-temp-dir").value = s.processing_temp_dir || "";
             // Debug settings
             $("#set-debug-enabled").checked = s.debug_enabled === "1";
@@ -1706,10 +2227,6 @@
             default_enable_archive: $("#set-default-enable-archive").checked ? "1" : "0",
             default_select_all: $("#set-default-select-all").checked ? "1" : "0",
             speed_schedule: JSON.stringify(collectScheduleRules()),
-            tool_chdman_path: $("#set-tool-chdman").value,
-            tool_maxcso_path: $("#set-tool-maxcso").value,
-            tool_7z_path: $("#set-tool-7z").value,
-            tool_unrar_path: $("#set-tool-unrar").value,
             processing_temp_dir: $("#set-processing-temp-dir").value,
             debug_enabled: $("#set-debug-enabled").checked ? "1" : "0",
             debug_log_file: $("#set-debug-log-file").value,
@@ -1847,10 +2364,16 @@
 
     // --- Select All Files ---
 
-    async function toggleSelectAll(checked) {
+    function toggleSelectAll(checked) {
         if (!currentArchiveId) return;
-        await api("POST", `/api/archives/${currentArchiveId}/files/select-all`, { selected: checked });
-        loadFiles();
+        const boxes = fileListEl.querySelectorAll("input[type=checkbox][data-select-id]");
+        boxes.forEach((cb) => {
+            cb.checked = checked;
+            const fid = parseInt(cb.dataset.selectId);
+            if (checked) selectedFileIds.add(fid);
+            else selectedFileIds.delete(fid);
+        });
+        updateBatchActions();
     }
 
     // --- Reset Download Order ---
@@ -1863,8 +2386,8 @@
             doResetOrder();
             return;
         }
-        $("#reset-order-suppress").checked = false;
-        $("#modal-reset-order").classList.add("open");
+        $("#reset-queue-order-suppress").checked = false;
+        $("#modal-reset-queue-order").classList.add("open");
     }
 
     async function doResetOrder() {
@@ -2231,27 +2754,40 @@
     // --- Tool Detection ---
 
     async function detectAndShowTools() {
+        const container = $("#processing-tools-status");
+        if (!container) return;
+        container.textContent = "Detecting tools\u2026";
         try {
             const tools = await api("GET", "/api/processing/tools");
+            const table = document.createElement("table");
+            table.className = "tools-status-table";
             for (const [name, info] of Object.entries(tools)) {
-                const statusEl = $(`#tool-${name}-status`);
-                if (statusEl) {
-                    if (info.available) {
-                        statusEl.textContent = `Detected: ${info.path} (${info.version || "unknown version"})`;
-                        statusEl.style.color = "var(--accent)";
-                    } else {
-                        statusEl.textContent = "Not found";
-                        statusEl.style.color = "var(--text-muted)";
-                    }
+                const tr = document.createElement("tr");
+                const tdName = document.createElement("td");
+                tdName.textContent = name;
+                const tdStatus = document.createElement("td");
+                if (info.available) {
+                    tdStatus.innerHTML =
+                        '<span class="tool-found">Detected</span> <span class="tool-version">' +
+                        (info.version || "unknown version") + "</span>";
+                } else {
+                    tdStatus.innerHTML = '<span class="tool-missing">Not found</span>';
                 }
+                tr.appendChild(tdName);
+                tr.appendChild(tdStatus);
+                table.appendChild(tr);
             }
-        } catch (e) { /* ignore */ }
+            container.innerHTML = "";
+            container.appendChild(table);
+        } catch (e) {
+            container.textContent = "Failed to detect tools.";
+        }
     }
 
     // --- Process Archive Modal ---
 
     async function openProcessArchiveModal() {
-        if (!currentArchiveId) return;
+        if (!currentArchiveId && !pendingBatchArchiveProcessIds) return;
         await loadProcessorTypes();
         const profiles = await loadProcessingProfiles();
         const select = $("#process-profile-select");
@@ -2296,22 +2832,37 @@
 
     async function confirmProcessArchive() {
         const profileId = parseInt($("#process-profile-select").value);
-        if (!profileId || !currentArchiveId) return;
         const options = collectOptions($("#process-profile-options"));
         const autoProcess = $("#process-auto-future").checked;
-        try {
-            const resp = await api("POST", `/api/archives/${currentArchiveId}/process`, {
-                profile_id: profileId,
-                options,
-                auto_process: autoProcess,
-            });
-            if (resp.queued) {
-                addNotification(`Processing queued for "${getArchiveName(currentArchiveId)}"`, "info");
+        const fileIds = pendingBatchProcessIds || undefined;
+        pendingBatchProcessIds = null;
+
+        // Batch archive processing
+        const archiveIds = pendingBatchArchiveProcessIds || (currentArchiveId ? [currentArchiveId] : []);
+        pendingBatchArchiveProcessIds = null;
+
+        if (!profileId || archiveIds.length === 0) return;
+
+        let queued = 0;
+        for (const aid of archiveIds) {
+            try {
+                const body = { profile_id: profileId, options, auto_process: autoProcess };
+                if (fileIds) body.file_ids = fileIds;
+                const resp = await api("POST", `/api/archives/${aid}/process`, body);
+                if (resp.queued) queued++;
+            } catch (e) {
+                addNotification(`Processing failed for archive ${aid}: ${e.message}`, "error");
             }
-            // If not queued, SSE progress events will show the processing notification
-        } catch (e) {
-            addNotification(`Processing failed: ${e.message}`, "error");
         }
+        if (queued > 0) {
+            if (archiveIds.length === 1) {
+                addNotification(`Processing queued for "${getArchiveName(archiveIds[0])}"`, "info");
+            } else {
+                addNotification(`Processing queued for ${queued} archive(s)`, "info");
+            }
+        }
+        selectedArchiveIds.clear();
+        updateArchiveBatchActions();
         $("#modal-process-archive").classList.remove("open");
     }
 
@@ -2453,6 +3004,12 @@
             $("#notif-popup").classList.remove("open");
         });
 
+        // Archive batch actions
+        $("#archive-batch-scan").addEventListener("click", archiveBatchScan);
+        $("#archive-batch-process").addEventListener("click", archiveBatchProcess);
+        $("#archive-batch-retry").addEventListener("click", archiveBatchRetry);
+        $("#archive-batch-delete-folders").addEventListener("click", archiveBatchDeleteFolders);
+
         // Groups
         $("#btn-add-group").addEventListener("click", openCreateGroup);
         $("#btn-group-create-cancel").addEventListener("click", () => $("#modal-create-group").classList.remove("open"));
@@ -2470,11 +3027,11 @@
         $("#btn-force-resume-confirm").addEventListener("click", doForceResume);
 
         // Reset download order
-        $("#btn-reset-order").addEventListener("click", confirmResetOrder);
-        $("#btn-reset-order-cancel").addEventListener("click", () => $("#modal-reset-order").classList.remove("open"));
-        $("#btn-reset-order-confirm").addEventListener("click", () => {
-            const suppress = $("#reset-order-suppress").checked;
-            $("#modal-reset-order").classList.remove("open");
+        $("#btn-reset-queue-order").addEventListener("click", confirmResetOrder);
+        $("#btn-reset-queue-order-cancel").addEventListener("click", () => $("#modal-reset-queue-order").classList.remove("open"));
+        $("#btn-reset-queue-order-confirm").addEventListener("click", () => {
+            const suppress = $("#reset-queue-order-suppress").checked;
+            $("#modal-reset-queue-order").classList.remove("open");
             if (suppress) {
                 confirmResetSetting = false;
                 api("POST", "/api/settings", { confirm_reset_order: "0" });
@@ -2488,8 +3045,14 @@
         $("#btn-retry-all").addEventListener("click", () => { if (currentArchiveId) retryArchive(currentArchiveId); });
         $("#btn-refresh-meta").addEventListener("click", refreshMetadata);
         $("#btn-scan-files").addEventListener("click", scanExistingFiles);
-        $("#btn-process-archive").addEventListener("click", openProcessArchiveModal);
+        $("#btn-process-all-files").addEventListener("click", openProcessArchiveModal);
         $("#btn-clear-changes").addEventListener("click", clearChanges);
+
+        // Batch actions
+        $("#batch-scan").addEventListener("click", batchScanFiles);
+        $("#batch-process").addEventListener("click", batchProcessFiles);
+        $("#batch-retry").addEventListener("click", batchRetryFiles);
+        $("#batch-delete").addEventListener("click", batchDeleteFiles);
 
         // Process Archive modal
         $("#btn-process-cancel").addEventListener("click", () => $("#modal-process-archive").classList.remove("open"));

@@ -108,6 +108,13 @@
                 <p>No archives added yet.</p>
                 <p>Click <strong>Add</strong> to get started.</p>
             </div>
+            <div class="batch-actions" id="archive-batch-actions" style="display:none">
+                <span class="batch-count" id="archive-batch-count">0 selected</span>
+                <button class="action-btn batch-btn" id="archive-batch-scan" title="Scan selected archives for existing files">Scan Existing Files</button>
+                <button class="action-btn batch-btn" id="archive-batch-process" title="Process selected archives">Process Archive</button>
+                <button class="action-btn batch-btn" id="archive-batch-retry" title="Retry all failed files in selected archives">Retry All Files</button>
+                <button class="action-btn batch-btn batch-btn-danger" id="archive-batch-delete-folders" title="Delete download folders from disk">Delete Folder(s)</button>
+            </div>
             <ul id="archive-list" class="archive-list"></ul>
         </section>
 
@@ -125,15 +132,24 @@
                 </div>
             </div>
             <div class="detail-controls">
-                <button class="action-btn" id="btn-retry-all" title="Reset all failed files to pending">Retry Failed</button>
+                <button class="action-btn" id="btn-retry-all" title="Reset all failed files to pending">Retry All</button>
                 <button class="action-btn" id="btn-refresh-meta" title="Re-check Internet Archive for file list changes">Refresh Metadata</button>
-                <button class="action-btn" id="btn-scan-files" title="Scan local folder for existing files that match this archive">Scan Existing Files</button>
-                <button class="action-btn" id="btn-process-archive" title="Convert downloaded files (e.g. to CHD or CISO)">Process Archive</button>
-                <button class="action-btn" id="btn-reset-order" title="Reset download order to alphabetical" style="display:none">Reset Order</button>
+                <button class="action-btn" id="btn-scan-files" title="Scan local folder for existing files that match this archive">Scan For Existing Files</button>
+                <button class="action-btn" id="btn-process-all-files" title="Convert downloaded files (e.g. to CHD or CISO)">Process All Files</button>
+                <button class="action-btn" id="btn-reset-queue-order" title="Reset download order to alphabetical" style="display:none">Reset Queue Order</button>
                 <button class="action-btn" id="btn-clear-changes" title="Dismiss change highlights" style="display:none">
                     <svg viewBox="0 0 24 24" width="16" height="16"><path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z" fill="currentColor"/></svg>
                     Clear Highlights
                 </button>
+            </div>
+            <div class="batch-actions" id="batch-actions" style="display:none">
+                <span class="batch-count" id="batch-count">0 selected</span>
+                <button class="action-btn batch-btn" id="batch-scan" title="Scan selected files against disk">Scan Existing Files</button>
+                <button class="action-btn batch-btn" id="batch-process" title="Process selected files">Process Files</button>
+                <button class="action-btn batch-btn" id="batch-retry" title="Retry failed among selected">Retry Files</button>
+                <button class="action-btn batch-btn batch-btn-danger" id="batch-delete" title="Delete selected files">Delete Files</button>
+            </div>
+            <div class="file-toolbar">
                 <div class="file-search">
                     <svg viewBox="0 0 24 24" width="14" height="14"><path d="M15.5 14h-.79l-.28-.27A6.471 6.471 0 0016 9.5 6.5 6.5 0 109.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z" fill="currentColor"/></svg>
                     <input type="text" id="file-search" placeholder="Filter files…">
@@ -153,6 +169,7 @@
                 <table class="file-table">
                     <thead>
                         <tr>
+                            <th class="col-queue"></th>
                             <th class="col-check"><input type="checkbox" id="select-all-files" title="Select / deselect all files"></th>
                             <th class="col-name">Name</th>
                             <th class="col-size">Size</th>
@@ -344,25 +361,9 @@
                         <p class="settings-desc">Convert downloaded files (e.g. zipped disc images to CHD or CISO). Create profiles here, then use "Process Archive" in the archive detail view.</p>
 
                         <h4 class="settings-subheading">External Tools</h4>
-                        <p class="settings-desc">Grabia auto-detects tools on your PATH. Override paths here if needed.</p>
+                        <p class="settings-desc">Grabia auto-detects tools on your system PATH. Install tools via your package manager (e.g. <code>apt install mame-tools p7zip-full unrar</code>).</p>
                         <div class="settings-form" id="processing-tools-form">
                             <div id="processing-tools-status"></div>
-                            <label>chdman path
-                                <input type="text" id="set-tool-chdman" placeholder="Auto-detect">
-                                <small id="tool-chdman-status"></small>
-                            </label>
-                            <label>maxcso path
-                                <input type="text" id="set-tool-maxcso" placeholder="Auto-detect">
-                                <small id="tool-maxcso-status"></small>
-                            </label>
-                            <label>7z path
-                                <input type="text" id="set-tool-7z" placeholder="Auto-detect">
-                                <small id="tool-7z-status"></small>
-                            </label>
-                            <label>unrar path
-                                <input type="text" id="set-tool-unrar" placeholder="Auto-detect">
-                                <small id="tool-unrar-status"></small>
-                            </label>
                             <label>Temp directory
                                 <input type="text" id="set-processing-temp-dir" placeholder="Default: alongside download">
                                 <small>Temporary directory for extraction during processing. Leave blank to use the download directory.</small>
@@ -416,17 +417,17 @@
     </div>
 
     <!-- Reset Download Order Modal -->
-    <div class="modal-overlay" id="modal-reset-order">
+    <div class="modal-overlay" id="modal-reset-queue-order">
         <div class="modal">
-            <h3>Reset Download Order</h3>
+            <h3>Reset Queue Order</h3>
             <p>This will reset the download priority of all files in this archive back to alphabetical order by filename. Any custom ordering you have set will be lost.</p>
             <label class="checkbox-label modal-suppress">
-                <input type="checkbox" id="reset-order-suppress">
+                <input type="checkbox" id="reset-queue-order-suppress">
                 Don't show this warning again
             </label>
             <div class="modal-actions">
-                <button class="action-btn" id="btn-reset-order-cancel">Cancel</button>
-                <button class="action-btn danger" id="btn-reset-order-confirm">Reset Order</button>
+                <button class="action-btn" id="btn-reset-queue-order-cancel">Cancel</button>
+                <button class="action-btn danger" id="btn-reset-queue-order-confirm">Reset Queue Order</button>
             </div>
         </div>
     </div>
