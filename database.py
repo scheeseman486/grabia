@@ -123,6 +123,34 @@ def init_db():
             options_json TEXT NOT NULL DEFAULT '{}',
             position INTEGER NOT NULL DEFAULT 0
         );
+
+        CREATE TABLE IF NOT EXISTS notifications (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            message TEXT NOT NULL,
+            type TEXT NOT NULL DEFAULT 'info',
+            created_at REAL NOT NULL,
+            progress REAL DEFAULT NULL,
+            scan_archive_id INTEGER DEFAULT NULL,
+            processing_archive_id INTEGER DEFAULT NULL,
+            adding_archive INTEGER NOT NULL DEFAULT 0,
+            dismissed INTEGER NOT NULL DEFAULT 0
+        );
+
+        CREATE TABLE IF NOT EXISTS processing_jobs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            archive_id INTEGER NOT NULL,
+            profile_id INTEGER NOT NULL,
+            file_ids_json TEXT DEFAULT NULL,
+            options_override_json TEXT DEFAULT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            error_message TEXT NOT NULL DEFAULT '',
+            started_at REAL DEFAULT NULL,
+            completed_at REAL DEFAULT NULL,
+            created_at REAL NOT NULL,
+            position INTEGER NOT NULL DEFAULT 0,
+            FOREIGN KEY (archive_id) REFERENCES archives(id) ON DELETE CASCADE,
+            FOREIGN KEY (profile_id) REFERENCES processing_profiles(id) ON DELETE CASCADE
+        );
     """)
 
     # Default settings
@@ -246,6 +274,18 @@ def init_db():
             conn.execute("UPDATE archives SET status = 'partial' WHERE id = ?", (aid,))
         else:
             conn.execute("UPDATE archives SET status = 'idle' WHERE id = ?", (aid,))
+
+    # Reset interrupted processing jobs back to pending so the worker picks them up.
+    # Jobs stuck in 'running' mean the server crashed mid-processing.
+    conn.execute("UPDATE processing_jobs SET status = 'pending', started_at = NULL WHERE status = 'running'")
+
+    # Clean up stale in-progress notifications (scan/processing that were mid-flight)
+    conn.execute("""
+        DELETE FROM notifications
+        WHERE dismissed = 0
+          AND (scan_archive_id IS NOT NULL OR processing_archive_id IS NOT NULL OR adding_archive = 1)
+          AND progress IS NOT NULL
+    """)
 
     conn.commit()
     conn.close()
@@ -1112,3 +1152,203 @@ def get_processing_queue_files(archive_id):
             (archive_id,),
         ).fetchall()
         return [dict(r) for r in rows]
+
+
+# --- Notifications ---
+
+def create_notification(message, type="info", progress=None, scan_archive_id=None,
+                        processing_archive_id=None, adding_archive=False):
+    """Create a persistent notification and return its ID."""
+    with _db() as conn:
+        conn.execute(
+            """INSERT INTO notifications (message, type, created_at, progress, scan_archive_id,
+               processing_archive_id, adding_archive)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (message, type, time.time(), progress, scan_archive_id,
+             processing_archive_id, 1 if adding_archive else 0),
+        )
+        nid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        conn.commit()
+        return nid
+
+
+def update_notification(notif_id, **kwargs):
+    """Update fields on a notification. Supported: message, type, progress, dismissed."""
+    allowed = {"message", "type", "progress", "dismissed"}
+    updates = {k: v for k, v in kwargs.items() if k in allowed}
+    if not updates:
+        return
+    set_clause = ", ".join(f"{k} = ?" for k in updates)
+    values = list(updates.values()) + [notif_id]
+    with _db() as conn:
+        conn.execute(f"UPDATE notifications SET {set_clause} WHERE id = ?", values)
+        conn.commit()
+
+
+def dismiss_notification(notif_id):
+    """Mark a notification as dismissed."""
+    update_notification(notif_id, dismissed=1)
+
+
+def delete_notification(notif_id):
+    """Permanently delete a notification."""
+    with _db() as conn:
+        conn.execute("DELETE FROM notifications WHERE id = ?", (notif_id,))
+        conn.commit()
+
+
+def get_notifications(include_dismissed=False):
+    """Return all notifications, newest first."""
+    with _db() as conn:
+        if include_dismissed:
+            rows = conn.execute("SELECT * FROM notifications ORDER BY created_at DESC").fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM notifications WHERE dismissed = 0 ORDER BY created_at DESC"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_notification(notif_id):
+    """Return a single notification by ID."""
+    with _db() as conn:
+        row = conn.execute("SELECT * FROM notifications WHERE id = ?", (notif_id,)).fetchone()
+        return dict(row) if row else None
+
+
+def clear_notifications():
+    """Dismiss all non-active notifications (those without ongoing scan/processing/adding)."""
+    with _db() as conn:
+        conn.execute("""
+            UPDATE notifications SET dismissed = 1
+            WHERE dismissed = 0
+              AND scan_archive_id IS NULL
+              AND processing_archive_id IS NULL
+              AND adding_archive = 0
+        """)
+        conn.commit()
+
+
+def find_notification_by_scan(archive_id):
+    """Find the active (non-dismissed) scan notification for an archive."""
+    with _db() as conn:
+        row = conn.execute(
+            "SELECT * FROM notifications WHERE scan_archive_id = ? AND dismissed = 0",
+            (archive_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def find_notification_by_processing(archive_id):
+    """Find the active (non-dismissed) processing notification for an archive."""
+    with _db() as conn:
+        row = conn.execute(
+            "SELECT * FROM notifications WHERE processing_archive_id = ? AND dismissed = 0",
+            (archive_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+# --- Processing Jobs ---
+
+def create_processing_job(archive_id, profile_id, file_ids=None, options_override=None):
+    """Create a new processing job and return its ID."""
+    with _db() as conn:
+        position = conn.execute(
+            "SELECT COALESCE(MAX(position), -1) + 1 FROM processing_jobs WHERE status = 'pending'"
+        ).fetchone()[0]
+        conn.execute(
+            """INSERT INTO processing_jobs
+               (archive_id, profile_id, file_ids_json, options_override_json, status, created_at, position)
+               VALUES (?, ?, ?, ?, 'pending', ?, ?)""",
+            (archive_id, profile_id,
+             json.dumps(file_ids) if file_ids else None,
+             json.dumps(options_override) if options_override else None,
+             time.time(), position),
+        )
+        job_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        conn.commit()
+        return job_id
+
+
+def get_next_processing_job():
+    """Get the next pending processing job (FIFO by position)."""
+    with _db() as conn:
+        row = conn.execute(
+            "SELECT * FROM processing_jobs WHERE status = 'pending' ORDER BY position ASC LIMIT 1"
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def claim_processing_job(job_id):
+    """Atomically claim a pending job by setting status to 'running'."""
+    with _db() as conn:
+        conn.execute(
+            "UPDATE processing_jobs SET status = 'running', started_at = ? WHERE id = ? AND status = 'pending'",
+            (time.time(), job_id),
+        )
+        changed = conn.execute("SELECT changes()").fetchone()[0]
+        conn.commit()
+        return changed > 0
+
+
+def complete_processing_job(job_id, error_message=None):
+    """Mark a processing job as completed or failed."""
+    status = "failed" if error_message else "completed"
+    with _db() as conn:
+        conn.execute(
+            "UPDATE processing_jobs SET status = ?, error_message = ?, completed_at = ? WHERE id = ?",
+            (status, error_message or "", time.time(), job_id),
+        )
+        conn.commit()
+
+
+def cancel_processing_job(job_id):
+    """Cancel a pending or running processing job."""
+    with _db() as conn:
+        conn.execute(
+            "UPDATE processing_jobs SET status = 'cancelled', completed_at = ? WHERE id = ? AND status IN ('pending', 'running')",
+            (time.time(), job_id),
+        )
+        changed = conn.execute("SELECT changes()").fetchone()[0]
+        conn.commit()
+        return changed > 0
+
+
+def get_processing_job(job_id):
+    """Return a single processing job by ID."""
+    with _db() as conn:
+        row = conn.execute("SELECT * FROM processing_jobs WHERE id = ?", (job_id,)).fetchone()
+        return dict(row) if row else None
+
+
+def get_processing_jobs(status=None):
+    """Return processing jobs, optionally filtered by status."""
+    with _db() as conn:
+        if status:
+            rows = conn.execute(
+                "SELECT * FROM processing_jobs WHERE status = ? ORDER BY position ASC",
+                (status,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM processing_jobs ORDER BY created_at DESC"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_active_processing_job_for_archive(archive_id):
+    """Check if there's an active (pending/running) processing job for an archive."""
+    with _db() as conn:
+        row = conn.execute(
+            "SELECT * FROM processing_jobs WHERE archive_id = ? AND status IN ('pending', 'running') LIMIT 1",
+            (archive_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def count_pending_processing_jobs():
+    """Return count of pending processing jobs."""
+    with _db() as conn:
+        row = conn.execute("SELECT COUNT(*) as cnt FROM processing_jobs WHERE status = 'pending'").fetchone()
+        return row["cnt"]

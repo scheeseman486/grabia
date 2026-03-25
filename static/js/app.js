@@ -65,23 +65,49 @@
     let notifIdCounter = 0;
 
     function addNotification(message, type = "info") {
-        const notif = { id: ++notifIdCounter, message, type, time: new Date() };
-        notifications.unshift(notif);
-        renderNotifBadge();
-        renderNotifList();
+        // Create a server-side notification; add from response immediately
+        // (SSE notification_created will be deduped by ID check)
+        api("POST", "/api/notifications", { message, type }).then((notif) => {
+            if (!notifications.find(n => n.id === notif.id)) {
+                notifications.unshift(notif);
+                renderNotifBadge();
+                renderNotifList();
+            }
+        }).catch(() => {
+            // Fallback: add client-side only
+            const notif = { id: "local-" + (++notifIdCounter), message, type, created_at: Date.now() / 1000 };
+            notifications.unshift(notif);
+            renderNotifBadge();
+            renderNotifList();
+        });
         showToast(message, type);
     }
 
     function removeNotification(id) {
+        // Dismiss on server (skip for local-only IDs)
+        if (typeof id === "number") {
+            api("DELETE", "/api/notifications/" + id).catch(() => {});
+        }
         notifications = notifications.filter((n) => n.id !== id);
         renderNotifBadge();
         renderNotifList();
     }
 
     function clearAllNotifications() {
-        notifications = notifications.filter((n) => n.scanArchiveId || n.processingArchiveId || n.addingArchive);
+        api("POST", "/api/notifications/clear").catch(() => {});
+        notifications = notifications.filter((n) =>
+            n.scan_archive_id != null || n.processing_archive_id != null || (n.adding_archive && n.adding_archive !== 0)
+        );
         renderNotifBadge();
         renderNotifList();
+    }
+
+    function loadNotifications() {
+        api("GET", "/api/notifications").then((notifs) => {
+            notifications = notifs;
+            renderNotifBadge();
+            renderNotifList();
+        }).catch(() => {});
     }
 
     function renderNotifBadge() {
@@ -104,8 +130,10 @@
         notifications.forEach((n) => {
             const div = document.createElement("div");
             div.className = "notif-item notif-" + n.type;
-            const ago = formatTimeAgo(n.time);
-            const hasProgress = n.progress !== undefined;
+            // Support both server (created_at as unix timestamp) and legacy (time as Date)
+            const notifTime = n.created_at ? new Date(n.created_at * 1000) : (n.time || new Date());
+            const ago = formatTimeAgo(notifTime);
+            const hasProgress = n.progress !== undefined && n.progress !== null;
             let progressHtml = "";
             if (hasProgress) {
                 if (n.progress >= 0) {
@@ -114,10 +142,10 @@
                     progressHtml = `<div class="notif-progress-track"><div class="notif-progress-fill indeterminate"></div></div>`;
                 }
             }
-            const cancelHtml = n.scanArchiveId
-                ? `<button class="notif-cancel" data-cancel-type="scan" data-cancel-archive="${n.scanArchiveId}">Cancel</button>`
-                : n.processingArchiveId
-                ? `<button class="notif-cancel" data-cancel-type="process" data-cancel-archive="${n.processingArchiveId}">Cancel</button>`
+            const cancelHtml = n.scan_archive_id
+                ? `<button class="notif-cancel" data-cancel-type="scan" data-cancel-archive="${n.scan_archive_id}">Cancel</button>`
+                : n.processing_archive_id
+                ? `<button class="notif-cancel" data-cancel-type="process" data-cancel-archive="${n.processing_archive_id}">Cancel</button>`
                 : "";
             div.innerHTML = `
                 <div class="notif-content">
@@ -188,11 +216,8 @@
         }, 5000);
     }
 
-    // --- Scan Progress Notification ---
+    // --- Scan Progress (UI updates only — notifications handled server-side) ---
 
-    // Track progress notification IDs per archive
-    let scanNotifs = {}; // archive_id -> notif id
-    let scanQueuedNotifs = {}; // archive_id -> notif id for "queued" message
     let scanLastRefresh = {}; // archive_id -> timestamp of last UI refresh
     const SCAN_REFRESH_INTERVAL = 3000; // refresh file list every 3s during scan
 
@@ -202,34 +227,9 @@
     }
 
     function updateScanProgress(data) {
-        const { archive_id, phase, current, total } = data;
-        const archiveName = getArchiveName(archive_id);
+        const { archive_id, phase } = data;
 
         if (phase === "verify") {
-            const pct = total > 0 ? Math.round((current / total) * 100) : 0;
-            const msg = `Scanning "${archiveName}": ${current}/${total} (${pct}%)`;
-            if (!scanNotifs[archive_id]) {
-                // Remove "queued" notification if present
-                if (scanQueuedNotifs[archive_id]) {
-                    notifications = notifications.filter((n) => n.id !== scanQueuedNotifs[archive_id]);
-                    delete scanQueuedNotifs[archive_id];
-                }
-                // Create progress notification with toast
-                const nid = ++notifIdCounter;
-                scanNotifs[archive_id] = nid;
-                const notif = { id: nid, message: msg, type: "info", time: new Date(), progress: pct, scanArchiveId: archive_id };
-                notifications.unshift(notif);
-                renderNotifBadge();
-                renderNotifList();
-                showToast(`Scan started: "${archiveName}"`, "info");
-            } else {
-                const notif = notifications.find((n) => n.id === scanNotifs[archive_id]);
-                if (notif) {
-                    notif.message = msg;
-                    notif.progress = pct;
-                    renderNotifList();
-                }
-            }
             // Periodically refresh file list & archive sidebar during scan
             const now = Date.now();
             if (!scanLastRefresh[archive_id] || now - scanLastRefresh[archive_id] >= SCAN_REFRESH_INTERVAL) {
@@ -237,67 +237,19 @@
                 if (currentArchiveId === archive_id) loadFiles();
                 refreshArchives();
             }
-        } else if (phase === "disk") {
-            const notif = notifications.find((n) => n.id === scanNotifs[archive_id]);
-            if (notif) {
-                notif.message = `Scanning "${archiveName}": checking for unknown files...`;
-                notif.progress = -1;
-                renderNotifList();
-            }
         } else if (phase === "done") {
-            // Remove progress and queued notifications
-            if (scanNotifs[archive_id]) {
-                notifications = notifications.filter((n) => n.id !== scanNotifs[archive_id]);
-                delete scanNotifs[archive_id];
-            }
-            if (scanQueuedNotifs[archive_id]) {
-                notifications = notifications.filter((n) => n.id !== scanQueuedNotifs[archive_id]);
-                delete scanQueuedNotifs[archive_id];
-            }
             delete scanLastRefresh[archive_id];
             updateScanButton();
-            // Add final summary notification
-            const s = data.summary || {};
-            const parts = [];
-            if (s.matched > 0) parts.push(`${s.matched} matched`);
-            if (s.partial > 0) parts.push(`${s.partial} partial`);
-            if (s.conflict > 0) parts.push(`${s.conflict} conflict`);
-            if (s.unknown > 0) parts.push(`${s.unknown} unknown`);
-            if (s.missing > 0) parts.push(`${s.missing} not on disk`);
-            if (parts.length === 0) {
-                addNotification(`Scan "${archiveName}": no files found on disk`, "info");
-            } else {
-                const type = s.conflict > 0 || s.unknown > 0 ? "warning" : "success";
-                addNotification(`Scan "${archiveName}": ` + parts.join(", "), type);
-            }
             loadFiles();
             refreshArchives();
             refreshQueueCount();
         } else if (phase === "cancelled") {
-            if (scanNotifs[archive_id]) {
-                notifications = notifications.filter((n) => n.id !== scanNotifs[archive_id]);
-                delete scanNotifs[archive_id];
-            }
-            if (scanQueuedNotifs[archive_id]) {
-                notifications = notifications.filter((n) => n.id !== scanQueuedNotifs[archive_id]);
-                delete scanQueuedNotifs[archive_id];
-            }
             delete scanLastRefresh[archive_id];
-            addNotification(`Scan "${archiveName}": cancelled`, "info");
             updateScanButton();
             loadFiles();
             refreshArchives();
         } else if (phase === "error") {
-            if (scanNotifs[archive_id]) {
-                notifications = notifications.filter((n) => n.id !== scanNotifs[archive_id]);
-                delete scanNotifs[archive_id];
-            }
-            if (scanQueuedNotifs[archive_id]) {
-                notifications = notifications.filter((n) => n.id !== scanQueuedNotifs[archive_id]);
-                delete scanQueuedNotifs[archive_id];
-            }
             delete scanLastRefresh[archive_id];
-            addNotification(`Scan "${archiveName}" failed: ${data.error || "Unknown error"}`, "error");
             updateScanButton();
         }
     }
@@ -510,6 +462,7 @@
         refreshArchives();
         refreshGroups();
         refreshQueueCount();
+        loadNotifications();
         if (currentArchiveId) loadFiles();
     }
 
@@ -597,6 +550,43 @@
         es.addEventListener("processing_progress", (e) => {
             const data = JSON.parse(e.data);
             updateProcessingProgress(data);
+        });
+
+        es.addEventListener("notification_created", (e) => {
+            const notif = JSON.parse(e.data);
+            // Don't add duplicates
+            if (!notifications.find(n => n.id === notif.id)) {
+                notifications.unshift(notif);
+                renderNotifBadge();
+                renderNotifList();
+            }
+        });
+
+        es.addEventListener("notification_updated", (e) => {
+            const notif = JSON.parse(e.data);
+            const idx = notifications.findIndex(n => n.id === notif.id);
+            if (idx >= 0) {
+                notifications[idx] = notif;
+            } else {
+                notifications.unshift(notif);
+            }
+            renderNotifBadge();
+            renderNotifList();
+        });
+
+        es.addEventListener("notification_dismissed", (e) => {
+            const data = JSON.parse(e.data);
+            notifications = notifications.filter(n => n.id !== data.id);
+            renderNotifBadge();
+            renderNotifList();
+        });
+
+        es.addEventListener("notifications_cleared", () => {
+            notifications = notifications.filter(n =>
+                n.scan_archive_id != null || n.processing_archive_id != null || (n.adding_archive && n.adding_archive !== 0)
+            );
+            renderNotifBadge();
+            renderNotifList();
         });
 
         es.addEventListener("archive_added", () => { refreshArchives(); refreshQueueCount(); });
@@ -1462,18 +1452,8 @@
         if (!currentArchiveId) return;
         const archiveName = getArchiveName(currentArchiveId);
         try {
-            const aid = currentArchiveId;
-            const resp = await api("POST", `/api/archives/${aid}/scan`);
-            if (resp.queued) {
-                // Actually waiting behind another task — show queued notification
-                const qid = ++notifIdCounter;
-                scanQueuedNotifs[aid] = qid;
-                notifications.unshift({ id: qid, message: `Scan "${archiveName}": queued`, type: "info", time: new Date() });
-                renderNotifBadge();
-                renderNotifList();
-                showToast(`Scan "${archiveName}": queued`, "info");
-            }
-            // If not queued, SSE progress events will show the scan notification
+            await api("POST", `/api/archives/${currentArchiveId}/scan`);
+            // Server creates the notification and broadcasts via SSE
             updateScanButton();
         } catch (e) {
             if (e.message && e.message.includes("already queued")) {
@@ -1503,7 +1483,8 @@
     function updateScanButton() {
         const btn = $("#btn-scan-files");
         if (!btn) return;
-        const active = currentArchiveId && (scanNotifs[currentArchiveId] || scanQueuedNotifs[currentArchiveId]);
+        // Check for active scan notification from server
+        const active = currentArchiveId && notifications.some(n => n.scan_archive_id === currentArchiveId && n.progress !== null);
         btn.disabled = !!active;
         btn.style.opacity = active ? "0.5" : "";
         btn.title = active
@@ -2625,36 +2606,61 @@
     }
 
     async function addArchiveSingle(url, enable, selectAll, groupId) {
-        // Create persistent notification with indeterminate progress
-        const nid = ++notifIdCounter;
+        // Create a server-side notification for the adding operation
         const label = url.length > 40 ? url.substring(0, 37) + "..." : url;
-        const notif = { id: nid, message: `Adding "${label}": fetching metadata...`, type: "info", time: new Date(), progress: -1, addingArchive: true };
-        notifications.unshift(notif);
-        renderNotifBadge();
-        renderNotifList();
+        let serverNotifId = null;
+        try {
+            const nRes = await api("POST", "/api/notifications", {
+                message: `Adding "${label}": fetching metadata...`,
+                type: "info",
+                adding_archive: true,
+                progress: -1,
+            });
+            serverNotifId = nRes.id;
+        } catch (_) {
+            // Fallback: local-only notification
+            const nid = "local-" + (++notifIdCounter);
+            notifications.unshift({ id: nid, message: `Adding "${label}": fetching metadata...`, type: "info", created_at: Date.now() / 1000, progress: -1, adding_archive: true });
+            serverNotifId = nid;
+            renderNotifBadge();
+            renderNotifList();
+        }
 
         try {
             const result = await api("POST", "/api/archives", { url, enable, select_all: selectAll, group_id: groupId });
-            // Replace progress notification with success
-            notifications = notifications.filter(n => n.id !== nid);
+            // Remove progress notification and add success
+            if (typeof serverNotifId === "number") api("DELETE", "/api/notifications/" + serverNotifId).catch(() => {});
+            notifications = notifications.filter(n => n.id !== serverNotifId);
             const title = result.title || result.identifier || url;
             addNotification(`Added "${title}"`, "success");
             refreshArchives();
         } catch (e) {
-            // Replace progress notification with error
-            notifications = notifications.filter(n => n.id !== nid);
+            // Remove progress notification and add error
+            if (typeof serverNotifId === "number") api("DELETE", "/api/notifications/" + serverNotifId).catch(() => {});
+            notifications = notifications.filter(n => n.id !== serverNotifId);
             addNotification(`Failed to add "${label}": ${e.message}`, "error");
         }
     }
 
     async function addArchiveBatch(lines, enable, selectAll, groupId) {
-        // Create persistent notification with progress bar
-        const nid = ++notifIdCounter;
         const total = lines.length;
-        const notif = { id: nid, message: `Batch add: 0/${total}`, type: "info", time: new Date(), progress: 0, addingArchive: true };
-        notifications.unshift(notif);
-        renderNotifBadge();
-        renderNotifList();
+        // Create server-side notification
+        let serverNotifId = null;
+        try {
+            const nRes = await api("POST", "/api/notifications", {
+                message: `Batch add: 0/${total}`,
+                type: "info",
+                adding_archive: true,
+                progress: 0,
+            });
+            serverNotifId = nRes.id;
+        } catch (_) {
+            const nid = "local-" + (++notifIdCounter);
+            notifications.unshift({ id: nid, message: `Batch add: 0/${total}`, type: "info", created_at: Date.now() / 1000, progress: 0, adding_archive: true });
+            serverNotifId = nid;
+            renderNotifBadge();
+            renderNotifList();
+        }
 
         let succeeded = 0;
         let failed = 0;
@@ -2668,18 +2674,24 @@
                 failed++;
                 errors.push(`${lines[i]}: ${e.message}`);
             }
-            // Update progress notification
+            // Update progress notification on server
             const done = i + 1;
-            const active = notifications.find(n => n.id === nid);
+            const pct = Math.round((done / total) * 100);
+            if (typeof serverNotifId === "number") {
+                api("PATCH", "/api/notifications/" + serverNotifId, { message: `Batch add: ${done}/${total}`, progress: pct }).catch(() => {});
+            }
+            // Also update local copy
+            const active = notifications.find(n => n.id === serverNotifId);
             if (active) {
-                active.progress = Math.round((done / total) * 100);
+                active.progress = pct;
                 active.message = `Batch add: ${done}/${total}`;
                 renderNotifList();
             }
         }
 
-        // Replace progress notification with final result
-        notifications = notifications.filter(n => n.id !== nid);
+        // Remove progress notification and add final result
+        if (typeof serverNotifId === "number") api("DELETE", "/api/notifications/" + serverNotifId).catch(() => {});
+        notifications = notifications.filter(n => n.id !== serverNotifId);
         if (failed === 0) {
             addNotification(`Batch add: ${succeeded} archive${succeeded !== 1 ? "s" : ""} added`, "success");
         } else {
@@ -3519,86 +3531,28 @@
                 addNotification(`Processing failed for archive ${aid}: ${e.message}`, "error");
             }
         }
-        if (queued > 0) {
-            if (archiveIds.length === 1) {
-                addNotification(`Processing queued for "${getArchiveName(archiveIds[0])}"`, "info");
-            } else {
-                addNotification(`Processing queued for ${queued} archive(s)`, "info");
-            }
-        }
+        // Notifications for queued processing jobs are now created server-side
         selectedArchiveIds.clear();
         updateArchiveBatchActions();
         $("#modal-process-archive").classList.remove("open");
     }
 
-    // --- Processing SSE Events ---
-
-    let processingNotifs = {}; // archive_id -> notif id
+    // --- Processing SSE Events (UI updates only — notifications handled server-side) ---
 
     function updateProcessingProgress(data) {
         const { archive_id, phase } = data;
-        const archiveName = getArchiveName(archive_id);
 
         if (phase === "starting") {
-            const nid = ++notifIdCounter;
-            processingNotifs[archive_id] = nid;
-            const notif = { id: nid, message: `Processing "${archiveName}": starting...`, type: "info", time: new Date(), progress: 0, processingArchiveId: archive_id };
-            notifications.unshift(notif);
-            renderNotifBadge();
-            renderNotifList();
-            showToast(`Processing started: "${archiveName}"`, "info");
             if (currentArchiveId === archive_id) loadFiles();
-        } else if (phase === "extracting" || phase === "converting") {
-            const notif = notifications.find(n => n.id === processingNotifs[archive_id]);
-            if (notif) {
-                const pct = data.total > 0 ? Math.round((data.current / data.total) * 100) : -1;
-                const verb = phase === "extracting" ? "Extracting" : "Converting";
-                notif.message = `Processing "${archiveName}": ${verb} ${data.filename || ""}${data.total ? ` (${data.current}/${data.total})` : ""}`;
-                notif.progress = pct;
-                renderNotifList();
-            }
         } else if (phase === "file_done") {
-            const notif = notifications.find(n => n.id === processingNotifs[archive_id]);
-            if (notif && data.total) {
-                notif.message = `Processing "${archiveName}": ${data.current}/${data.total}`;
-                notif.progress = Math.round((data.current / data.total) * 100);
-                renderNotifList();
-            }
             if (currentArchiveId === archive_id) loadFiles();
         } else if (phase === "file_error") {
-            addNotification(`Processing "${archiveName}": ${data.filename} failed — ${data.error}`, "error");
             if (currentArchiveId === archive_id) loadFiles();
         } else if (phase === "done") {
-            if (processingNotifs[archive_id]) {
-                notifications = notifications.filter(n => n.id !== processingNotifs[archive_id]);
-                delete processingNotifs[archive_id];
-            }
-            const s = data.summary || {};
-            const parts = [];
-            if (s.processed > 0) parts.push(`${s.processed} converted`);
-            if (s.skipped > 0) parts.push(`${s.skipped} skipped`);
-            if (s.failed > 0) parts.push(`${s.failed} failed`);
-            if (parts.length) {
-                const type = s.failed > 0 ? "warning" : "success";
-                addNotification(`Processing "${archiveName}": ` + parts.join(", "), type);
-            } else {
-                addNotification(`Processing "${archiveName}": no eligible files`, "info");
-            }
             if (currentArchiveId === archive_id) loadFiles();
             refreshArchives();
         } else if (phase === "cancelled") {
-            if (processingNotifs[archive_id]) {
-                notifications = notifications.filter(n => n.id !== processingNotifs[archive_id]);
-                delete processingNotifs[archive_id];
-            }
-            addNotification(`Processing "${archiveName}": cancelled`, "info");
             if (currentArchiveId === archive_id) loadFiles();
-        } else if (phase === "error") {
-            if (processingNotifs[archive_id]) {
-                notifications = notifications.filter(n => n.id !== processingNotifs[archive_id]);
-                delete processingNotifs[archive_id];
-            }
-            addNotification(`Processing "${archiveName}" failed: ${data.error}`, "error");
         }
     }
 
@@ -3807,6 +3761,7 @@
         refreshGroups();
         refreshStatus();
         refreshQueueCount();
+        loadNotifications();
         connectSSE();
 
         // Set initial lock indicator and confirmation settings

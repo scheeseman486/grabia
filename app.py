@@ -488,6 +488,11 @@ def _scan_worker():
         try:
             _run_scan(archive_id)
         except Exception as e:
+            # Update notification with error
+            scan_notif = db.find_notification_by_scan(archive_id)
+            if scan_notif:
+                db.update_notification(scan_notif["id"], message=f'Scan failed: {e}', type="error", progress=None)
+                broadcast_sse("notification_updated", db.get_notification(scan_notif["id"]))
             broadcast_sse("scan_progress", {
                 "archive_id": archive_id, "phase": "error",
                 "error": str(e),
@@ -511,6 +516,19 @@ def _run_scan(archive_id):
         log.warning("scan", "Archive %d not found, aborting scan", archive_id)
         return
 
+    archive_name = archive["title"] or archive["identifier"]
+
+    # Create or find existing scan notification
+    scan_notif = db.find_notification_by_scan(archive_id)
+    if not scan_notif:
+        scan_notif_id = db.create_notification(
+            f'Scanning "{archive_name}": starting...',
+            type="info", progress=0, scan_archive_id=archive_id,
+        )
+        broadcast_sse("notification_created", db.get_notification(scan_notif_id))
+    else:
+        scan_notif_id = scan_notif["id"]
+
     # Read update rate from settings (milliseconds -> seconds)
     update_rate = int(db.get_setting("sse_update_rate", "500")) / 1000.0
 
@@ -518,6 +536,8 @@ def _run_scan(archive_id):
     base_dir = os.path.realpath(os.path.join(download_dir, archive["identifier"]))
 
     if not os.path.isdir(base_dir):
+        db.update_notification(scan_notif_id, message=f'Scan "{archive_name}" failed: folder not found', type="error", progress=None)
+        broadcast_sse("notification_updated", db.get_notification(scan_notif_id))
         broadcast_sse("scan_progress", {
             "archive_id": archive_id, "phase": "error",
             "error": f"Download folder not found: {base_dir}",
@@ -528,17 +548,26 @@ def _run_scan(archive_id):
         return cancel_evt and cancel_evt.is_set()
 
     def _abort():
+        db.update_notification(scan_notif_id, message=f'Scan "{archive_name}": cancelled', type="info", progress=None)
+        broadcast_sse("notification_updated", db.get_notification(scan_notif_id))
         broadcast_sse("scan_progress", {"archive_id": archive_id, "phase": "cancelled", "current": processed, "total": total_manifest})
         conn.close()
 
     # Time-based progress throttle
     last_progress = [0.0]  # mutable for closure
+    last_notif_update = [0.0]
 
     def _progress():
         now = time.monotonic()
         if now - last_progress[0] >= update_rate or processed == total_manifest:
             broadcast_sse("scan_progress", {"archive_id": archive_id, "phase": "verify", "current": processed, "total": total_manifest})
             last_progress[0] = now
+        # Update persistent notification less frequently (every 2s)
+        if now - last_notif_update[0] >= 2.0 or processed == total_manifest:
+            pct = int((processed / total_manifest) * 100) if total_manifest > 0 else 0
+            db.update_notification(scan_notif_id, message=f'Scanning "{archive_name}": {processed}/{total_manifest} ({pct}%)', progress=pct)
+            broadcast_sse("notification_updated", db.get_notification(scan_notif_id))
+            last_notif_update[0] = now
 
     # Clean slate
     conn = db.get_db()
@@ -734,6 +763,8 @@ def _run_scan(archive_id):
     _flush_writes()
 
     # Scan for unknown files on disk
+    db.update_notification(scan_notif_id, message=f'Scanning "{archive_name}": checking for unknown files...', progress=-1)
+    broadcast_sse("notification_updated", db.get_notification(scan_notif_id))
     broadcast_sse("scan_progress", {"archive_id": archive_id, "phase": "disk", "current": 0, "total": 0})
 
     # Build a set of known processed filenames so we don't flag them as unknown
@@ -781,6 +812,24 @@ def _run_scan(archive_id):
     db.recompute_archive_status(archive_id)
     updated = db.get_archive(archive_id)
     log.info("scan", "Scan complete for %s: %s", archive["identifier"], summary)
+
+    # Update notification with final summary
+    parts = []
+    if summary["matched"] > 0:
+        parts.append(f'{summary["matched"]} matched')
+    if summary["partial"] > 0:
+        parts.append(f'{summary["partial"]} partial')
+    if summary["conflict"] > 0:
+        parts.append(f'{summary["conflict"]} conflict')
+    if summary["unknown"] > 0:
+        parts.append(f'{summary["unknown"]} unknown')
+    if summary["missing"] > 0:
+        parts.append(f'{summary["missing"]} not on disk')
+    result_msg = ", ".join(parts) if parts else "no files found on disk"
+    ntype = "success" if summary["conflict"] == 0 and summary["missing"] == 0 else "warning"
+    db.update_notification(scan_notif_id, message=f'Scan "{archive_name}": {result_msg}', type=ntype, progress=None)
+    broadcast_sse("notification_updated", db.get_notification(scan_notif_id))
+
     broadcast_sse("scan_progress", {
         "archive_id": archive_id, "phase": "done",
         "current": total_manifest, "total": total_manifest,
@@ -809,6 +858,15 @@ def scan_existing_files(archive_id):
         _scan_cancel[archive_id] = evt
 
     pending = _scan_queue.qsize()
+    archive_name = archive["title"] or archive["identifier"]
+
+    # Create a persistent notification for the scan
+    notif_id = db.create_notification(
+        f'Scanning "{archive_name}": queued...' if pending > 0 else f'Scanning "{archive_name}": starting...',
+        type="info", progress=-1, scan_archive_id=archive_id,
+    )
+    broadcast_sse("notification_created", db.get_notification(notif_id))
+
     _scan_queue.put(archive_id)
     return jsonify({"ok": True, "queued": pending > 0})
 
@@ -1625,6 +1683,74 @@ def process_single_file(file_id):
     if not ok:
         return jsonify({"error": queued}), 409
     return jsonify({"ok": True, "queued": queued})
+
+
+# --- Notifications ---
+
+@app.route("/api/notifications", methods=["GET"])
+@login_required
+def list_notifications():
+    """Return all active (non-dismissed) notifications."""
+    notifs = db.get_notifications(include_dismissed=False)
+    return jsonify(notifs)
+
+
+@app.route("/api/notifications", methods=["POST"])
+@login_required
+def create_notification():
+    """Create a new notification (from frontend)."""
+    data = request.json or {}
+    message = data.get("message", "")
+    ntype = data.get("type", "info")
+    if not message:
+        return jsonify({"error": "message is required"}), 400
+    progress = data.get("progress")
+    adding_archive = data.get("adding_archive", False)
+    notif_id = db.create_notification(message, type=ntype, progress=progress,
+                                       adding_archive=adding_archive)
+    notif = db.get_notification(notif_id)
+    broadcast_sse("notification_created", notif)
+    return jsonify(notif), 201
+
+
+@app.route("/api/notifications/<int:notif_id>", methods=["PATCH"])
+@login_required
+def update_notification_endpoint(notif_id):
+    """Update a notification's fields."""
+    data = request.json or {}
+    kwargs = {}
+    if "message" in data:
+        kwargs["message"] = data["message"]
+    if "type" in data:
+        kwargs["type"] = data["type"]
+    if "progress" in data:
+        kwargs["progress"] = data["progress"]
+    if "dismissed" in data:
+        kwargs["dismissed"] = data["dismissed"]
+    if kwargs:
+        db.update_notification(notif_id, **kwargs)
+        notif = db.get_notification(notif_id)
+        if notif:
+            broadcast_sse("notification_updated", notif)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/notifications/<int:notif_id>", methods=["DELETE"])
+@login_required
+def dismiss_notification(notif_id):
+    """Dismiss (delete) a single notification."""
+    db.delete_notification(notif_id)
+    broadcast_sse("notification_dismissed", {"id": notif_id})
+    return jsonify({"ok": True})
+
+
+@app.route("/api/notifications/clear", methods=["POST"])
+@login_required
+def clear_notifications():
+    """Clear all clearable notifications (not active scan/processing/adding)."""
+    db.clear_notifications()
+    broadcast_sse("notifications_cleared", {})
+    return jsonify({"ok": True})
 
 
 # --- Init ---

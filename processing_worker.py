@@ -15,10 +15,13 @@
 # with this program; if not, write to the Free Software Foundation, Inc.,
 # 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 
-"""Background processing worker for post-download file conversion."""
+"""Background processing worker for post-download file conversion.
 
+Uses a SQLite-backed job queue so jobs survive server restarts.
+"""
+
+import json
 import os
-import queue
 import threading
 import time
 
@@ -35,10 +38,10 @@ from processors import (
 # Worker state
 # ---------------------------------------------------------------------------
 
-_processing_queue = queue.Queue()
 _cancel_events = {}          # archive_id -> threading.Event
 _processing_lock = threading.Lock()
 _sse_broadcaster = None      # set by init_processing_worker()
+_wake_event = threading.Event()  # signalled when a new job is enqueued
 
 
 def init_processing_worker(broadcast_fn):
@@ -50,28 +53,52 @@ def init_processing_worker(broadcast_fn):
 
 
 def queue_archive_processing(archive_id, profile_id, file_ids=None, options_override=None):
-    """Queue processing for an archive.
+    """Queue processing for an archive via the DB.
 
     Args:
         archive_id: archive to process
         profile_id: processing profile to use
         file_ids: specific file IDs to process (None = all eligible)
         options_override: dict of option overrides for this run
+
+    Returns:
+        (ok, info) — ok is True on success, info is pending count or error string
     """
+    # Check if there's already an active job for this archive
+    existing = db.get_active_processing_job_for_archive(archive_id)
+    if existing:
+        return False, "Processing already queued for this archive"
+
+    # Set up cancel event BEFORE creating the DB job so the worker can
+    # find it even if it picks up the job immediately.
     with _processing_lock:
-        if archive_id in _cancel_events:
-            return False, "Processing already queued for this archive"
         evt = threading.Event()
         _cancel_events[archive_id] = evt
 
-    pending = _processing_queue.qsize()
-    _processing_queue.put({
-        "archive_id": archive_id,
-        "profile_id": profile_id,
-        "file_ids": file_ids,
-        "options_override": options_override,
-    })
-    return True, pending > 0
+    job_id = db.create_processing_job(archive_id, profile_id, file_ids, options_override)
+
+    pending = db.count_pending_processing_jobs()
+
+    # Create a persistent notification for the queued job
+    archive = db.get_archive(archive_id)
+    archive_name = archive["title"] or archive["identifier"] if archive else f"Archive #{archive_id}"
+    if pending > 1:
+        notif_id = db.create_notification(
+            f'Processing "{archive_name}": queued (position {pending})',
+            type="info", progress=0, processing_archive_id=archive_id,
+        )
+    else:
+        notif_id = db.create_notification(
+            f'Processing "{archive_name}": starting...',
+            type="info", progress=0, processing_archive_id=archive_id,
+        )
+
+    _broadcast("notification_created", db.get_notification(notif_id))
+
+    # Wake the worker thread
+    _wake_event.set()
+
+    return True, pending > 1
 
 
 def cancel_archive_processing(archive_id):
@@ -81,13 +108,27 @@ def cancel_archive_processing(archive_id):
         if evt:
             evt.set()
             return True
+
+    # Also try to cancel a pending (not yet running) job
+    job = db.get_active_processing_job_for_archive(archive_id)
+    if job and job["status"] == "pending":
+        db.cancel_processing_job(job["id"])
+        # Remove the notification
+        notif = db.find_notification_by_processing(archive_id)
+        if notif:
+            db.delete_notification(notif["id"])
+            _broadcast("notification_dismissed", {"id": notif["id"]})
+        return True
     return False
 
 
 def is_processing(archive_id):
     """Check if an archive is currently queued or being processed."""
     with _processing_lock:
-        return archive_id in _cancel_events
+        if archive_id in _cancel_events:
+            return True
+    job = db.get_active_processing_job_for_archive(archive_id)
+    return job is not None
 
 
 def _broadcast(event, data):
@@ -96,15 +137,28 @@ def _broadcast(event, data):
 
 
 # ---------------------------------------------------------------------------
-# Worker loop
+# Worker loop — polls DB for pending jobs
 # ---------------------------------------------------------------------------
 
 def _worker_loop():
     while True:
-        job = _processing_queue.get()
+        job = db.get_next_processing_job()
+        if not job:
+            # No work — wait for a wake signal or poll every 5s
+            _wake_event.wait(timeout=5)
+            _wake_event.clear()
+            continue
+
+        if not db.claim_processing_job(job["id"]):
+            # Another thread/instance claimed it (shouldn't happen with single worker)
+            continue
+
         try:
             _run_processing(job)
+            db.complete_processing_job(job["id"])
         except Exception as e:
+            log.error("worker", "Processing job %d failed: %s", job["id"], e)
+            db.complete_processing_job(job["id"], error_message=str(e))
             _broadcast("processing_progress", {
                 "archive_id": job["archive_id"],
                 "phase": "error",
@@ -113,14 +167,13 @@ def _worker_loop():
         finally:
             with _processing_lock:
                 _cancel_events.pop(job["archive_id"], None)
-            _processing_queue.task_done()
 
 
 def _run_processing(job):
     archive_id = job["archive_id"]
     profile_id = job["profile_id"]
-    file_ids = job.get("file_ids")
-    options_override = job.get("options_override") or {}
+    file_ids = json.loads(job["file_ids_json"]) if job.get("file_ids_json") else None
+    options_override = json.loads(job["options_override_json"]) if job.get("options_override_json") else {}
 
     cancel_evt = _cancel_events.get(archive_id)
 
@@ -129,29 +182,48 @@ def _run_processing(job):
 
     log.info("worker", "Processing job started: archive=%d, profile=%d", archive_id, profile_id)
 
+    archive = db.get_archive(archive_id)
+    archive_name = archive["title"] or archive["identifier"] if archive else f"Archive #{archive_id}"
+
+    # Find or create the notification for this job
+    notif = db.find_notification_by_processing(archive_id)
+    if notif:
+        notif_id = notif["id"]
+    else:
+        notif_id = db.create_notification(
+            f'Processing "{archive_name}": starting...',
+            type="info", progress=0, processing_archive_id=archive_id,
+        )
+        _broadcast("notification_created", db.get_notification(notif_id))
+
     # Load profile
     profile = db.get_processing_profile(profile_id)
     if not profile:
+        msg = "Processing profile not found"
+        if notif_id:
+            db.update_notification(notif_id, message=f'Processing "{archive_name}" failed: {msg}', type="error", progress=None)
+            _broadcast("notification_updated", db.get_notification(notif_id))
         _broadcast("processing_progress", {
             "archive_id": archive_id,
             "phase": "error",
-            "error": "Processing profile not found",
+            "error": msg,
         })
         return
 
-    # Load archive
-    archive = db.get_archive(archive_id)
     if not archive:
         return
 
     # Get processor class
-    import json
     processor_cls = get_processor(profile["processor_type"])
     if not processor_cls:
+        msg = f"Unknown processor type: {profile['processor_type']}"
+        if notif_id:
+            db.update_notification(notif_id, message=f'Processing "{archive_name}" failed: {msg}', type="error", progress=None)
+            _broadcast("notification_updated", db.get_notification(notif_id))
         _broadcast("processing_progress", {
             "archive_id": archive_id,
             "phase": "error",
-            "error": f"Unknown processor type: {profile['processor_type']}",
+            "error": msg,
         })
         return
 
@@ -167,7 +239,6 @@ def _run_processing(job):
 
     # Get eligible files
     if file_ids:
-        # Process specific files
         conn = db.get_db()
         placeholders = ",".join("?" * len(file_ids))
         rows = conn.execute(
@@ -192,6 +263,9 @@ def _run_processing(job):
 
     if not files:
         log.info("worker", "No files to process after filtering — done")
+        if notif_id:
+            db.update_notification(notif_id, message=f'Processing "{archive_name}": no eligible files', type="info", progress=None)
+            _broadcast("notification_updated", db.get_notification(notif_id))
         _broadcast("processing_progress", {
             "archive_id": archive_id,
             "phase": "done",
@@ -203,6 +277,10 @@ def _run_processing(job):
     for f in files:
         db.set_file_processing_status(f["id"], "queued", processor_type=profile["processor_type"])
 
+    if notif_id:
+        db.update_notification(notif_id, message=f'Processing "{archive_name}": starting...', progress=0)
+        _broadcast("notification_updated", db.get_notification(notif_id))
+
     _broadcast("processing_progress", {
         "archive_id": archive_id,
         "phase": "starting",
@@ -213,9 +291,11 @@ def _run_processing(job):
 
     for i, file_info in enumerate(files):
         if _cancelled():
-            # Mark remaining as un-queued
             for remaining in files[i:]:
                 db.set_file_processing_status(remaining["id"], "", error="Cancelled")
+            if notif_id:
+                db.update_notification(notif_id, message=f'Processing "{archive_name}": cancelled', type="info", progress=None)
+                _broadcast("notification_updated", db.get_notification(notif_id))
             _broadcast("processing_progress", {
                 "archive_id": archive_id,
                 "phase": "cancelled",
@@ -228,6 +308,12 @@ def _run_processing(job):
         file_path = os.path.join(archive_dir, filename)
 
         db.set_file_processing_status(file_id, "processing")
+
+        # Update notification progress
+        pct = int((i / len(files)) * 100)
+        if notif_id:
+            db.update_notification(notif_id, message=f'Processing "{archive_name}": {i + 1}/{len(files)}', progress=pct)
+            _broadcast("notification_updated", db.get_notification(notif_id))
 
         def progress_cb(**kwargs):
             _broadcast("processing_progress", {
@@ -260,7 +346,6 @@ def _run_processing(job):
                 )
                 summary["skipped"] += 1
             else:
-                # Delete original files if option allows
                 delete_original = merged_options.get("delete_original", "yes") == "yes"
                 if delete_original:
                     for to_delete in result.get("files_to_delete", []):
@@ -269,7 +354,6 @@ def _run_processing(job):
                         except OSError:
                             pass
 
-                # Use "extracted" status when original is kept, "completed" when deleted
                 proc_status = "completed" if delete_original else "extracted"
                 log.info("worker", "%s %s -> %s", proc_status.capitalize(), filename, result["processed_filename"])
                 db.set_file_processing_status(
@@ -294,6 +378,9 @@ def _run_processing(job):
             db.set_file_processing_status(file_id, "", error="Cancelled")
             for remaining in files[i + 1:]:
                 db.set_file_processing_status(remaining["id"], "", error="Cancelled")
+            if notif_id:
+                db.update_notification(notif_id, message=f'Processing "{archive_name}": cancelled', type="info", progress=None)
+                _broadcast("notification_updated", db.get_notification(notif_id))
             _broadcast("processing_progress", {
                 "archive_id": archive_id,
                 "phase": "cancelled",
@@ -330,6 +417,21 @@ def _run_processing(job):
 
     log.info("worker", "Processing complete for archive %d: %d processed, %d skipped, %d failed",
              archive_id, summary["processed"], summary["skipped"], summary["failed"])
+
+    # Update notification with final result
+    if notif_id:
+        parts = []
+        if summary["processed"] > 0:
+            parts.append(f'{summary["processed"]} converted')
+        if summary["skipped"] > 0:
+            parts.append(f'{summary["skipped"]} skipped')
+        if summary["failed"] > 0:
+            parts.append(f'{summary["failed"]} failed')
+        result_msg = ", ".join(parts) if parts else "no eligible files"
+        ntype = "warning" if summary["failed"] > 0 else "success"
+        db.update_notification(notif_id, message=f'Processing "{archive_name}": {result_msg}', type=ntype, progress=None)
+        _broadcast("notification_updated", db.get_notification(notif_id))
+
     _broadcast("processing_progress", {
         "archive_id": archive_id,
         "phase": "done",
