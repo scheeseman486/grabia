@@ -48,4 +48,5 @@ ENV GRABIA_DATA_DIR=/app/data
 
 EXPOSE 5000
 
-CMD ["python", "app.py"]
+# Ensure files created in mounted volumes are accessible via SMB shares
+CMD ["sh", "-c", "umask 0000 && exec python app.py"]
