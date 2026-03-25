@@ -518,6 +518,7 @@ main {
 .archive-controls {
     display: flex;
     align-items: center;
+    justify-content: space-between;
     gap: 12px;
     margin-bottom: 8px;
     padding: 8px 12px;
@@ -526,6 +527,13 @@ main {
     border: 1px solid var(--border);
     flex-wrap: wrap;
     flex-shrink: 0;
+}
+.archive-controls-left,
+.archive-controls-right {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
 }
 
 .archive-toolbar {

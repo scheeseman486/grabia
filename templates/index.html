@@ -72,11 +72,7 @@
                 <canvas id="speed-sparkline" width="80" height="24" title="Download speed history"></canvas>
                 <div class="speed-display" id="speed-display"></div>
             </div>
-            <button id="btn-add" class="action-btn primary" title="Add archive">
-                <svg viewBox="0 0 24 24" width="18" height="18"><line x1="12" y1="5" x2="12" y2="19" stroke="currentColor" stroke-width="2"/><line x1="5" y1="12" x2="19" y2="12" stroke="currentColor" stroke-width="2"/></svg>
-                Add
-            </button>
-            <button id="btn-add-group" class="action-btn" title="Add group">
+            <button id="btn-archives" class="action-btn" title="Archives">
                 <svg viewBox="0 0 24 24" width="18" height="18"><path d="M20 6h-8l-2-2H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2zm0 12H4V8h16v10z" fill="currentColor"/></svg>
             </button>
             <button id="btn-collections" class="action-btn" title="Collections">
@@ -100,9 +96,6 @@
             <button id="btn-settings" class="action-btn" title="Settings">
                 <svg viewBox="0 0 24 24" width="18" height="18"><path d="M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58a.49.49 0 00.12-.61l-1.92-3.32a.488.488 0 00-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54a.484.484 0 00-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.07.62-.07.94s.02.64.07.94l-2.03 1.58a.49.49 0 00-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6A3.6 3.6 0 1112 8.4a3.6 3.6 0 010 7.2z" fill="currentColor"/></svg>
             </button>
-            <button id="btn-logout" class="action-btn" title="Log out">
-                <svg viewBox="0 0 24 24" width="18" height="18"><path d="M17 7l-1.41 1.41L18.17 11H8v2h10.17l-2.58 2.58L17 17l5-5zM4 5h8V3H4c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h8v-2H4V5z" fill="currentColor"/></svg>
-            </button>
         </div>
     </header>
 
@@ -120,15 +113,33 @@
     <main id="main-content">
         <!-- Home: Archive List -->
         <section id="page-home" class="page active">
+            <div class="detail-header">
+                <div class="detail-info">
+                    <h2>Archives</h2>
+                    <p>Manage Internet Archive downloads</p>
+                </div>
+            </div>
             <div class="empty-state" id="empty-state">
                 <svg viewBox="0 0 24 24" width="64" height="64"><path d="M20 6h-8l-2-2H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2zm0 12H4V8h16v10z" fill="currentColor" opacity="0.3"/></svg>
                 <p>No archives added yet.</p>
-                <p>Click <strong>Add</strong> to get started.</p>
+                <p>Click <strong>Add Archive</strong> to get started.</p>
             </div>
             <div class="archive-controls" id="archive-controls">
-                <button class="action-btn" id="btn-retry-all-archives" title="Reset all failed files across all archives to pending">Retry All Archives</button>
-                <button class="action-btn" id="btn-refresh-all-meta" title="Re-check Internet Archive for file list changes across all archives">Refresh All Metadata</button>
-                <button class="action-btn" id="btn-scan-all-archives" title="Scan local folders for existing files across all archives">Scan For Files In All Archives</button>
+                <div class="archive-controls-left">
+                    <button id="btn-add" class="action-btn primary" title="Add archive">
+                        <svg viewBox="0 0 24 24" width="16" height="16"><line x1="12" y1="5" x2="12" y2="19" stroke="currentColor" stroke-width="2"/><line x1="5" y1="12" x2="19" y2="12" stroke="currentColor" stroke-width="2"/></svg>
+                        Add Archive
+                    </button>
+                    <button id="btn-add-group" class="action-btn" title="Add group">
+                        <svg viewBox="0 0 24 24" width="16" height="16"><path d="M20 6h-8l-2-2H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2zm0 12H4V8h16v10z" fill="currentColor"/></svg>
+                        Add Group
+                    </button>
+                </div>
+                <div class="archive-controls-right">
+                    <button class="action-btn" id="btn-retry-all-archives" title="Reset all failed files across all archives to pending">Retry All Archives</button>
+                    <button class="action-btn" id="btn-refresh-all-meta" title="Re-check Internet Archive for file list changes across all archives">Refresh All Metadata</button>
+                    <button class="action-btn" id="btn-scan-all-archives" title="Scan local folders for existing files across all archives">Scan For Files In All Archives</button>
+                </div>
             </div>
             <div class="archive-toolbar">
                 <div class="file-search">
@@ -236,10 +247,6 @@
         <!-- Collections List -->
         <section id="page-collections" class="page">
             <div class="detail-header">
-                <button id="btn-collections-back" class="action-btn">
-                    <svg viewBox="0 0 24 24" width="18" height="18"><path d="M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2z" fill="currentColor"/></svg>
-                    Back
-                </button>
                 <div class="detail-info">
                     <h2>Collections</h2>
                     <p>Organize archives into virtual folders using symlinks</p>
@@ -523,6 +530,13 @@
                             <div class="settings-form-actions">
                                 <button class="action-btn" id="btn-change-password" type="button">Change Password</button>
                             </div>
+                        </div>
+                        <hr class="settings-divider">
+                        <div class="settings-form">
+                            <button class="action-btn" id="btn-logout" type="button">
+                                <svg viewBox="0 0 24 24" width="16" height="16"><path d="M17 7l-1.41 1.41L18.17 11H8v2h10.17l-2.58 2.58L17 17l5-5zM4 5h8V3H4c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h8v-2H4V5z" fill="currentColor"/></svg>
+                                Log Out
+                            </button>
                         </div>
                     </div>
                     <!-- Speed Schedule Tab -->

@@ -1554,7 +1554,7 @@
         $("#file-sort").value = "priority";
         $("#file-search").value = "";
         $(".file-table-wrap").scrollTop = 0;
-        pageHome.classList.remove("active");
+        $$(".page").forEach((p) => p.classList.remove("active"));
         pageDetail.classList.add("active");
 
         const archive = archives.find((a) => a.id === id);
@@ -3650,13 +3650,14 @@
         showPage("page-collections");
     }
 
+    function openArchiveList() {
+        currentCollectionId = null;
+        showPage("page-home");
+    }
+
     function closeCollections() {
         currentCollectionId = null;
-        if (currentArchiveId) {
-            showPage("page-detail");
-        } else {
-            showPage("page-home");
-        }
+        showPage("page-home");
     }
 
     function renderCollectionList() {
@@ -4071,9 +4072,10 @@
             $("#notif-popup").classList.remove("open");
         });
 
+        // Navigation
+        $("#btn-archives").addEventListener("click", openArchiveList);
         // Collections
         $("#btn-collections").addEventListener("click", openCollections);
-        $("#btn-collections-back").addEventListener("click", closeCollections);
         $("#btn-create-collection").addEventListener("click", () => openCollectionModal());
         $("#btn-collection-modal-cancel").addEventListener("click", closeCollectionModal);
         $("#btn-collection-modal-save").addEventListener("click", saveCollection);
@@ -4221,8 +4223,6 @@
                     closeSettings();
                 } else if ($("#page-collection-detail").classList.contains("active")) {
                     closeCollectionDetail();
-                } else if ($("#page-collections").classList.contains("active")) {
-                    closeCollections();
                 } else if (pageDetail.classList.contains("active")) {
                     closeDetail();
                 }
