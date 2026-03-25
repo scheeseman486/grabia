@@ -371,10 +371,9 @@ def _run_processing(job):
                         except OSError:
                             pass
 
-                proc_status = "completed" if delete_original else "extracted"
-                log.info("worker", "%s %s -> %s", proc_status.capitalize(), filename, result["processed_filename"])
+                log.info("worker", "Processed %s -> %s", filename, result["processed_filename"])
                 db.set_file_processing_status(
-                    file_id, proc_status,
+                    file_id, "processed",
                     processed_filename=result["processed_filename"],
                     processor_type=profile["processor_type"],
                     processed_files=result.get("processed_files"),

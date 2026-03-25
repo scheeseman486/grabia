@@ -617,8 +617,8 @@ def _run_scan(archive_id):
             _abort()
             return
 
-        # Check if a previously processed/extracted file still exists on disk
-        if info.get("processing_status") in ("completed", "extracted"):
+        # Check if a previously processed file still exists on disk
+        if info.get("processing_status") == "processed":
             pf = info.get("processed_filename", "")
             pf_path = os.path.join(base_dir, pf) if pf else ""
             # processed_filename can be a file or a directory (folder extraction)
@@ -650,7 +650,7 @@ def _run_scan(archive_id):
                     proc_filename = base_no_ext + proc_ext
                     pending_writes.append((
                         "UPDATE archive_files SET download_status = 'completed', "
-                        "processing_status = 'completed', processed_filename = ?, "
+                        "processing_status = 'processed', processed_filename = ?, "
                         "downloaded_bytes = ? WHERE id = ?",
                         (proc_filename, os.path.getsize(proc_path), info["id"]),
                     ))
@@ -1098,7 +1098,7 @@ def delete_file(file_id):
         db.set_file_download_status(file_id, "pending", downloaded_bytes=0, error_message="")
         # Only reset processing state if there are no processed outputs remaining on disk
         has_outputs = False
-        if f.get("processing_status") in ("completed", "extracted"):
+        if f.get("processing_status") == "processed":
             if archive:
                 download_dir = db.get_setting("download_dir", os.path.expanduser("~/ia-downloads"))
                 base_dir = os.path.realpath(os.path.join(download_dir, archive["identifier"]))

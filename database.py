@@ -287,6 +287,12 @@ def init_db():
         WHERE processing_status IN ('queued', 'processing')
     """)
 
+    # Migrate legacy processing statuses: 'completed' and 'extracted' → 'processed'
+    conn.execute("""
+        UPDATE archive_files SET processing_status = 'processed'
+        WHERE processing_status IN ('completed', 'extracted')
+    """)
+
     # Clean up stale in-progress notifications (scan/processing that were mid-flight)
     conn.execute("""
         DELETE FROM notifications
@@ -531,8 +537,7 @@ _FILE_SORT_MAP = {
 # Effective status mirrors the JS formatFileStatus logic:
 # processing_status takes priority, then queued+download_status determines "skipped"
 _EFFECTIVE_STATUS_EXPR = """CASE
-    WHEN processing_status = 'completed' THEN 'processed'
-    WHEN processing_status = 'extracted' THEN 'extracted'
+    WHEN processing_status = 'processed' THEN 'processed'
     WHEN processing_status = 'processing' THEN 'processing'
     WHEN processing_status = 'queued' THEN 'proc_queued'
     WHEN processing_status = 'failed' THEN 'proc_failed'
@@ -1035,7 +1040,7 @@ def get_all_processed_files(archive_id):
     with _db() as conn:
         rows = conn.execute(
             "SELECT processed_filename, processed_files_json FROM archive_files "
-            "WHERE archive_id = ? AND processing_status IN ('completed', 'extracted')",
+            "WHERE archive_id = ? AND processing_status = 'processed'",
             (archive_id,),
         ).fetchall()
         names = set()
@@ -1098,7 +1103,7 @@ def reset_failed_files_by_ids(file_ids):
 def assign_as_processed_output(target_file_id, unknown_file_id):
     """Assign an unknown file as processed output of a target file.
     Adds the unknown file's name to the target's processed_files_json,
-    sets the target's processing_status to 'completed' if not already,
+    sets the target's processing_status to 'processed' if not already,
     and deletes the unknown file record."""
     with _db() as conn:
         unknown = conn.execute("SELECT * FROM archive_files WHERE id = ?", (unknown_file_id,)).fetchone()
@@ -1123,8 +1128,8 @@ def assign_as_processed_output(target_file_id, unknown_file_id):
         # Update target: set processing_status and processed_files_json
         updates = ["processed_files_json = ?"]
         params = [json.dumps(existing)]
-        if target["processing_status"] not in ("completed", "extracted"):
-            updates.append("processing_status = 'completed'")
+        if target["processing_status"] != "processed":
+            updates.append("processing_status = 'processed'")
         if not target["processed_filename"]:
             updates.append("processed_filename = ?")
             params.append(unknown["name"])

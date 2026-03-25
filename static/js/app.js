@@ -1908,8 +1908,8 @@
         }
 
         const procStatus = f.processing_status || "";
-        const sourceDeleted = (f.download_status === "pending" && (procStatus === "completed" || procStatus === "extracted"));
-        const hasProcessedOutput = (procStatus === "completed" || procStatus === "extracted");
+        const sourceDeleted = (f.download_status === "pending" && procStatus === "processed");
+        const hasProcessedOutput = (procStatus === "processed");
         const hideQueue = isUnknown || (hasProcessedOutput && !sourceDeleted);
         if (hideQueue) {
             html += '<td class="col-queue"></td>';
@@ -1958,8 +1958,7 @@
         html += `<td class="col-modified">${formatDate(f.mtime)}</td>`;
         const displayStatus = formatFileStatus(f);
         const isSkipped = !f.queued && f.download_status === "pending";
-        const statusClass = procStatus === "completed" ? "processed"
-            : procStatus === "extracted" ? "processed"
+        const statusClass = procStatus === "processed" ? "processed"
             : procStatus === "failed" ? "proc-failed"
             : procStatus === "processing" || procStatus === "queued" ? "proc-active"
             : isSkipped ? "skipped"
@@ -2033,7 +2032,7 @@
             if (upBtn) upBtn.addEventListener("click", () => moveFile(f.id, -1));
             if (downBtn) downBtn.addEventListener("click", () => moveFile(f.id, 1));
         }
-        if (procStatus === "completed" || procStatus === "extracted") {
+        if (procStatus === "processed") {
             tr.classList.add("processed-expandable");
             tr.addEventListener("click", (e) => {
                 if (e.target.closest("input, button, .file-error-hint, .file-actions")) return;
@@ -2153,8 +2152,7 @@
     function formatFileStatus(f) {
         // Show processing status first — it takes priority over download status
         if (f.processing_status && f.processing_status !== "") {
-            if (f.processing_status === "completed") return "processed";
-            if (f.processing_status === "extracted") return "extracted";
+            if (f.processing_status === "processed") return "processed";
             if (f.processing_status === "processing") return "processing...";
             if (f.processing_status === "queued") return "proc. queued";
             if (f.processing_status === "failed") return "proc. failed";
