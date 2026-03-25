@@ -1756,6 +1756,321 @@ def clear_notifications():
     return jsonify({"ok": True})
 
 
+# ── Collections ──────────────────────────────────────────────────────────
+
+import collection_sync
+
+
+@app.route("/api/collections", methods=["GET"])
+@login_required
+def get_collections():
+    """Return all collections with summary info."""
+    return jsonify(db.get_collections())
+
+
+@app.route("/api/collections", methods=["POST"])
+@login_required
+def create_collection():
+    """Create a new collection."""
+    data = request.get_json(force=True)
+    name = data.get("name", "").strip()
+    if not name:
+        return jsonify({"error": "Name is required"}), 400
+    file_scope = data.get("file_scope", "processed")
+    if file_scope not in ("processed", "downloaded", "both"):
+        return jsonify({"error": "Invalid file_scope"}), 400
+    auto_tag = data.get("auto_tag", "").strip() or None
+    try:
+        coll = db.create_collection(name, file_scope=file_scope, auto_tag=auto_tag)
+    except Exception as e:
+        if "UNIQUE" in str(e):
+            return jsonify({"error": "A collection with that name already exists"}), 409
+        raise
+    broadcast_sse("collection_created", coll)
+    return jsonify(coll), 201
+
+
+@app.route("/api/collections/<int:collection_id>", methods=["GET"])
+@login_required
+def get_collection(collection_id):
+    """Return a single collection with full details."""
+    coll = db.get_collection(collection_id)
+    if not coll:
+        return jsonify({"error": "Collection not found"}), 404
+    coll["archives"] = db.get_archives_for_collection(collection_id)
+    return jsonify(coll)
+
+
+@app.route("/api/collections/<int:collection_id>", methods=["PUT"])
+@login_required
+def update_collection(collection_id):
+    """Update a collection's name, file_scope, or auto_tag."""
+    coll = db.get_collection(collection_id)
+    if not coll:
+        return jsonify({"error": "Collection not found"}), 404
+    data = request.get_json(force=True)
+    kwargs = {}
+    if "name" in data:
+        name = data["name"].strip()
+        if not name:
+            return jsonify({"error": "Name cannot be empty"}), 400
+        kwargs["name"] = name
+    if "file_scope" in data:
+        if data["file_scope"] not in ("processed", "downloaded", "both"):
+            return jsonify({"error": "Invalid file_scope"}), 400
+        kwargs["file_scope"] = data["file_scope"]
+    if "auto_tag" in data:
+        kwargs["auto_tag"] = data["auto_tag"].strip() or None
+    if "position" in data:
+        kwargs["position"] = int(data["position"])
+    if kwargs:
+        try:
+            db.update_collection(collection_id, **kwargs)
+        except Exception as e:
+            if "UNIQUE" in str(e):
+                return jsonify({"error": "A collection with that name already exists"}), 409
+            raise
+    updated = db.get_collection(collection_id)
+    broadcast_sse("collection_updated", updated)
+    return jsonify(updated)
+
+
+@app.route("/api/collections/<int:collection_id>", methods=["DELETE"])
+@login_required
+def delete_collection(collection_id):
+    """Delete a collection and remove its symlink directories."""
+    coll = db.get_collection(collection_id)
+    if not coll:
+        return jsonify({"error": "Collection not found"}), 404
+    collection_sync.delete_collection_files(collection_id)
+    db.delete_collection(collection_id)
+    broadcast_sse("collection_deleted", {"id": collection_id})
+    return jsonify({"ok": True})
+
+
+@app.route("/api/collections/reorder", methods=["POST"])
+@login_required
+def reorder_collections():
+    """Reorder collections. Expects {"order": [id, id, ...]}."""
+    data = request.get_json(force=True)
+    order = data.get("order", [])
+    for pos, cid in enumerate(order):
+        db.update_collection(cid, position=pos)
+    broadcast_sse("collections_reordered", {"order": order})
+    return jsonify({"ok": True})
+
+
+# ── Collection Archives ──────────────────────────────────────────────────
+
+@app.route("/api/collections/<int:collection_id>/archives", methods=["GET"])
+@login_required
+def get_collection_archives(collection_id):
+    """Return archives in a collection."""
+    coll = db.get_collection(collection_id)
+    if not coll:
+        return jsonify({"error": "Collection not found"}), 404
+    return jsonify(db.get_archives_for_collection(collection_id))
+
+
+@app.route("/api/collections/<int:collection_id>/archives", methods=["POST"])
+@login_required
+def add_collection_archive(collection_id):
+    """Add an archive to a collection."""
+    coll = db.get_collection(collection_id)
+    if not coll:
+        return jsonify({"error": "Collection not found"}), 404
+    data = request.get_json(force=True)
+    archive_id = data.get("archive_id")
+    if not archive_id:
+        return jsonify({"error": "archive_id is required"}), 400
+    added = db.add_archive_to_collection(collection_id, archive_id)
+    if not added:
+        return jsonify({"error": "Archive already in collection"}), 409
+    updated = db.get_collection(collection_id)
+    broadcast_sse("collection_updated", updated)
+    return jsonify({"ok": True}), 201
+
+
+@app.route("/api/collections/<int:collection_id>/archives/<int:archive_id>", methods=["DELETE"])
+@login_required
+def remove_collection_archive(collection_id, archive_id):
+    """Remove an archive from a collection."""
+    db.remove_archive_from_collection(collection_id, archive_id)
+    updated = db.get_collection(collection_id)
+    broadcast_sse("collection_updated", updated)
+    return jsonify({"ok": True})
+
+
+# ── Collection Layouts ───────────────────────────────────────────────────
+
+@app.route("/api/collections/<int:collection_id>/layouts", methods=["GET"])
+@login_required
+def get_collection_layouts(collection_id):
+    """Return layouts for a collection."""
+    return jsonify(db.get_collection_layouts(collection_id))
+
+
+@app.route("/api/collections/<int:collection_id>/layouts", methods=["POST"])
+@login_required
+def add_collection_layout(collection_id):
+    """Add a layout to a collection."""
+    coll = db.get_collection(collection_id)
+    if not coll:
+        return jsonify({"error": "Collection not found"}), 404
+    data = request.get_json(force=True)
+    name = data.get("name", "").strip()
+    if not name:
+        return jsonify({"error": "Layout name is required"}), 400
+    layout_type = data.get("type", "flat")
+    if layout_type not in ("flat", "alphabetical", "by_archive"):
+        return jsonify({"error": "Invalid layout type"}), 400
+    layout = db.add_collection_layout(collection_id, name, layout_type=layout_type)
+    updated = db.get_collection(collection_id)
+    broadcast_sse("collection_updated", updated)
+    return jsonify(layout), 201
+
+
+@app.route("/api/collections/<int:collection_id>/layouts/<int:layout_id>", methods=["PUT"])
+@login_required
+def update_collection_layout(collection_id, layout_id):
+    """Update a layout's name, type, or position."""
+    data = request.get_json(force=True)
+    kwargs = {}
+    if "name" in data:
+        name = data["name"].strip()
+        if not name:
+            return jsonify({"error": "Layout name cannot be empty"}), 400
+        kwargs["name"] = name
+    if "type" in data:
+        if data["type"] not in ("flat", "alphabetical", "by_archive"):
+            return jsonify({"error": "Invalid layout type"}), 400
+        kwargs["type"] = data["type"]
+    if "position" in data:
+        kwargs["position"] = int(data["position"])
+    if kwargs:
+        db.update_collection_layout(layout_id, **kwargs)
+    updated = db.get_collection(collection_id)
+    broadcast_sse("collection_updated", updated)
+    return jsonify(db.get_collection_layouts(collection_id))
+
+
+@app.route("/api/collections/<int:collection_id>/layouts/<int:layout_id>", methods=["DELETE"])
+@login_required
+def delete_collection_layout(collection_id, layout_id):
+    """Delete a layout."""
+    db.delete_collection_layout(layout_id)
+    updated = db.get_collection(collection_id)
+    broadcast_sse("collection_updated", updated)
+    return jsonify({"ok": True})
+
+
+# ── Collection Sync ──────────────────────────────────────────────────────
+
+@app.route("/api/collections/<int:collection_id>/sync", methods=["POST"])
+@login_required
+def sync_collection(collection_id):
+    """Trigger a sync for a collection — rebuilds all symlinks."""
+    coll = db.get_collection(collection_id)
+    if not coll:
+        return jsonify({"error": "Collection not found"}), 404
+
+    # Create a notification for the sync
+    notif_id = db.create_notification(
+        f"Syncing collection '{coll['name']}'...", type="info"
+    )
+    broadcast_sse("notification", db.get_notification(notif_id))
+
+    try:
+        stats = collection_sync.sync_collection(collection_id)
+    except Exception as e:
+        db.update_notification(notif_id, message=f"Sync failed: {e}", type="error")
+        broadcast_sse("notification", db.get_notification(notif_id))
+        return jsonify({"error": str(e)}), 500
+
+    if stats.get("error"):
+        db.update_notification(notif_id, message=f"Sync failed: {stats['error']}", type="error")
+        broadcast_sse("notification", db.get_notification(notif_id))
+        return jsonify(stats), 400
+
+    # Build summary message
+    msg = (
+        f"Collection '{coll['name']}' synced: "
+        f"{stats['total_created']} created, {stats['total_removed']} removed"
+    )
+    if stats["total_errors"]:
+        msg += f", {stats['total_errors']} errors"
+        db.update_notification(notif_id, message=msg, type="warning")
+    else:
+        db.update_notification(notif_id, message=msg, type="success")
+    broadcast_sse("notification", db.get_notification(notif_id))
+    broadcast_sse("collection_synced", stats)
+    return jsonify(stats)
+
+
+@app.route("/api/collections/<int:collection_id>/files", methods=["GET"])
+@login_required
+def get_collection_files(collection_id):
+    """Return all files that would be included in this collection."""
+    coll = db.get_collection(collection_id)
+    if not coll:
+        return jsonify({"error": "Collection not found"}), 404
+    files = db.get_collection_files(collection_id)
+    return jsonify(files)
+
+
+# ── Archive Tags ─────────────────────────────────────────────────────────
+
+@app.route("/api/archives/<int:archive_id>/tags", methods=["GET"])
+@login_required
+def get_archive_tags(archive_id):
+    """Return tags for an archive."""
+    return jsonify(db.get_archive_tags(archive_id))
+
+
+@app.route("/api/archives/<int:archive_id>/tags", methods=["POST"])
+@login_required
+def add_archive_tag(archive_id):
+    """Add a tag to an archive."""
+    data = request.get_json(force=True)
+    tag = data.get("tag", "").strip()
+    if not tag:
+        return jsonify({"error": "Tag is required"}), 400
+    db.add_archive_tag(archive_id, tag)
+    return jsonify(db.get_archive_tags(archive_id))
+
+
+@app.route("/api/archives/<int:archive_id>/tags/<tag>", methods=["DELETE"])
+@login_required
+def remove_archive_tag(archive_id, tag):
+    """Remove a tag from an archive."""
+    db.remove_archive_tag(archive_id, tag)
+    return jsonify(db.get_archive_tags(archive_id))
+
+
+@app.route("/api/tags", methods=["GET"])
+@login_required
+def get_all_tags():
+    """Return all unique tags with usage counts."""
+    return jsonify(db.get_all_tags())
+
+
+@app.route("/api/archives/<int:archive_id>/collections", methods=["GET"])
+@login_required
+def get_archive_collections(archive_id):
+    """Return collections that contain this archive."""
+    return jsonify(db.get_collections_for_archive(archive_id))
+
+
+@app.route("/api/collections/settings", methods=["GET"])
+@login_required
+def get_collections_settings():
+    """Return the collections directory path."""
+    return jsonify({
+        "collections_dir": collection_sync.get_collections_dir(),
+        "download_dir": collection_sync.get_download_dir(),
+    })
+
+
 # --- Init ---
 
 def create_app():

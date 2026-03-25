@@ -151,6 +151,41 @@ def init_db():
             FOREIGN KEY (archive_id) REFERENCES archives(id) ON DELETE CASCADE,
             FOREIGN KEY (profile_id) REFERENCES processing_profiles(id) ON DELETE CASCADE
         );
+
+        CREATE TABLE IF NOT EXISTS collections (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            file_scope TEXT NOT NULL DEFAULT 'processed',
+            auto_tag TEXT DEFAULT NULL,
+            position INTEGER NOT NULL DEFAULT 0,
+            created_at REAL NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS archive_tags (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            archive_id INTEGER NOT NULL,
+            tag TEXT NOT NULL,
+            UNIQUE(archive_id, tag),
+            FOREIGN KEY (archive_id) REFERENCES archives(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS collection_archives (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            collection_id INTEGER NOT NULL,
+            archive_id INTEGER NOT NULL,
+            UNIQUE(collection_id, archive_id),
+            FOREIGN KEY (collection_id) REFERENCES collections(id) ON DELETE CASCADE,
+            FOREIGN KEY (archive_id) REFERENCES archives(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS collection_layouts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            collection_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            type TEXT NOT NULL DEFAULT 'flat',
+            position INTEGER NOT NULL DEFAULT 0,
+            FOREIGN KEY (collection_id) REFERENCES collections(id) ON DELETE CASCADE
+        );
     """)
 
     # Default settings
@@ -1365,3 +1400,310 @@ def count_pending_processing_jobs():
     with _db() as conn:
         row = conn.execute("SELECT COUNT(*) as cnt FROM processing_jobs WHERE status = 'pending'").fetchone()
         return row["cnt"]
+
+
+# ── Collections ──────────────────────────────────────────────────────────
+
+def create_collection(name, file_scope="processed", auto_tag=None):
+    """Create a new collection. Returns the new collection dict."""
+    with _db() as conn:
+        pos = conn.execute("SELECT COALESCE(MAX(position), -1) + 1 FROM collections").fetchone()[0]
+        cur = conn.execute(
+            "INSERT INTO collections (name, file_scope, auto_tag, position, created_at) VALUES (?, ?, ?, ?, ?)",
+            (name, file_scope, auto_tag or None, pos, time.time()),
+        )
+        conn.commit()
+        return get_collection(cur.lastrowid)
+
+
+def get_collection(collection_id):
+    """Return a single collection dict with archive/layout counts, or None."""
+    with _db() as conn:
+        row = conn.execute("SELECT * FROM collections WHERE id = ?", (collection_id,)).fetchone()
+        if not row:
+            return None
+        d = dict(row)
+        d["archive_count"] = conn.execute(
+            "SELECT COUNT(*) FROM collection_archives WHERE collection_id = ?", (collection_id,)
+        ).fetchone()[0]
+        d["layout_count"] = conn.execute(
+            "SELECT COUNT(*) FROM collection_layouts WHERE collection_id = ?", (collection_id,)
+        ).fetchone()[0]
+        # Count total files across archives in this collection
+        d["file_count"] = _count_collection_files(conn, collection_id, d["file_scope"], d["auto_tag"])
+        d["layouts"] = [dict(r) for r in conn.execute(
+            "SELECT * FROM collection_layouts WHERE collection_id = ? ORDER BY position", (collection_id,)
+        ).fetchall()]
+        return d
+
+
+def get_collections():
+    """Return all collections with summary info."""
+    with _db() as conn:
+        rows = conn.execute("SELECT * FROM collections ORDER BY position").fetchall()
+        result = []
+        for row in rows:
+            d = dict(row)
+            cid = d["id"]
+            d["archive_count"] = conn.execute(
+                "SELECT COUNT(*) FROM collection_archives WHERE collection_id = ?", (cid,)
+            ).fetchone()[0]
+            d["layout_count"] = conn.execute(
+                "SELECT COUNT(*) FROM collection_layouts WHERE collection_id = ?", (cid,)
+            ).fetchone()[0]
+            d["file_count"] = _count_collection_files(conn, cid, d["file_scope"], d["auto_tag"])
+            d["layouts"] = [dict(r) for r in conn.execute(
+                "SELECT * FROM collection_layouts WHERE collection_id = ? ORDER BY position", (cid,)
+            ).fetchall()]
+            result.append(d)
+        return result
+
+
+def update_collection(collection_id, **kwargs):
+    """Update collection fields. Accepted keys: name, file_scope, auto_tag, position."""
+    allowed = {"name", "file_scope", "auto_tag", "position"}
+    updates = []
+    params = []
+    for key, val in kwargs.items():
+        if key in allowed:
+            updates.append(f"{key} = ?")
+            params.append(val)
+    if not updates:
+        return
+    params.append(collection_id)
+    with _db() as conn:
+        conn.execute(f"UPDATE collections SET {', '.join(updates)} WHERE id = ?", params)
+        conn.commit()
+
+
+def delete_collection(collection_id):
+    """Delete a collection and all its relationships (CASCADE)."""
+    with _db() as conn:
+        conn.execute("DELETE FROM collections WHERE id = ?", (collection_id,))
+        conn.commit()
+
+
+def _get_collection_archive_ids(conn, collection_id, auto_tag=None):
+    """Return set of archive IDs in a collection (manual + auto-tag)."""
+    ids = set()
+    for row in conn.execute(
+        "SELECT archive_id FROM collection_archives WHERE collection_id = ?", (collection_id,)
+    ).fetchall():
+        ids.add(row[0])
+    if auto_tag:
+        for row in conn.execute(
+            "SELECT archive_id FROM archive_tags WHERE tag = ?", (auto_tag,)
+        ).fetchall():
+            ids.add(row[0])
+    return ids
+
+
+def _count_collection_files(conn, collection_id, file_scope, auto_tag):
+    """Count files matching the collection's scope across its archives."""
+    archive_ids = _get_collection_archive_ids(conn, collection_id, auto_tag)
+    if not archive_ids:
+        return 0
+    placeholders = ",".join("?" * len(archive_ids))
+    if file_scope == "processed":
+        condition = "processing_status = 'processed'"
+    elif file_scope == "downloaded":
+        condition = "download_status = 'completed' AND origin = 'manifest'"
+    else:  # both
+        condition = "(processing_status = 'processed' OR (download_status = 'completed' AND origin = 'manifest'))"
+    row = conn.execute(
+        f"SELECT COUNT(*) FROM archive_files WHERE archive_id IN ({placeholders}) AND {condition}",
+        list(archive_ids),
+    ).fetchone()
+    return row[0]
+
+
+def get_collection_files(collection_id):
+    """Return all files matching a collection's scope, with archive identifier."""
+    with _db() as conn:
+        coll = conn.execute("SELECT * FROM collections WHERE id = ?", (collection_id,)).fetchone()
+        if not coll:
+            return []
+        archive_ids = _get_collection_archive_ids(conn, collection_id, coll["auto_tag"])
+        if not archive_ids:
+            return []
+        placeholders = ",".join("?" * len(archive_ids))
+        scope = coll["file_scope"]
+        if scope == "processed":
+            condition = "af.processing_status = 'processed'"
+        elif scope == "downloaded":
+            condition = "af.download_status = 'completed' AND af.origin = 'manifest'"
+        else:
+            condition = "(af.processing_status = 'processed' OR (af.download_status = 'completed' AND af.origin = 'manifest'))"
+        rows = conn.execute(
+            f"""SELECT af.*, a.identifier AS archive_identifier
+                FROM archive_files af
+                JOIN archives a ON af.archive_id = a.id
+                WHERE af.archive_id IN ({placeholders}) AND {condition}""",
+            list(archive_ids),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+# ── Collection-Archive relationships ──────────────────────────────────
+
+def add_archive_to_collection(collection_id, archive_id):
+    """Add an archive to a collection. Returns True if added, False if already present."""
+    with _db() as conn:
+        try:
+            conn.execute(
+                "INSERT INTO collection_archives (collection_id, archive_id) VALUES (?, ?)",
+                (collection_id, archive_id),
+            )
+            conn.commit()
+            return True
+        except sqlite3.IntegrityError:
+            return False
+
+
+def remove_archive_from_collection(collection_id, archive_id):
+    """Remove an archive from a collection."""
+    with _db() as conn:
+        conn.execute(
+            "DELETE FROM collection_archives WHERE collection_id = ? AND archive_id = ?",
+            (collection_id, archive_id),
+        )
+        conn.commit()
+
+
+def get_archives_for_collection(collection_id):
+    """Return archives in a collection (manual + auto-tag), with file counts."""
+    with _db() as conn:
+        coll = conn.execute("SELECT * FROM collections WHERE id = ?", (collection_id,)).fetchone()
+        if not coll:
+            return []
+        archive_ids = _get_collection_archive_ids(conn, collection_id, coll["auto_tag"])
+        if not archive_ids:
+            return []
+        placeholders = ",".join("?" * len(archive_ids))
+        rows = conn.execute(
+            f"SELECT * FROM archives WHERE id IN ({placeholders}) ORDER BY identifier",
+            list(archive_ids),
+        ).fetchall()
+        # Check which are manual vs auto-tag
+        manual_ids = set(r[0] for r in conn.execute(
+            "SELECT archive_id FROM collection_archives WHERE collection_id = ?", (collection_id,)
+        ).fetchall())
+        result = []
+        for row in rows:
+            d = dict(row)
+            d["manual"] = d["id"] in manual_ids
+            d["file_count"] = conn.execute(
+                "SELECT COUNT(*) FROM archive_files WHERE archive_id = ?", (d["id"],)
+            ).fetchone()[0]
+            result.append(d)
+        return result
+
+
+def get_collections_for_archive(archive_id):
+    """Return collections that contain this archive (manual membership only)."""
+    with _db() as conn:
+        rows = conn.execute(
+            """SELECT c.* FROM collections c
+               JOIN collection_archives ca ON c.id = ca.collection_id
+               WHERE ca.archive_id = ?
+               ORDER BY c.position""",
+            (archive_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+# ── Archive Tags ──────────────────────────────────────────────────────
+
+def add_archive_tag(archive_id, tag):
+    """Add a tag to an archive. Returns True if added, False if already present."""
+    with _db() as conn:
+        try:
+            conn.execute(
+                "INSERT INTO archive_tags (archive_id, tag) VALUES (?, ?)",
+                (archive_id, tag.strip()),
+            )
+            conn.commit()
+            return True
+        except sqlite3.IntegrityError:
+            return False
+
+
+def remove_archive_tag(archive_id, tag):
+    """Remove a tag from an archive."""
+    with _db() as conn:
+        conn.execute(
+            "DELETE FROM archive_tags WHERE archive_id = ? AND tag = ?",
+            (archive_id, tag),
+        )
+        conn.commit()
+
+
+def get_archive_tags(archive_id):
+    """Return list of tag strings for an archive."""
+    with _db() as conn:
+        rows = conn.execute(
+            "SELECT tag FROM archive_tags WHERE archive_id = ? ORDER BY tag",
+            (archive_id,),
+        ).fetchall()
+        return [r["tag"] for r in rows]
+
+
+def get_all_tags():
+    """Return all unique tags with counts."""
+    with _db() as conn:
+        rows = conn.execute(
+            "SELECT tag, COUNT(*) as count FROM archive_tags GROUP BY tag ORDER BY tag"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+# ── Collection Layouts ────────────────────────────────────────────────
+
+def add_collection_layout(collection_id, name, layout_type="flat"):
+    """Add a layout to a collection. Returns the new layout dict."""
+    with _db() as conn:
+        pos = conn.execute(
+            "SELECT COALESCE(MAX(position), -1) + 1 FROM collection_layouts WHERE collection_id = ?",
+            (collection_id,),
+        ).fetchone()[0]
+        cur = conn.execute(
+            "INSERT INTO collection_layouts (collection_id, name, type, position) VALUES (?, ?, ?, ?)",
+            (collection_id, name, layout_type, pos),
+        )
+        conn.commit()
+        row = conn.execute("SELECT * FROM collection_layouts WHERE id = ?", (cur.lastrowid,)).fetchone()
+        return dict(row) if row else None
+
+
+def update_collection_layout(layout_id, **kwargs):
+    """Update layout fields. Accepted keys: name, type, position."""
+    allowed = {"name", "type", "position"}
+    updates = []
+    params = []
+    for key, val in kwargs.items():
+        if key in allowed:
+            updates.append(f"{key} = ?")
+            params.append(val)
+    if not updates:
+        return
+    params.append(layout_id)
+    with _db() as conn:
+        conn.execute(f"UPDATE collection_layouts SET {', '.join(updates)} WHERE id = ?", params)
+        conn.commit()
+
+
+def delete_collection_layout(layout_id):
+    """Delete a layout."""
+    with _db() as conn:
+        conn.execute("DELETE FROM collection_layouts WHERE id = ?", (layout_id,))
+        conn.commit()
+
+
+def get_collection_layouts(collection_id):
+    """Return layouts for a collection."""
+    with _db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM collection_layouts WHERE collection_id = ? ORDER BY position",
+            (collection_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]

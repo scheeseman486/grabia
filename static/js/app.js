@@ -1565,6 +1565,7 @@
         }
         await loadFiles();
         updateScanButton();
+        loadArchiveTagsAndCollections(id);
     }
 
     function closeDetail() {
@@ -2787,6 +2788,9 @@
             // Snapshot for dirty tracking
             settingsSnapshot = getSettingsFingerprint();
             $("#btn-settings-save-bottom").disabled = true;
+            // Track current page before switching to settings
+            const activePage = document.querySelector(".page.active");
+            pageBeforeSettings = activePage ? activePage.id : null;
             // Show settings page, hide others
             $$(".page").forEach((p) => p.classList.remove("active"));
             $("#page-settings").classList.add("active");
@@ -2795,9 +2799,16 @@
         }
     }
 
+    let pageBeforeSettings = null;
+
     function closeSettings() {
         $("#page-settings").classList.remove("active");
-        if (currentArchiveId) {
+        if (pageBeforeSettings) {
+            $(`#${pageBeforeSettings}`).classList.add("active");
+            pageBeforeSettings = null;
+        } else if (currentCollectionId) {
+            $("#page-collection-detail").classList.add("active");
+        } else if (currentArchiveId) {
             $("#page-detail").classList.add("active");
         } else {
             $("#page-home").classList.add("active");
@@ -3559,6 +3570,435 @@
         }
     }
 
+    // ── Archive Tags & Collection Membership ───────────────────────────────
+
+    async function loadArchiveTagsAndCollections(archiveId) {
+        const tagsEl = $("#archive-tags");
+        const collsEl = $("#archive-collections-list");
+        tagsEl.innerHTML = "";
+        collsEl.innerHTML = "";
+        try {
+            const [tags, colls] = await Promise.all([
+                api("GET", `/api/archives/${archiveId}/tags`),
+                api("GET", `/api/archives/${archiveId}/collections`),
+            ]);
+            renderArchiveTags(tags, archiveId);
+            renderArchiveCollections(colls);
+        } catch (e) {
+            // Silently fail — tags are optional
+        }
+    }
+
+    function renderArchiveTags(tags, archiveId) {
+        const el = $("#archive-tags");
+        el.innerHTML = "";
+        for (const tag of tags) {
+            const chip = document.createElement("span");
+            chip.className = "tag-chip";
+            chip.innerHTML = `${esc(tag)} <button class="tag-remove" data-tag="${esc(tag)}">&times;</button>`;
+            el.appendChild(chip);
+        }
+        // Remove tag handler
+        el.querySelectorAll(".tag-remove").forEach((btn) => {
+            btn.addEventListener("click", async () => {
+                const tag = btn.dataset.tag;
+                await api("DELETE", `/api/archives/${archiveId}/tags/${encodeURIComponent(tag)}`);
+                loadArchiveTagsAndCollections(archiveId);
+            });
+        });
+    }
+
+    function renderArchiveCollections(colls) {
+        const el = $("#archive-collections-list");
+        el.innerHTML = "";
+        if (colls.length === 0) {
+            el.innerHTML = '<span class="no-collections">None</span>';
+            return;
+        }
+        for (const c of colls) {
+            const chip = document.createElement("span");
+            chip.className = "collection-chip";
+            chip.textContent = c.name;
+            chip.addEventListener("click", () => openCollectionDetail(c.id));
+            el.appendChild(chip);
+        }
+    }
+
+    // ── Collections ────────────────────────────────────────────────────────
+
+    let collections = [];
+    let currentCollectionId = null;
+    let editingCollectionId = null;
+    let editingLayoutId = null;
+
+    async function refreshCollections() {
+        try {
+            collections = await api("GET", "/api/collections");
+        } catch (e) {
+            collections = [];
+        }
+    }
+
+    function showPage(pageId) {
+        $$(".page").forEach((p) => p.classList.remove("active"));
+        $(`#${pageId}`).classList.add("active");
+    }
+
+    async function openCollections() {
+        await refreshCollections();
+        renderCollectionList();
+        showPage("page-collections");
+    }
+
+    function closeCollections() {
+        currentCollectionId = null;
+        if (currentArchiveId) {
+            showPage("page-detail");
+        } else {
+            showPage("page-home");
+        }
+    }
+
+    function renderCollectionList() {
+        const listEl = $("#collection-list");
+        const emptyEl = $("#collections-empty");
+        listEl.innerHTML = "";
+        if (collections.length === 0) {
+            emptyEl.style.display = "";
+            return;
+        }
+        emptyEl.style.display = "none";
+
+        for (const coll of collections) {
+            const card = document.createElement("div");
+            card.className = "collection-card";
+            card.dataset.id = coll.id;
+            const layoutInfo = (coll.layouts || []).map((l) => `${l.name} (${l.type})`).join(", ") || "No layouts";
+            card.innerHTML = `
+                <div class="collection-card-header">
+                    <h3 class="collection-card-title">${esc(coll.name)}</h3>
+                    <span class="collection-card-scope">${esc(coll.file_scope)}</span>
+                </div>
+                <div class="collection-card-meta">
+                    <span>${coll.archive_count} archive${coll.archive_count !== 1 ? "s" : ""}</span>
+                    <span>${coll.file_count} file${coll.file_count !== 1 ? "s" : ""}</span>
+                    <span>${coll.layout_count} layout${coll.layout_count !== 1 ? "s" : ""}</span>
+                </div>
+                <div class="collection-card-layouts">${esc(layoutInfo)}</div>
+            `;
+            card.addEventListener("click", () => openCollectionDetail(coll.id));
+            listEl.appendChild(card);
+        }
+    }
+
+    function esc(str) {
+        const d = document.createElement("div");
+        d.textContent = str;
+        return d.innerHTML;
+    }
+
+    async function openCollectionDetail(id) {
+        currentCollectionId = id;
+        try {
+            const coll = await api("GET", `/api/collections/${id}`);
+            renderCollectionDetail(coll);
+            showPage("page-collection-detail");
+        } catch (e) {
+            alert("Failed to load collection: " + e.message);
+        }
+    }
+
+    function renderCollectionDetail(coll) {
+        $("#collection-detail-title").textContent = coll.name;
+        const scopeLabel = { processed: "Processed files", downloaded: "Downloaded files", both: "All files" }[coll.file_scope] || coll.file_scope;
+        let meta = `${coll.file_count} files \u2022 ${scopeLabel}`;
+        if (coll.auto_tag) meta += ` \u2022 auto-tag: ${coll.auto_tag}`;
+        $("#collection-detail-meta").textContent = meta;
+
+        // Layouts
+        const layoutsEl = $("#collection-layouts");
+        layoutsEl.innerHTML = "";
+        const layouts = coll.layouts || [];
+        if (layouts.length === 0) {
+            layoutsEl.innerHTML = '<p class="empty-hint">No layouts configured. Add a layout to define how files are organized.</p>';
+        } else {
+            for (const layout of layouts) {
+                const div = document.createElement("div");
+                div.className = "layout-card";
+                const typeLabel = { flat: "Flat", alphabetical: "Alphabetical (A\u2013Z)", by_archive: "By Archive" }[layout.type] || layout.type;
+                div.innerHTML = `
+                    <div class="layout-card-info">
+                        <strong>${esc(layout.name)}</strong>
+                        <span class="layout-type-badge">${esc(typeLabel)}</span>
+                    </div>
+                    <div class="layout-card-actions">
+                        <button class="action-btn action-btn-sm" data-edit-layout="${layout.id}" data-name="${esc(layout.name)}" data-type="${layout.type}">Edit</button>
+                        <button class="action-btn action-btn-sm batch-btn-danger" data-delete-layout="${layout.id}">Delete</button>
+                    </div>
+                `;
+                layoutsEl.appendChild(div);
+            }
+            layoutsEl.addEventListener("click", (e) => {
+                const editBtn = e.target.closest("[data-edit-layout]");
+                if (editBtn) {
+                    editingLayoutId = parseInt(editBtn.dataset.editLayout);
+                    openLayoutModal(editBtn.dataset.name, editBtn.dataset.type);
+                    return;
+                }
+                const delBtn = e.target.closest("[data-delete-layout]");
+                if (delBtn) {
+                    deleteLayout(parseInt(delBtn.dataset.deleteLayout));
+                }
+            });
+        }
+
+        // Archives
+        const archivesEl = $("#collection-archives");
+        archivesEl.innerHTML = "";
+        const collArchives = coll.archives || [];
+        if (collArchives.length === 0) {
+            archivesEl.innerHTML = '<p class="empty-hint">No archives in this collection. Click "Add Archives" to get started.</p>';
+        } else {
+            for (const a of collArchives) {
+                const div = document.createElement("div");
+                div.className = "collection-archive-item";
+                div.innerHTML = `
+                    <div class="collection-archive-info">
+                        <strong>${esc(a.title || a.identifier)}</strong>
+                        <span class="collection-archive-meta">${a.identifier} \u2022 ${a.file_count} files${!a.manual ? " \u2022 auto-tag" : ""}</span>
+                    </div>
+                    ${a.manual ? `<button class="action-btn action-btn-sm batch-btn-danger" data-remove-archive="${a.id}">Remove</button>` : ""}
+                `;
+                archivesEl.appendChild(div);
+            }
+            archivesEl.addEventListener("click", (e) => {
+                const btn = e.target.closest("[data-remove-archive]");
+                if (btn) removeArchiveFromCollection(parseInt(btn.dataset.removeArchive));
+            });
+        }
+    }
+
+    function closeCollectionDetail() {
+        currentCollectionId = null;
+        openCollections();
+    }
+
+    // --- Collection CRUD Modals ---
+
+    function openCollectionModal(coll = null) {
+        editingCollectionId = coll ? coll.id : null;
+        $("#modal-collection-title").textContent = coll ? "Edit Collection" : "New Collection";
+        $("#collection-name-input").value = coll ? coll.name : "";
+        $("#collection-scope-input").value = coll ? coll.file_scope : "processed";
+        $("#collection-autotag-input").value = coll ? (coll.auto_tag || "") : "";
+        $("#collection-modal-error").textContent = "";
+        $("#modal-collection").classList.add("open");
+        $("#collection-name-input").focus();
+    }
+
+    function closeCollectionModal() {
+        $("#modal-collection").classList.remove("open");
+        editingCollectionId = null;
+    }
+
+    async function saveCollection() {
+        const name = $("#collection-name-input").value.trim();
+        if (!name) {
+            $("#collection-modal-error").textContent = "Name is required.";
+            return;
+        }
+        const body = {
+            name,
+            file_scope: $("#collection-scope-input").value,
+            auto_tag: $("#collection-autotag-input").value.trim(),
+        };
+        try {
+            if (editingCollectionId) {
+                await api("PUT", `/api/collections/${editingCollectionId}`, body);
+            } else {
+                const created = await api("POST", "/api/collections", body);
+                editingCollectionId = null;
+                closeCollectionModal();
+                await refreshCollections();
+                renderCollectionList();
+                openCollectionDetail(created.id);
+                return;
+            }
+            closeCollectionModal();
+            if (currentCollectionId) {
+                openCollectionDetail(currentCollectionId);
+            } else {
+                await refreshCollections();
+                renderCollectionList();
+            }
+        } catch (e) {
+            $("#collection-modal-error").textContent = e.message;
+        }
+    }
+
+    async function deleteCurrentCollection() {
+        if (!currentCollectionId) return;
+        if (!confirm("Delete this collection and remove all its symlinks?")) return;
+        try {
+            await api("DELETE", `/api/collections/${currentCollectionId}`);
+            currentCollectionId = null;
+            await refreshCollections();
+            renderCollectionList();
+            showPage("page-collections");
+        } catch (e) {
+            alert("Failed to delete: " + e.message);
+        }
+    }
+
+    // --- Add Archives Modal ---
+
+    function openAddArchivesModal() {
+        if (!currentCollectionId) return;
+        const listEl = $("#add-archives-list");
+        const searchEl = $("#add-archives-search");
+        searchEl.value = "";
+        listEl.innerHTML = "";
+
+        function render(filter = "") {
+            listEl.innerHTML = "";
+            const lf = filter.toLowerCase();
+            // Get the collection's current archive IDs from the rendered detail
+            const currentArchiveEls = $$("#collection-archives [data-remove-archive]");
+            const currentIds = new Set();
+            currentArchiveEls.forEach((el) => currentIds.add(parseInt(el.dataset.removeArchive)));
+
+            for (const a of archives) {
+                if (lf && !(a.identifier || "").toLowerCase().includes(lf) && !(a.title || "").toLowerCase().includes(lf)) continue;
+                const inColl = currentIds.has(a.id);
+                const div = document.createElement("div");
+                div.className = "add-archive-item" + (inColl ? " in-collection" : "");
+                div.innerHTML = `
+                    <div class="add-archive-info">
+                        <strong>${esc(a.title || a.identifier)}</strong>
+                        <span>${a.identifier}</span>
+                    </div>
+                    ${inColl
+                        ? '<span class="add-archive-badge">Added</span>'
+                        : `<button class="action-btn action-btn-sm primary" data-add-archive="${a.id}">Add</button>`
+                    }
+                `;
+                listEl.appendChild(div);
+            }
+        }
+
+        render();
+        searchEl.addEventListener("input", () => render(searchEl.value));
+        listEl.addEventListener("click", async (e) => {
+            const btn = e.target.closest("[data-add-archive]");
+            if (!btn) return;
+            const aid = parseInt(btn.dataset.addArchive);
+            try {
+                await api("POST", `/api/collections/${currentCollectionId}/archives`, { archive_id: aid });
+                btn.replaceWith(Object.assign(document.createElement("span"), { className: "add-archive-badge", textContent: "Added" }));
+                btn.closest(".add-archive-item").classList.add("in-collection");
+                // Refresh detail in background
+                openCollectionDetail(currentCollectionId);
+            } catch (e) {
+                alert(e.message);
+            }
+        });
+        $("#modal-add-archives").classList.add("open");
+    }
+
+    function closeAddArchivesModal() {
+        $("#modal-add-archives").classList.remove("open");
+    }
+
+    async function removeArchiveFromCollection(archiveId) {
+        if (!currentCollectionId) return;
+        try {
+            await api("DELETE", `/api/collections/${currentCollectionId}/archives/${archiveId}`);
+            openCollectionDetail(currentCollectionId);
+        } catch (e) {
+            alert(e.message);
+        }
+    }
+
+    // --- Layout Modal ---
+
+    function openLayoutModal(name = "", type = "flat") {
+        const isEdit = !!editingLayoutId;
+        $("#modal-layout-title").textContent = isEdit ? "Edit Layout" : "Add Layout";
+        $("#layout-name-input").value = name;
+        $("#layout-type-input").value = type;
+        $("#layout-modal-error").textContent = "";
+        $("#modal-add-layout").classList.add("open");
+        $("#layout-name-input").focus();
+    }
+
+    function closeLayoutModal() {
+        $("#modal-add-layout").classList.remove("open");
+        editingLayoutId = null;
+    }
+
+    async function saveLayout() {
+        if (!currentCollectionId) return;
+        const name = $("#layout-name-input").value.trim();
+        if (!name) {
+            $("#layout-modal-error").textContent = "Name is required.";
+            return;
+        }
+        const body = { name, type: $("#layout-type-input").value };
+        try {
+            if (editingLayoutId) {
+                await api("PUT", `/api/collections/${currentCollectionId}/layouts/${editingLayoutId}`, body);
+            } else {
+                await api("POST", `/api/collections/${currentCollectionId}/layouts`, body);
+            }
+            closeLayoutModal();
+            openCollectionDetail(currentCollectionId);
+        } catch (e) {
+            $("#layout-modal-error").textContent = e.message;
+        }
+    }
+
+    async function deleteLayout(layoutId) {
+        if (!currentCollectionId) return;
+        if (!confirm("Delete this layout?")) return;
+        try {
+            await api("DELETE", `/api/collections/${currentCollectionId}/layouts/${layoutId}`);
+            openCollectionDetail(currentCollectionId);
+        } catch (e) {
+            alert(e.message);
+        }
+    }
+
+    // --- Sync ---
+
+    async function syncCurrentCollection() {
+        if (!currentCollectionId) return;
+        const btn = $("#btn-sync-collection");
+        btn.disabled = true;
+        btn.textContent = "Syncing\u2026";
+        try {
+            const stats = await api("POST", `/api/collections/${currentCollectionId}/sync`);
+            let msg = `Sync complete: ${stats.total_created} created, ${stats.total_removed} removed`;
+            if (stats.total_errors > 0) msg += `, ${stats.total_errors} errors`;
+            // Show sync status
+            const statusEl = $("#collection-sync-status");
+            const detailsEl = $("#collection-sync-details");
+            statusEl.style.display = "";
+            let html = `<p>${esc(msg)}</p>`;
+            for (const [layoutName, ls] of Object.entries(stats.layouts || {})) {
+                html += `<div class="sync-layout-stat"><strong>${esc(layoutName)}</strong>: ${ls.created} created, ${ls.removed} removed, ${ls.unchanged} unchanged`;
+                if (ls.conflicts > 0) html += `, ${ls.conflicts} conflicts`;
+                if (ls.errors.length > 0) html += `<br><span class="sync-errors">${ls.errors.map(esc).join("<br>")}</span>`;
+                html += `</div>`;
+            }
+            detailsEl.innerHTML = html;
+        } catch (e) {
+            alert("Sync failed: " + e.message);
+        } finally {
+            btn.disabled = false;
+            btn.innerHTML = `<svg viewBox="0 0 24 24" width="16" height="16"><path d="M12 4V1L8 5l4 4V6c3.31 0 6 2.69 6 6 0 1.01-.25 1.97-.7 2.8l1.46 1.46A7.93 7.93 0 0020 12c0-4.42-3.58-8-8-8zm0 14c-3.31 0-6-2.69-6-6 0-1.01.25-1.97.7-2.8L5.24 7.74A7.93 7.93 0 004 12c0 4.42 3.58 8 8 8v3l4-4-4-4v3z" fill="currentColor"/></svg> Sync`;
+        }
+    }
+
     // --- Init ---
 
     function init() {
@@ -3629,6 +4069,38 @@
         $("#btn-notif-clear-all").addEventListener("click", clearAllNotifications);
         document.addEventListener("click", () => {
             $("#notif-popup").classList.remove("open");
+        });
+
+        // Collections
+        $("#btn-collections").addEventListener("click", openCollections);
+        $("#btn-collections-back").addEventListener("click", closeCollections);
+        $("#btn-create-collection").addEventListener("click", () => openCollectionModal());
+        $("#btn-collection-modal-cancel").addEventListener("click", closeCollectionModal);
+        $("#btn-collection-modal-save").addEventListener("click", saveCollection);
+        $("#collection-name-input").addEventListener("keydown", (e) => { if (e.key === "Enter") saveCollection(); });
+        $("#btn-collection-detail-back").addEventListener("click", closeCollectionDetail);
+        $("#btn-sync-collection").addEventListener("click", syncCurrentCollection);
+        $("#btn-edit-collection").addEventListener("click", async () => {
+            if (!currentCollectionId) return;
+            const coll = await api("GET", `/api/collections/${currentCollectionId}`);
+            openCollectionModal(coll);
+        });
+        $("#btn-add-archives-to-collection").addEventListener("click", openAddArchivesModal);
+        $("#btn-add-archives-cancel").addEventListener("click", closeAddArchivesModal);
+        $("#btn-add-layout").addEventListener("click", () => { editingLayoutId = null; openLayoutModal(); });
+        $("#btn-layout-modal-cancel").addEventListener("click", closeLayoutModal);
+        $("#btn-layout-modal-save").addEventListener("click", saveLayout);
+        $("#layout-name-input").addEventListener("keydown", (e) => { if (e.key === "Enter") saveLayout(); });
+        $("#btn-delete-collection").addEventListener("click", deleteCurrentCollection);
+        // Tags
+        $("#archive-tag-input").addEventListener("keydown", async (e) => {
+            if (e.key === "Enter" && currentArchiveId) {
+                const tag = e.target.value.trim();
+                if (!tag) return;
+                await api("POST", `/api/archives/${currentArchiveId}/tags`, { tag });
+                e.target.value = "";
+                loadArchiveTagsAndCollections(currentArchiveId);
+            }
         });
 
         // Archive batch actions
@@ -3747,6 +4219,10 @@
                 $$(".modal-overlay.open").forEach((m) => m.classList.remove("open"));
                 if ($("#page-settings").classList.contains("active")) {
                     closeSettings();
+                } else if ($("#page-collection-detail").classList.contains("active")) {
+                    closeCollectionDetail();
+                } else if ($("#page-collections").classList.contains("active")) {
+                    closeCollections();
                 } else if (pageDetail.classList.contains("active")) {
                     closeDetail();
                 }
