@@ -548,8 +548,8 @@ def _run_scan(archive_id):
         return cancel_evt and cancel_evt.is_set()
 
     def _abort():
-        db.update_notification(scan_notif_id, message=f'Scan "{archive_name}": cancelled', type="info", progress=None)
-        broadcast_sse("notification_updated", db.get_notification(scan_notif_id))
+        db.delete_notification(scan_notif_id)
+        broadcast_sse("notification_dismissed", {"id": scan_notif_id})
         broadcast_sse("scan_progress", {"archive_id": archive_id, "phase": "cancelled", "current": processed, "total": total_manifest})
         conn.close()
 
@@ -1738,7 +1738,10 @@ def update_notification_endpoint(notif_id):
 @app.route("/api/notifications/<int:notif_id>", methods=["DELETE"])
 @login_required
 def dismiss_notification(notif_id):
-    """Dismiss (delete) a single notification."""
+    """Dismiss (delete) a single notification. Refuses to delete active notifications."""
+    notif = db.get_notification(notif_id)
+    if notif and notif["progress"] is not None:
+        return jsonify({"error": "Cannot dismiss an active notification"}), 409
     db.delete_notification(notif_id)
     broadcast_sse("notification_dismissed", {"id": notif_id})
     return jsonify({"ok": True})

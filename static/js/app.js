@@ -142,11 +142,17 @@
                     progressHtml = `<div class="notif-progress-track"><div class="notif-progress-fill indeterminate"></div></div>`;
                 }
             }
+            // Active notifications (with progress) show cancel, not dismiss
+            const isActive = hasProgress || (n.adding_archive && n.adding_archive !== 0);
             const cancelHtml = n.scan_archive_id
                 ? `<button class="notif-cancel" data-cancel-type="scan" data-cancel-archive="${n.scan_archive_id}">Cancel</button>`
                 : n.processing_archive_id
                 ? `<button class="notif-cancel" data-cancel-type="process" data-cancel-archive="${n.processing_archive_id}">Cancel</button>`
                 : "";
+            const dismissHtml = isActive ? "" : `
+                <button class="notif-dismiss" data-notif-id="${n.id}" title="Dismiss">
+                    <svg viewBox="0 0 24 24" width="12" height="12"><path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z" fill="currentColor"/></svg>
+                </button>`;
             div.innerHTML = `
                 <div class="notif-content">
                     <span class="notif-message">${escapeHtml(n.message)}</span>
@@ -156,11 +162,10 @@
                         ${cancelHtml}
                     </span>
                 </div>
-                <button class="notif-dismiss" data-notif-id="${n.id}" title="Dismiss">
-                    <svg viewBox="0 0 24 24" width="12" height="12"><path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z" fill="currentColor"/></svg>
-                </button>
+                ${dismissHtml}
             `;
-            div.querySelector(".notif-dismiss").addEventListener("click", (e) => {
+            const dismissBtn = div.querySelector(".notif-dismiss");
+            if (dismissBtn) dismissBtn.addEventListener("click", (e) => {
                 e.stopPropagation();
                 removeNotification(n.id);
             });

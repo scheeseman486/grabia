@@ -279,6 +279,14 @@ def init_db():
     # Jobs stuck in 'running' mean the server crashed mid-processing.
     conn.execute("UPDATE processing_jobs SET status = 'pending', started_at = NULL WHERE status = 'running'")
 
+    # Reset archive_files stuck in processing states from a crash.
+    # Files marked 'queued' or 'processing' need to be reset so they can be
+    # re-queued when the recovered job runs.
+    conn.execute("""
+        UPDATE archive_files SET processing_status = '', processing_error = ''
+        WHERE processing_status IN ('queued', 'processing')
+    """)
+
     # Clean up stale in-progress notifications (scan/processing that were mid-flight)
     conn.execute("""
         DELETE FROM notifications

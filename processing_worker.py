@@ -102,24 +102,31 @@ def queue_archive_processing(archive_id, profile_id, file_ids=None, options_over
 
 
 def cancel_archive_processing(archive_id):
-    """Cancel processing for an archive."""
+    """Cancel processing for an archive and remove its notification."""
+    cancelled = False
+
     with _processing_lock:
         evt = _cancel_events.get(archive_id)
         if evt:
             evt.set()
-            return True
+            cancelled = True
 
-    # Also try to cancel a pending (not yet running) job
-    job = db.get_active_processing_job_for_archive(archive_id)
-    if job and job["status"] == "pending":
-        db.cancel_processing_job(job["id"])
-        # Remove the notification
+    # Also cancel via DB — handles pending jobs and running jobs that
+    # somehow lack a cancel event (e.g. after crash recovery).
+    if not cancelled:
+        job = db.get_active_processing_job_for_archive(archive_id)
+        if job:
+            db.cancel_processing_job(job["id"])
+            cancelled = True
+
+    # Always remove the notification on cancel
+    if cancelled:
         notif = db.find_notification_by_processing(archive_id)
         if notif:
             db.delete_notification(notif["id"])
             _broadcast("notification_dismissed", {"id": notif["id"]})
-        return True
-    return False
+
+    return cancelled
 
 
 def is_processing(archive_id):
@@ -152,6 +159,13 @@ def _worker_loop():
         if not db.claim_processing_job(job["id"]):
             # Another thread/instance claimed it (shouldn't happen with single worker)
             continue
+
+        # Ensure a cancel event exists for this archive so cancel requests work.
+        # queue_archive_processing() creates one for new jobs, but recovered
+        # jobs (from a crash) won't have one.
+        with _processing_lock:
+            if job["archive_id"] not in _cancel_events:
+                _cancel_events[job["archive_id"]] = threading.Event()
 
         try:
             _run_processing(job)
@@ -293,9 +307,12 @@ def _run_processing(job):
         if _cancelled():
             for remaining in files[i:]:
                 db.set_file_processing_status(remaining["id"], "", error="Cancelled")
-            if notif_id:
-                db.update_notification(notif_id, message=f'Processing "{archive_name}": cancelled', type="info", progress=None)
-                _broadcast("notification_updated", db.get_notification(notif_id))
+            # Notification is cleaned up by cancel_archive_processing();
+            # only delete here if it still exists (e.g. ProcessingCancelled
+            # raised by the processor itself without an explicit cancel call).
+            if notif_id and db.get_notification(notif_id):
+                db.delete_notification(notif_id)
+                _broadcast("notification_dismissed", {"id": notif_id})
             _broadcast("processing_progress", {
                 "archive_id": archive_id,
                 "phase": "cancelled",
@@ -378,9 +395,12 @@ def _run_processing(job):
             db.set_file_processing_status(file_id, "", error="Cancelled")
             for remaining in files[i + 1:]:
                 db.set_file_processing_status(remaining["id"], "", error="Cancelled")
-            if notif_id:
-                db.update_notification(notif_id, message=f'Processing "{archive_name}": cancelled', type="info", progress=None)
-                _broadcast("notification_updated", db.get_notification(notif_id))
+            # Notification is cleaned up by cancel_archive_processing();
+            # only delete here if it still exists (e.g. ProcessingCancelled
+            # raised by the processor itself without an explicit cancel call).
+            if notif_id and db.get_notification(notif_id):
+                db.delete_notification(notif_id)
+                _broadcast("notification_dismissed", {"id": notif_id})
             _broadcast("processing_progress", {
                 "archive_id": archive_id,
                 "phase": "cancelled",
