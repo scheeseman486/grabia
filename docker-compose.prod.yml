@@ -3,12 +3,15 @@ services:
     image: ghcr.io/scheeseman486/grabia:latest
     ports:
       - "5000:5000"
+    pids_limit: 2048
     volumes:
       - /mnt/user/appdata/grabia:/app/data
       - /mnt/user/grabia_downloads:/root/ia-downloads
+      - /mnt/user/grabia_temp:/tempstorage
     environment:
       - GRABIA_PORT=5000
     labels:
+      net.unraid.docker.managed: dockerman
       net.unraid.docker.webui: "http://[IP]:[PORT:5000]"
       net.unraid.docker.icon: "https://raw.githubusercontent.com/scheeseman486/grabia/main/static/grabia_icon.png"
     restart: unless-stopped
