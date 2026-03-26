@@ -4315,9 +4315,9 @@
         $("#btn-archives").addEventListener("click", openArchiveList);
         // Activity Log
         $("#btn-activity").addEventListener("click", () => openActivityLog());
-        $("#activity-filter-apply").addEventListener("click", () => { activityOffset = 0; activityJobFilter = null; $("#activity-job-banner").style.display = "none"; loadActivityLog(); });
+        $("#activity-filter-apply").addEventListener("click", () => { activityOffset = 0; loadActivityLog(); });
         $("#activity-filter-clear").addEventListener("click", clearActivityFilters);
-        $("#activity-filter-search").addEventListener("keydown", (e) => { if (e.key === "Enter") { activityOffset = 0; activityJobFilter = null; loadActivityLog(); } });
+        $("#activity-filter-search").addEventListener("keydown", (e) => { if (e.key === "Enter") { activityOffset = 0; loadActivityLog(); } });
         // Collections
         $("#btn-collections").addEventListener("click", openCollections);
         $("#btn-create-collection").addEventListener("click", () => openCollectionModal());
