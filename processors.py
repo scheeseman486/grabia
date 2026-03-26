@@ -33,43 +33,41 @@ from logger import log
 
 # -- chdman memory model (empirically measured, chdman 0.286) --
 #
-# Peak memory is dominated by the INPUT FILE SIZE, not thread count.
-# chdman heap-allocates ~2.7× the input file size in anonymous memory
-# (hunk buffers, codec trial outputs, SHA1 tree, compressed output
-# staging).  Thread count has negligible effect on peak — it only
-# determines how fast peak is reached.
+# The FLAC codec is responsible for virtually ALL of chdman's memory usage.
+# With FLAC in the codec set, peak anonymous memory is ~2.7× the input file
+# size (e.g. 20 GB for a 7.3 GB DVD ISO).  Without FLAC, memory usage is
+# <100 MB regardless of file size or thread count.
 #
-# Measured on DVD ISOs with default compression (lzma+zlib+huff+flac):
+# Measured on DVD ISOs:
 #
-#   File                    Size     1T peak   4T peak   8T peak
-#   Mortal Kombat DA       4468 MB   12028 MB  11921 MB  11889 MB
-#   Dynasty Warriors 6     7324 MB     —       20418 MB    —
+#   Codec set             MK (4.5 GB)    DW6 (7.3 GB)   Output size
+#   lzma,zlib,huff,flac   11,915 MB      20,418 MB      56.7%
+#   lzma,zlib,huff            —              81 MB       ~58%
+#   lzma alone                46 MB           —          57.9%
+#   zstd alone                45 MB           —          58.4%
+#   flac alone            11,921 MB           —          60.4%
 #
-#   Average ratio: 2.70× input file size (all anonymous, <6 MB file cache)
+# Dropping FLAC costs only ~1-2% compression ratio but reduces memory
+# from ~20 GB to ~80 MB.  The default DVD compression is therefore
+# lzma,zlib,huff (no FLAC).  FLAC-inclusive compression is available
+# as the "maximum" preset for users with sufficient RAM.
 #
-# The ratio appears slightly higher for larger files (~2.79× for 7.3 GB
-# vs ~2.67× for 4.5 GB), so we use 2.8× as a conservative estimate.
-#
-# For thread scaling, the only lever is limiting concurrency on systems
-# where the conversion WILL fit in memory.  Since peak is file-dominated,
-# thread count is chosen purely for CPU efficiency.
-#
-_CHDMAN_MEMORY_RATIO_DVD = 2.8    # peak_anonymous ≈ input_size × this
-_CHDMAN_MEMORY_RATIO_CD = 1.5     # CD images are smaller; ratio is lower (conservative)
+_CHDMAN_FLAC_MEMORY_RATIO = 2.8   # peak_anonymous ≈ input_size × this (with FLAC)
 _CHDMAN_MEMORY_HEADROOM_MB = 700  # reserve for Grabia, Flask, OS, other containers
 
 
-def _check_chdman_memory(disc_type, input_path):
-    """Check whether enough memory exists for chdman to convert *input_path*.
+def _check_chdman_memory(disc_type, input_path, uses_flac=False):
+    """Check memory when FLAC codec is in use (the only codec that needs lots of RAM).
 
-    chdman's peak anonymous memory is ~2.8× the input file size (DVD) and is
-    NOT meaningfully reduced by lowering thread count — threads only affect
-    how quickly peak is reached.  If the container / system doesn't have
-    enough memory, the conversion WILL be OOM-killed regardless of -np.
+    Without FLAC, chdman uses <100 MB regardless of file size — no check needed.
+    With FLAC, peak anonymous memory is ~2.8× the input file size and the
+    conversion WILL be OOM-killed if the container doesn't have enough.
 
     Raises ProcessingError with a helpful message if memory is insufficient.
-    Logs the estimate either way.
     """
+    if not uses_flac:
+        return  # Non-FLAC codecs use <100 MB — no concern
+
     file_size_mb = 0
     if input_path:
         try:
@@ -77,34 +75,35 @@ def _check_chdman_memory(disc_type, input_path):
         except OSError:
             pass
 
-    ratio = _CHDMAN_MEMORY_RATIO_DVD if disc_type == "dvd" else _CHDMAN_MEMORY_RATIO_CD
-    estimated_peak = int(file_size_mb * ratio)
+    estimated_peak = int(file_size_mb * _CHDMAN_FLAC_MEMORY_RATIO)
     needed = estimated_peak + _CHDMAN_MEMORY_HEADROOM_MB
 
     available_mb = _get_available_memory_mb()
     if available_mb is None:
-        log.warning("proc", "chdman memory check: cannot detect memory limits; "
-                    "estimated peak for %.0fMB %s file = %dMB",
+        log.warning("proc", "chdman memory check (FLAC): cannot detect memory "
+                    "limits; estimated peak for %.0fMB %s file = %dMB",
                     file_size_mb, disc_type.upper(), estimated_peak)
-        return  # Can't check — proceed and hope for the best
+        return
 
-    log.info("proc", "chdman memory check: %.0fMB %s file, estimated peak %dMB "
-             "(%.1f× file), available %dMB, needed %dMB (peak + %dMB headroom)",
-             file_size_mb, disc_type.upper(), estimated_peak, ratio,
-             available_mb, needed, _CHDMAN_MEMORY_HEADROOM_MB)
+    log.info("proc", "chdman memory check (FLAC): %.0fMB %s file, "
+             "estimated peak %dMB (%.1f× file), available %dMB",
+             file_size_mb, disc_type.upper(), estimated_peak,
+             _CHDMAN_FLAC_MEMORY_RATIO, available_mb)
 
     if available_mb < needed:
         needed_gb = needed / 1024
         avail_gb = available_mb / 1024
-        log.error("proc", "chdman: not enough memory — %.1fGB available, "
-                  "need ~%.1fGB for %.0fMB %s file",
+        log.error("proc", "chdman: not enough memory for FLAC compression — "
+                  "%.1fGB available, need ~%.1fGB for %.0fMB %s file",
                   avail_gb, needed_gb, file_size_mb, disc_type.upper())
         raise ProcessingError(
-            f"Not enough memory for CHD conversion: {avail_gb:.1f}GB available, "
-            f"need ~{needed_gb:.1f}GB for this {file_size_mb:.0f}MB "
-            f"{disc_type.upper()} file. chdman uses ~{ratio}× the input file "
-            f"size in memory regardless of thread count. "
-            f"Increase the container memory limit to at least {needed_gb:.0f}GB."
+            f"Not enough memory for CHD conversion with FLAC: "
+            f"{avail_gb:.1f}GB available, need ~{needed_gb:.1f}GB for this "
+            f"{file_size_mb:.0f}MB {disc_type.upper()} file. "
+            f"The FLAC codec uses ~{_CHDMAN_FLAC_MEMORY_RATIO}× the input "
+            f"file size in memory. Switch to the default compression preset "
+            f"(without FLAC) to use <100MB, or increase the container memory "
+            f"limit to at least {needed_gb:.0f}GB."
         )
 
 
@@ -748,7 +747,7 @@ class CHDCDProcessor(BaseProcessor):
                 {"value": "none", "label": "None"},
                 {"value": "cdlz", "label": "LZMA (cdlz)"},
                 {"value": "cdzl", "label": "Zlib (cdzl)"},
-                {"value": "cdfl", "label": "FLAC (cdfl)"},
+                {"value": "cdfl", "label": "FLAC (cdfl) — high memory usage"},
             ],
         },
         {
@@ -878,9 +877,10 @@ class CHDCDProcessor(BaseProcessor):
 
     def _run_chdman_createcd(self, chdman, input_path, output_path):
         """Run chdman createcd with configured options."""
-        _check_chdman_memory("cd", input_path)
-        cmd = [chdman, "createcd", "-i", input_path, "-o", output_path, "-f"]
         compression = self.options.get("compression", "default")
+        flac = compression == "default" or "flac" in compression or "cdfl" in compression
+        _check_chdman_memory("cd", input_path, uses_flac=flac)
+        cmd = [chdman, "createcd", "-i", input_path, "-o", output_path, "-f"]
         if compression != "default":
             cmd.extend(["-c", compression])
         threads = _get_chdman_threads(self.options.get("num_processors", 0))
@@ -922,9 +922,16 @@ class CHDAutoProcessor(BaseProcessor):
     input_extensions = [".zip", ".7z", ".rar", ".iso", ".bin", ".img"]
     # Maps preset value -> (cd_codecs, dvd_codecs)
     # cd_codecs passed to chdman createcd -c, dvd_codecs to createdvd -c
+    #
+    # NOTE: FLAC codec causes chdman to allocate ~2.7× the input file size
+    # in memory (e.g. 20 GB for a 7.3 GB DVD ISO).  Without FLAC, memory
+    # usage is <100 MB regardless of file size.  The "default" preset
+    # therefore excludes FLAC; use "maximum" to include it if you have RAM.
     _COMPRESSION_PRESETS = {
-        "default": (None, None),  # chdman built-in defaults (tries all)
+        "default": ("cdlz,cdzl,cdfl", "lzma,zlib,huff"),
+        "maximum": (None, None),  # chdman built-in (lzma+zlib+huff+flac) — needs ~2.7× file size in RAM
         "lzma":    ("cdlz", "lzma"),
+        "zstd":    ("cdzl", "zstd"),
         "zlib":    ("cdzl", "zlib"),
         "flac":    ("cdfl", "flac"),
         "huff":    (None, "huff"),  # Huffman is DVD-only; CD falls back to default
@@ -938,10 +945,12 @@ class CHDAutoProcessor(BaseProcessor):
             "type": "select",
             "default": "default",
             "choices": [
-                {"value": "default", "label": "Default — CD: cdlz+cdzl+cdfl / DVD: lzma+zlib+huff+flac"},
+                {"value": "default", "label": "Default — CD: cdlz+cdzl+cdfl / DVD: lzma+zlib+huff (low memory)"},
+                {"value": "maximum", "label": "Maximum — includes FLAC, ~1-2% smaller but needs ~2.7× file size in RAM"},
                 {"value": "lzma", "label": "LZMA — CD: cdlz / DVD: lzma (best ratio, slowest)"},
+                {"value": "zstd", "label": "Zstd — CD: cdzl / DVD: zstd (fast, good ratio)"},
                 {"value": "zlib", "label": "Zlib — CD: cdzl / DVD: zlib (balanced)"},
-                {"value": "flac", "label": "FLAC — CD: cdfl / DVD: flac (lossless audio, fast)"},
+                {"value": "flac", "label": "FLAC — CD: cdfl / DVD: flac (WARNING: extreme memory usage)"},
                 {"value": "huff", "label": "Huffman — DVD: huff (fastest, larger files)"},
                 {"value": "none", "label": "None — no compression"},
             ],
@@ -1095,8 +1104,17 @@ class CHDAutoProcessor(BaseProcessor):
                     pass
         return new_files
 
+    def _uses_flac(self, disc_type):
+        """Check if the chosen compression preset includes FLAC."""
+        preset = self.options.get("compression", "default")
+        if preset in ("flac", "maximum"):
+            return True
+        mapping = self._COMPRESSION_PRESETS.get(preset, (None, None))
+        codec = mapping[0] if disc_type == "cd" else mapping[1]
+        return codec is not None and "flac" in codec or "cdfl" in (codec or "")
+
     def _run_chdman_createcd(self, chdman, input_path, output_path):
-        _check_chdman_memory("cd", input_path)
+        _check_chdman_memory("cd", input_path, uses_flac=self._uses_flac("cd"))
         cmd = [chdman, "createcd", "-i", input_path, "-o", output_path, "-f"]
         cmd.extend(self._get_compression_args("cd"))
         threads = _get_chdman_threads(self.options.get("num_processors", 0))
@@ -1113,7 +1131,7 @@ class CHDAutoProcessor(BaseProcessor):
         self._verify_chd(chdman, output_path)
 
     def _run_chdman_createdvd(self, chdman, input_path, output_path):
-        _check_chdman_memory("dvd", input_path)
+        _check_chdman_memory("dvd", input_path, uses_flac=self._uses_flac("dvd"))
         cmd = [chdman, "createdvd", "-i", input_path, "-o", output_path, "-f"]
         cmd.extend(self._get_compression_args("dvd"))
         threads = _get_chdman_threads(self.options.get("num_processors", 0))
@@ -1159,12 +1177,14 @@ class CHDDVDProcessor(BaseProcessor):
             "type": "select",
             "default": "default",
             "choices": [
-                {"value": "default", "label": "Default"},
+                {"value": "default", "label": "Default — lzma+zlib+huff (low memory)"},
+                {"value": "maximum", "label": "Maximum — lzma+zlib+huff+flac (~1-2% smaller, needs ~2.7× file size in RAM)"},
                 {"value": "none", "label": "None"},
                 {"value": "lzma", "label": "LZMA"},
+                {"value": "zstd", "label": "Zstd"},
                 {"value": "zlib", "label": "Zlib"},
                 {"value": "huff", "label": "Huffman"},
-                {"value": "flac", "label": "FLAC"},
+                {"value": "flac", "label": "FLAC (WARNING: extreme memory usage)"},
             ],
         },
         {
@@ -1238,12 +1258,24 @@ class CHDDVDProcessor(BaseProcessor):
             "skipped": False,
         }
 
+    # Maps preset names to chdman -c argument (None = chdman built-in default)
+    _DVD_COMPRESSION = {
+        "default": "lzma,zlib,huff",
+        "maximum": None,  # chdman built-in: lzma+zlib+huff+flac
+        "zstd": "zstd",
+    }
+
     def _run_chdman_createdvd(self, chdman, input_path, output_path):
-        _check_chdman_memory("dvd", input_path)
-        cmd = [chdman, "createdvd", "-i", input_path, "-o", output_path, "-f"]
         compression = self.options.get("compression", "default")
-        if compression != "default":
-            cmd.extend(["-c", compression])
+        flac = compression in ("maximum", "flac") or (
+            compression not in self._DVD_COMPRESSION
+            and "flac" in compression
+        )
+        _check_chdman_memory("dvd", input_path, uses_flac=flac)
+        cmd = [chdman, "createdvd", "-i", input_path, "-o", output_path, "-f"]
+        codec = self._DVD_COMPRESSION.get(compression, compression)
+        if codec:
+            cmd.extend(["-c", codec])
         threads = _get_chdman_threads(self.options.get("num_processors", 0))
         cmd.extend(["-np", str(threads)])
 
