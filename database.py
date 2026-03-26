@@ -828,8 +828,8 @@ def reset_stale_processing():
 
     - Files stuck in 'processing' or 'queued' → reset to '' (unprocessed)
     - Processing jobs stuck in 'running' → mark as 'failed'
-    - Notifications for stale processing jobs → dismissed
-    - Activity jobs stuck in 'running' for processing → marked failed
+    - Stale processing/scan notifications → cleared
+    - Activity jobs stuck in 'running' for processing/scan → marked failed
     """
     with _db() as conn:
         # Reset stuck files
@@ -842,43 +842,53 @@ def reset_stale_processing():
                 "WHERE processing_status IN ('processing', 'queued')"
             )
 
-        # Fail stuck processing jobs and collect their archive IDs for notification cleanup
-        stuck_jobs = conn.execute(
-            "SELECT id, archive_id FROM processing_jobs WHERE status = 'running'"
-        ).fetchall()
-        for row in stuck_jobs:
-            conn.execute(
-                "UPDATE processing_jobs SET status = 'failed', error_message = 'Interrupted by crash/restart', "
-                "completed_at = ? WHERE id = ?",
-                (time.time(), row["id"]),
-            )
-            # Dismiss the processing notification for this archive
-            conn.execute(
-                "UPDATE notifications SET dismissed = 1 WHERE processing_archive_id = ? AND dismissed = 0",
-                (row["archive_id"],),
-            )
-
-        # Also fail stuck activity jobs for processing
+        # Fail stuck processing jobs
         conn.execute(
-            "UPDATE activity_jobs SET status = 'failed', completed_at = ?, "
-            "summary = 'Interrupted by crash/restart' "
-            "WHERE category = 'processing' AND status = 'running'",
+            "UPDATE processing_jobs SET status = 'failed', error_message = 'Interrupted by crash/restart', "
+            "completed_at = ? WHERE status = 'running'",
             (time.time(),),
         )
+        stuck_jobs = conn.execute("SELECT changes()").fetchone()[0]
 
-        # Also reset stuck scan activity jobs
+        # Dismiss ALL stale processing notifications — any notification with
+        # processing_archive_id set where the job is no longer running.
+        # This catches both jobs stuck in 'running' (just failed above) and
+        # jobs that were already marked failed/completed but whose notification
+        # was never cleaned up.  Clear the processing_archive_id so that
+        # clear_notifications() and the dismiss endpoint can handle them
+        # normally going forward.
+        conn.execute("""
+            UPDATE notifications
+            SET dismissed = 1, processing_archive_id = NULL
+            WHERE processing_archive_id IS NOT NULL
+              AND dismissed = 0
+              AND processing_archive_id NOT IN (
+                  SELECT archive_id FROM processing_jobs WHERE status IN ('pending', 'running')
+              )
+        """)
+        stale_notifs = conn.execute("SELECT changes()").fetchone()[0]
+
+        # Same for scan notifications
+        conn.execute("""
+            UPDATE notifications
+            SET dismissed = 1, scan_archive_id = NULL
+            WHERE scan_archive_id IS NOT NULL
+              AND dismissed = 0
+        """)
+
+        # Fail stuck activity jobs for processing and scan
         conn.execute(
             "UPDATE activity_jobs SET status = 'failed', completed_at = ?, "
             "summary = 'Interrupted by crash/restart' "
-            "WHERE category = 'scan' AND status = 'running'",
+            "WHERE category IN ('processing', 'scan') AND status = 'running'",
             (time.time(),),
         )
 
         conn.commit()
 
-        if stuck_files or stuck_jobs:
-            log.info("Reset %d stuck files and %d stuck processing jobs after restart",
-                     stuck_files, len(stuck_jobs))
+        if stuck_files or stuck_jobs or stale_notifs:
+            log.info("Startup cleanup: %d stuck files, %d stuck jobs, %d stale notifications",
+                     stuck_files, stuck_jobs, stale_notifs)
 
 
 def reset_failed_files(archive_id):
@@ -1377,14 +1387,35 @@ def get_notification(notif_id):
 
 
 def clear_notifications():
-    """Dismiss all non-active notifications (those without ongoing scan/processing/adding)."""
+    """Dismiss all non-active notifications.
+
+    Clears notifications that have no ongoing operation, plus stale
+    processing/scan notifications whose jobs are no longer running.
+    """
     with _db() as conn:
+        # Clear simple notifications (no linked operation)
         conn.execute("""
             UPDATE notifications SET dismissed = 1
             WHERE dismissed = 0
               AND scan_archive_id IS NULL
               AND processing_archive_id IS NULL
               AND adding_archive = 0
+        """)
+        # Clear stale processing notifications (job finished/failed/cancelled)
+        conn.execute("""
+            UPDATE notifications SET dismissed = 1, processing_archive_id = NULL
+            WHERE dismissed = 0
+              AND processing_archive_id IS NOT NULL
+              AND processing_archive_id NOT IN (
+                  SELECT archive_id FROM processing_jobs WHERE status IN ('pending', 'running')
+              )
+        """)
+        # Clear stale scan notifications (scans don't have a persistent job table,
+        # so any scan notification at clear time is stale)
+        conn.execute("""
+            UPDATE notifications SET dismissed = 1, scan_archive_id = NULL
+            WHERE dismissed = 0
+              AND scan_archive_id IS NOT NULL
         """)
         conn.commit()
 

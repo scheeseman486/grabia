@@ -259,18 +259,26 @@ def _fail_activity_job(processing_job_id, error_msg):
 
 
 def _dismiss_processing_notification(archive_id, error_msg):
-    """Update the processing notification for a crashed job."""
+    """Update the processing notification for a crashed job and release it.
+
+    Clears processing_archive_id so the notification is no longer treated as
+    an "active processing" notification that can't be dismissed or cleared.
+    """
     try:
         notif = db.find_notification_by_processing(archive_id)
         if notif:
             archive = db.get_archive(archive_id)
             name = (archive["title"] or archive["identifier"]) if archive else f"Archive #{archive_id}"
-            db.update_notification(
-                notif["id"],
-                message=f'Processing "{name}" failed: {error_msg[:150]}',
-                type="error",
-                progress=None,
-            )
+            # Update message and release the processing lock in one go
+            with db._db() as conn:
+                conn.execute(
+                    """UPDATE notifications
+                       SET message = ?, type = 'error', progress = NULL,
+                           processing_archive_id = NULL
+                       WHERE id = ?""",
+                    (f'Processing "{name}" failed: {error_msg[:150]}', notif["id"]),
+                )
+                conn.commit()
             _broadcast("notification_updated", db.get_notification(notif["id"]))
     except Exception:
         pass
@@ -621,7 +629,8 @@ def _run_processing(job):
         activity.flush()
         activity.finish_job(act_job_id, status, summary=summary_str)
 
-    # Update notification with final result
+    # Update notification with final result and release the processing lock
+    # so it can be dismissed/cleared normally.
     if notif_id:
         parts = []
         if summary["processed"] > 0:
@@ -632,7 +641,15 @@ def _run_processing(job):
             parts.append(f'{summary["failed"]} failed')
         result_msg = ", ".join(parts) if parts else "no eligible files"
         ntype = "warning" if summary["failed"] > 0 else "success"
-        db.update_notification(notif_id, message=f'Processing "{archive_name}": {result_msg}', type=ntype, progress=None)
+        with db._db() as conn:
+            conn.execute(
+                """UPDATE notifications
+                   SET message = ?, type = ?, progress = NULL,
+                       processing_archive_id = NULL
+                   WHERE id = ?""",
+                (f'Processing "{archive_name}": {result_msg}', ntype, notif_id),
+            )
+            conn.commit()
         _broadcast("notification_updated", db.get_notification(notif_id))
 
     _broadcast("processing_progress", {
