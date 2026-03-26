@@ -693,13 +693,31 @@ def count_unqueued_files(archive_id):
 
 def set_file_queued(file_id, queued):
     with _db() as conn:
-        conn.execute("UPDATE archive_files SET queued = ? WHERE id = ?", (1 if queued else 0, file_id))
+        if queued:
+            # Only queue files that still need downloading
+            conn.execute(
+                """UPDATE archive_files SET queued = 1
+                   WHERE id = ? AND download_status NOT IN ('completed', 'conflict')
+                     AND processing_status NOT IN ('queued', 'processing', 'processed')""",
+                (file_id,),
+            )
+        else:
+            conn.execute("UPDATE archive_files SET queued = 0 WHERE id = ?", (file_id,))
         conn.commit()
 
 
 def set_all_files_queued(archive_id, queued):
     with _db() as conn:
-        conn.execute("UPDATE archive_files SET queued = ? WHERE archive_id = ?", (1 if queued else 0, archive_id))
+        if queued:
+            # Only queue files that still need downloading
+            conn.execute(
+                """UPDATE archive_files SET queued = 1
+                   WHERE archive_id = ? AND download_status NOT IN ('completed', 'conflict')
+                     AND processing_status NOT IN ('queued', 'processing', 'processed')""",
+                (archive_id,),
+            )
+        else:
+            conn.execute("UPDATE archive_files SET queued = 0 WHERE archive_id = ?", (archive_id,))
         conn.commit()
 
 
