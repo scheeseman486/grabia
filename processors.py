@@ -49,22 +49,29 @@ from logger import log
 #    (lzma+zlib+huff+flac), each thread allocates ~200 MB total.
 #    CD default (cdlz+cdzl+cdfl) is lighter at ~100 MB/thread.
 #
-# -- chdman memory model (see module docstring above) --
+# -- chdman memory model --
 #
-# Budget formula:  usable = available - base - file_overhead - reserve
-#                  threads = usable // per_thread
+# Budget formula:
+#   pool     = available_mb * _CHDMAN_MEMORY_FRACTION
+#   usable   = pool - base - file_overhead
+#   threads  = usable // per_thread
+#
+# LZMA compression allocates much more than just the 64 MB dictionary per
+# thread: the match finder (bt4/hc4) needs ~4-6× the dictionary for its
+# hash chains and binary tree, plus codec trial buffers.  Empirically,
+# 32 threads OOM-killed a 12 GB container (8.2 GB free) — meaning the
+# real cost is ~250-350 MB per DVD thread, not the 200 MB we estimated
+# before.
 #
 # The *minimum* constants are hard floors: if the container has less free
-# memory than the minimum, we refuse to run chdman at all (fail fast with
-# a clear error instead of letting the OOM killer fire after minutes of
-# work).  These were set empirically: a 2 GB container with ~1020 MB free
-# was consistently OOM-killed running a 7.3 GB DVD with 1 thread.
+# memory than the minimum, we refuse to run at all (fail fast instead of
+# letting the OOM killer fire after minutes of work).
 #
 _CHDMAN_BASE_OVERHEAD_MB = 150     # process startup, CHD structures, output metadata
 _CHDMAN_FILE_OVERHEAD_PCT = 0.02   # ~2 % of input: hunk map + SHA1 tree (small)
-_CHDMAN_MB_PER_THREAD_DVD = 200    # per thread: LZMA 64MB dict + zlib + huff + flac
-_CHDMAN_MB_PER_THREAD_CD = 100     # per thread: cdlz + cdzl + cdfl
-_SYSTEM_RESERVE_MB = 300           # headroom for Grabia, Flask, Python GC, OS
+_CHDMAN_MB_PER_THREAD_DVD = 350    # LZMA dict 64MB + match finder ~256MB + zlib/huff/flac
+_CHDMAN_MB_PER_THREAD_CD = 150     # cdlz + cdzl + cdfl (lighter codecs)
+_CHDMAN_MEMORY_FRACTION = 0.70     # use at most 70 % of available memory for chdman
 
 # Hard minimums — below this, don't even try
 _CHDMAN_MIN_MEMORY_DVD_MB = 1100   # 1 thread DVD needs ~800-900MB; pad for safety
@@ -128,18 +135,19 @@ def _get_chdman_threads(user_setting, disc_type="dvd", input_path=None):
             f"or reduce other running processes."
         )
 
-    usable = available_mb - total_base - _SYSTEM_RESERVE_MB
+    pool = int(available_mb * _CHDMAN_MEMORY_FRACTION)
+    usable = pool - total_base
     if usable < mb_per_thread:
         log.warning("proc", "chdman threads: low memory "
-                    "(%dMB available, %dMB base+file overhead), using 1 thread",
-                    available_mb, total_base)
+                    "(%dMB available, %dMB pool, %dMB base+file), using 1 thread",
+                    available_mb, pool, total_base)
         return 1
 
     mem_threads = int(usable // mb_per_thread)
     threads = max(1, min(mem_threads, cpu_count))
-    log.info("proc", "chdman threads: %d (avail=%dMB, base=%dMB, file=%.0fMB, "
-             "%dMB/thread, usable=%dMB, cpus=%d)",
-             threads, available_mb, total_base, file_size_mb,
+    log.info("proc", "chdman threads: %d (avail=%dMB, pool=%dMB, base=%dMB, "
+             "file=%.0fMB, %dMB/thread, usable=%dMB, cpus=%d)",
+             threads, available_mb, pool, total_base, file_size_mb,
              mb_per_thread, usable, cpu_count)
     return threads
 
