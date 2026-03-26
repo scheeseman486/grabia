@@ -3814,36 +3814,44 @@
             const data = await api("GET", `/api/activity/log?${params}`);
             renderActivityLog(data.entries, data.total);
         } catch (err) {
-            $("#activity-log-list").innerHTML = `<div class="activity-empty">Failed to load activity log</div>`;
+            $("#activity-log-list").innerHTML = `<div class="activity-log-wrap"><div class="activity-empty">Failed to load activity log</div></div>`;
         }
     }
 
     function renderActivityLog(entries, total) {
         const list = $("#activity-log-list");
         if (!entries || entries.length === 0) {
-            list.innerHTML = `<div class="activity-empty">No activity log entries</div>`;
+            list.innerHTML = `<div class="activity-log-wrap"><div class="activity-empty">No activity log entries</div></div>`;
             $("#activity-pagination").innerHTML = "";
             return;
         }
-        list.innerHTML = entries.map(e => {
+        const rows = entries.map(e => {
             const dt = new Date(e.timestamp * 1000);
             const time = dt.toLocaleString();
             const cat = e.resolved_category || e.category || "";
             const lvl = e.level || "info";
             const archiveLink = e.archive_identifier
-                ? `<span class="entry-archive" data-id="${e.archive_id}">${esc(e.archive_title || e.archive_identifier)}</span>`
+                ? ` — <span class="entry-archive" data-id="${e.archive_id}">${esc(e.archive_title || e.archive_identifier)}</span>`
                 : "";
             const detail = e.detail
                 ? `<div class="entry-detail">${esc(e.detail)}</div>`
                 : "";
-            return `<div class="activity-entry">
-                <span class="entry-time">${esc(time)}</span>
-                <span class="entry-category">${esc(cat)}</span>
-                <span class="entry-level level-${lvl}">${esc(lvl)}</span>
-                <span class="entry-message">${esc(e.message)}${archiveLink ? " — " + archiveLink : ""}</span>
-                ${detail}
-            </div>`;
+            return `<tr>
+                <td class="col-time"><span class="entry-time">${esc(time)}</span></td>
+                <td class="col-category"><span class="entry-category">${esc(cat)}</span></td>
+                <td class="col-level"><span class="entry-level level-${lvl}">${esc(lvl)}</span></td>
+                <td><span class="entry-message">${esc(e.message)}${archiveLink}</span>${detail}</td>
+            </tr>`;
         }).join("");
+        list.innerHTML = `<div class="activity-log-wrap"><table class="activity-table">
+            <thead><tr>
+                <th class="col-time">Time</th>
+                <th class="col-category">Category</th>
+                <th class="col-level">Level</th>
+                <th>Message</th>
+            </tr></thead>
+            <tbody>${rows}</tbody>
+        </table></div>`;
 
         // Click on archive links
         list.querySelectorAll(".entry-archive").forEach(el => {

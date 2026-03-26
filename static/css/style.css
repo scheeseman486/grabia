@@ -2624,45 +2624,71 @@ tr.processed-detail-row td { padding: 0 !important; }
 .job-card .job-time { color: var(--text-dim); font-size: 12px; }
 .job-card .job-summary { color: var(--text-secondary); font-size: 12px; margin-left: auto; }
 
-.activity-log-list { min-height: 200px; }
-.activity-empty { color: var(--text-dim); text-align: center; padding: 40px; }
-
-.activity-entry {
-    display: grid;
-    grid-template-columns: 150px 80px 80px 1fr;
-    gap: 8px;
+/* Activity log table — mirrors .file-table-wrap / .file-table */
+.activity-log-wrap {
+    overflow-x: auto;
+    overflow-y: auto;
+    flex: 1 1 0;
+    min-height: 0;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--bg-secondary);
+}
+.activity-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
+}
+.activity-table th {
+    text-align: left;
+    padding: 10px 12px;
+    background: var(--bg-tertiary);
+    color: var(--text-secondary);
+    font-weight: 600;
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    border-bottom: 1px solid var(--border);
+    position: sticky;
+    top: 0;
+    z-index: 2;
+}
+.activity-table td {
     padding: 8px 12px;
     border-bottom: 1px solid var(--border);
-    font-size: 13px;
-    align-items: start;
+    vertical-align: top;
 }
-.activity-entry:hover { background: var(--surface); }
-.activity-entry .entry-time { color: var(--text-dim); font-size: 12px; font-family: monospace; }
-.activity-entry .entry-category {
+.activity-table tr:last-child td { border-bottom: none; }
+.activity-table tr:hover td { background: var(--bg-hover); }
+
+.activity-table .col-time { width: 155px; }
+.activity-table .col-category { width: 90px; }
+.activity-table .col-level { width: 80px; }
+
+.activity-table .entry-time { color: var(--text-dim); font-size: 12px; font-family: monospace; white-space: nowrap; }
+.activity-table .entry-category {
     font-size: 11px;
     text-transform: uppercase;
     font-weight: 600;
-    color: var(--text-dim);
+    color: var(--text-secondary);
 }
-.activity-entry .entry-level {
+.activity-table .entry-level {
+    display: inline-block;
     font-size: 11px;
     font-weight: 600;
     padding: 1px 6px;
     border-radius: 4px;
-    text-align: center;
-    width: fit-content;
 }
 .entry-level.level-info { background: var(--border); color: var(--text); }
 .entry-level.level-success { background: var(--success); color: #fff; }
 .entry-level.level-warning { background: var(--warning); color: #000; }
 .entry-level.level-error { background: var(--danger); color: #fff; }
 
-.activity-entry .entry-message { line-height: 1.4; }
-.activity-entry .entry-detail {
-    grid-column: 1 / -1;
+.activity-table .entry-message { line-height: 1.4; }
+.activity-table .entry-detail {
     padding: 6px 10px;
-    margin-top: 4px;
-    background: var(--bg);
+    margin-top: 6px;
+    background: var(--bg-tertiary);
     border-radius: 4px;
     font-family: monospace;
     font-size: 12px;
@@ -2670,12 +2696,14 @@ tr.processed-detail-row td { padding: 0 !important; }
     word-break: break-all;
     color: var(--text-dim);
 }
-.activity-entry .entry-archive {
-    font-size: 11px;
+.activity-table .entry-archive {
+    font-size: 12px;
     color: var(--accent);
     cursor: pointer;
 }
-.activity-entry .entry-archive:hover { text-decoration: underline; }
+.activity-table .entry-archive:hover { text-decoration: underline; }
+
+.activity-empty { color: var(--text-dim); text-align: center; padding: 40px; }
 
 .activity-pagination {
     display: flex;
@@ -2684,14 +2712,14 @@ tr.processed-detail-row td { padding: 0 !important; }
     padding: 16px 0;
 }
 .activity-pagination button {
-    padding: 6px 14px;
+    padding: 4px 12px;
     border: 1px solid var(--border);
-    border-radius: 6px;
-    background: var(--surface);
-    color: var(--text);
+    border-radius: 4px;
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
     cursor: pointer;
     font-size: 13px;
 }
 .activity-pagination button:disabled { opacity: 0.4; cursor: default; }
-.activity-pagination button:hover:not(:disabled) { background: var(--border); }
-.activity-pagination .page-info { line-height: 32px; font-size: 13px; color: var(--text-dim); }
+.activity-pagination button:hover:not(:disabled) { background: var(--bg-hover); }
+.activity-pagination .page-info { line-height: 28px; font-size: 13px; color: var(--text-secondary); }
