@@ -56,6 +56,55 @@ _CHDMAN_FLAC_MEMORY_RATIO = 2.8   # peak_anonymous ≈ input_size × this (with 
 _CHDMAN_MEMORY_HEADROOM_MB = 700  # reserve for Grabia, Flask, OS, other containers
 
 
+def _get_disc_data_size(input_path):
+    """Return total data size in bytes for a disc image input path.
+
+    For .cue files, parses the sheet and sums the referenced BIN files.
+    For .gdi files, sums the referenced track files.
+    For everything else (.iso, .bin, .img), returns the file size directly.
+    """
+    if not input_path:
+        return 0
+    ext = os.path.splitext(input_path)[1].lower()
+    input_dir = os.path.dirname(input_path) or "."
+
+    if ext == ".cue":
+        bins = _parse_cue_bins(input_path, input_dir)
+        if bins:
+            total = 0
+            for b in bins:
+                try:
+                    total += os.path.getsize(b)
+                except OSError:
+                    pass
+            return total
+        # No bins found — fall through to direct size
+
+    if ext == ".gdi":
+        total = 0
+        try:
+            with open(input_path, "r", errors="replace") as f:
+                for line in f:
+                    parts = line.strip().split()
+                    if len(parts) >= 5:
+                        track_name = parts[4].strip('"')
+                        track_path = os.path.join(input_dir, track_name)
+                        try:
+                            total += os.path.getsize(track_path)
+                        except OSError:
+                            pass
+        except OSError:
+            pass
+        if total > 0:
+            return total
+        # No tracks found — fall through to direct size
+
+    try:
+        return os.path.getsize(input_path)
+    except OSError:
+        return 0
+
+
 def _can_use_flac(disc_type, input_path):
     """Check whether there's enough memory to use FLAC compression.
 
@@ -65,12 +114,7 @@ def _can_use_flac(disc_type, input_path):
     Returns True if FLAC is safe to use, False if memory is insufficient
     (caller should fall back to non-FLAC codecs).
     """
-    file_size_mb = 0
-    if input_path:
-        try:
-            file_size_mb = os.path.getsize(input_path) / (1024 * 1024)
-        except OSError:
-            pass
+    file_size_mb = _get_disc_data_size(input_path) / (1024 * 1024)
 
     estimated_peak = int(file_size_mb * _CHDMAN_FLAC_MEMORY_RATIO)
     needed = estimated_peak + _CHDMAN_MEMORY_HEADROOM_MB
