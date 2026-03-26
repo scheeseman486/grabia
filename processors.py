@@ -27,6 +27,112 @@ import zipfile
 from logger import log
 
 
+# ---------------------------------------------------------------------------
+# Memory-aware thread scaling for chdman
+# ---------------------------------------------------------------------------
+
+# Approximate per-thread memory for chdman compression buffers.
+# DVD default compression (lzma+zlib+huff+flac) is ~50 MB/thread;
+# CD default compression (cdlz+cdzl+cdfl) is ~25 MB/thread.
+# These are conservative estimates that include hunk I/O buffers.
+_CHDMAN_MB_PER_THREAD_DVD = 50
+_CHDMAN_MB_PER_THREAD_CD = 25
+_CHDMAN_BASE_OVERHEAD_MB = 150  # hunk map, SHA1 tracking, I/O buffers, etc.
+_SYSTEM_RESERVE_MB = 512        # leave headroom for Grabia, OS, other containers
+
+
+def _get_chdman_threads(user_setting, disc_type="dvd"):
+    """Return the number of chdman threads to use, respecting available memory.
+
+    When *user_setting* is 0 (auto), compute a thread count that fits within
+    the container / system memory.  When it's a positive integer, honour it
+    directly (the user explicitly chose it).
+
+    Returns an int >= 1.
+    """
+    if user_setting and int(user_setting) > 0:
+        return int(user_setting)
+
+    import multiprocessing
+    cpu_count = multiprocessing.cpu_count()
+
+    # Try to read available memory from cgroup (Docker) first, then system
+    available_mb = _get_available_memory_mb()
+    if available_mb is None:
+        # Can't determine memory — be conservative: half of CPUs, min 1, max 4
+        threads = max(1, min(cpu_count // 2, 4))
+        log.debug("proc", "chdman threads: no memory info, defaulting to %d (cpus=%d)", threads, cpu_count)
+        return threads
+
+    mb_per_thread = _CHDMAN_MB_PER_THREAD_DVD if disc_type == "dvd" else _CHDMAN_MB_PER_THREAD_CD
+    usable = available_mb - _CHDMAN_BASE_OVERHEAD_MB - _SYSTEM_RESERVE_MB
+    if usable < mb_per_thread:
+        log.warning("proc", "chdman threads: very low memory (%d MB available), using 1 thread", available_mb)
+        return 1
+
+    mem_threads = int(usable // mb_per_thread)
+    threads = max(1, min(mem_threads, cpu_count))
+    log.debug("proc", "chdman threads: %d (mem=%dMB, usable=%dMB, %dMB/thread, cpus=%d)",
+              threads, available_mb, usable, mb_per_thread, cpu_count)
+    return threads
+
+
+def _get_available_memory_mb():
+    """Return available memory in MB, checking cgroup limits then system memory.
+
+    Returns None if memory cannot be determined.
+    """
+    # 1. Check cgroup v2 memory limit (Docker with modern kernels)
+    cgroup_limit = None
+    try:
+        with open("/sys/fs/cgroup/memory.max", "r") as f:
+            val = f.read().strip()
+            if val != "max":
+                cgroup_limit = int(val) // (1024 * 1024)
+    except (OSError, ValueError):
+        pass
+
+    # 2. Check cgroup v1 memory limit (older Docker / Unraid)
+    if cgroup_limit is None:
+        try:
+            with open("/sys/fs/cgroup/memory/memory.limit_in_bytes", "r") as f:
+                val = int(f.read().strip())
+                # Very large values mean "no limit set"
+                if val < 2**62:
+                    cgroup_limit = val // (1024 * 1024)
+        except (OSError, ValueError):
+            pass
+
+    # 3. Get current memory usage within the cgroup
+    cgroup_usage = None
+    try:
+        with open("/sys/fs/cgroup/memory.current", "r") as f:
+            cgroup_usage = int(f.read().strip()) // (1024 * 1024)
+    except (OSError, ValueError):
+        pass
+    if cgroup_usage is None:
+        try:
+            with open("/sys/fs/cgroup/memory/memory.usage_in_bytes", "r") as f:
+                cgroup_usage = int(f.read().strip()) // (1024 * 1024)
+        except (OSError, ValueError):
+            pass
+
+    if cgroup_limit is not None:
+        available = cgroup_limit - (cgroup_usage or 0)
+        return max(available, 0)
+
+    # 4. Fall back to system MemAvailable from /proc/meminfo
+    try:
+        with open("/proc/meminfo", "r") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) // 1024  # kB -> MB
+    except (OSError, ValueError):
+        pass
+
+    return None
+
+
 def _safe_relpath(rel, dest_dir):
     """Validate that a relative path stays within dest_dir when joined.
 
@@ -709,9 +815,8 @@ class CHDCDProcessor(BaseProcessor):
         compression = self.options.get("compression", "default")
         if compression != "default":
             cmd.extend(["-c", compression])
-        num_proc = int(self.options.get("num_processors", 0))
-        if num_proc > 0:
-            cmd.extend(["-np", str(num_proc)])
+        threads = _get_chdman_threads(self.options.get("num_processors", 0), disc_type="cd")
+        cmd.extend(["-np", str(threads)])
 
         log.debug("proc", "Running: %s", " ".join(cmd))
         self._check_cancel()
@@ -925,9 +1030,8 @@ class CHDAutoProcessor(BaseProcessor):
     def _run_chdman_createcd(self, chdman, input_path, output_path):
         cmd = [chdman, "createcd", "-i", input_path, "-o", output_path, "-f"]
         cmd.extend(self._get_compression_args("cd"))
-        num_proc = int(self.options.get("num_processors", 0))
-        if num_proc > 0:
-            cmd.extend(["-np", str(num_proc)])
+        threads = _get_chdman_threads(self.options.get("num_processors", 0), disc_type="cd")
+        cmd.extend(["-np", str(threads)])
 
         log.debug("proc", "Running: %s", " ".join(cmd))
         self._check_cancel()
@@ -942,9 +1046,8 @@ class CHDAutoProcessor(BaseProcessor):
     def _run_chdman_createdvd(self, chdman, input_path, output_path):
         cmd = [chdman, "createdvd", "-i", input_path, "-o", output_path, "-f"]
         cmd.extend(self._get_compression_args("dvd"))
-        num_proc = int(self.options.get("num_processors", 0))
-        if num_proc > 0:
-            cmd.extend(["-np", str(num_proc)])
+        threads = _get_chdman_threads(self.options.get("num_processors", 0), disc_type="dvd")
+        cmd.extend(["-np", str(threads)])
 
         log.debug("proc", "Running: %s", " ".join(cmd))
         self._check_cancel()
@@ -1070,9 +1173,8 @@ class CHDDVDProcessor(BaseProcessor):
         compression = self.options.get("compression", "default")
         if compression != "default":
             cmd.extend(["-c", compression])
-        num_proc = int(self.options.get("num_processors", 0))
-        if num_proc > 0:
-            cmd.extend(["-np", str(num_proc)])
+        threads = _get_chdman_threads(self.options.get("num_processors", 0), disc_type="dvd")
+        cmd.extend(["-np", str(threads)])
 
         self._check_cancel()
         result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, timeout=14400)
