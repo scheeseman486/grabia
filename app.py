@@ -645,6 +645,7 @@ def _run_scan(archive_id):
     activity.log(act_job_id, "info",
                  f"Scan started: {total_manifest} manifest files to verify",
                  archive_id=archive_id)
+    activity.flush()
 
     broadcast_sse("scan_progress", {"archive_id": archive_id, "phase": "verify", "current": 0, "total": total_manifest})
 

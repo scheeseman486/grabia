@@ -367,6 +367,7 @@ def _run_processing(job):
         activity.log(act_job_id, "info",
                      f"Processing started: {len(files)} files with {profile['name']}",
                      archive_id=archive_id)
+        activity.flush()
 
     _broadcast("processing_progress", {
         "archive_id": archive_id,
@@ -548,7 +549,7 @@ def _run_processing(job):
             })
 
         # Periodic flush so entries are visible during long jobs
-        if act_job_id and (i + 1) % 25 == 0:
+        if act_job_id and (i + 1) % 10 == 0:
             activity.flush()
 
     log.info("worker", "Processing complete for archive %d: %d processed, %d skipped, %d failed",
