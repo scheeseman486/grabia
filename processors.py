@@ -56,18 +56,15 @@ _CHDMAN_FLAC_MEMORY_RATIO = 2.8   # peak_anonymous ≈ input_size × this (with 
 _CHDMAN_MEMORY_HEADROOM_MB = 700  # reserve for Grabia, Flask, OS, other containers
 
 
-def _check_chdman_memory(disc_type, input_path, uses_flac=False):
-    """Check memory when FLAC codec is in use (the only codec that needs lots of RAM).
+def _can_use_flac(disc_type, input_path):
+    """Check whether there's enough memory to use FLAC compression.
 
-    Without FLAC, chdman uses <100 MB regardless of file size — no check needed.
-    With FLAC, peak anonymous memory is ~2.8× the input file size and the
-    conversion WILL be OOM-killed if the container doesn't have enough.
+    FLAC is the only chdman codec that needs significant RAM (~2.8× file size).
+    Without FLAC, chdman uses <100 MB regardless of file size.
 
-    Raises ProcessingError with a helpful message if memory is insufficient.
+    Returns True if FLAC is safe to use, False if memory is insufficient
+    (caller should fall back to non-FLAC codecs).
     """
-    if not uses_flac:
-        return  # Non-FLAC codecs use <100 MB — no concern
-
     file_size_mb = 0
     if input_path:
         try:
@@ -80,31 +77,21 @@ def _check_chdman_memory(disc_type, input_path, uses_flac=False):
 
     available_mb = _get_available_memory_mb()
     if available_mb is None:
-        log.warning("proc", "chdman memory check (FLAC): cannot detect memory "
-                    "limits; estimated peak for %.0fMB %s file = %dMB",
-                    file_size_mb, disc_type.upper(), estimated_peak)
-        return
+        log.debug("proc", "chdman FLAC check: cannot detect memory limits; "
+                  "estimated peak for %.0fMB %s file = %dMB, skipping FLAC",
+                  file_size_mb, disc_type.upper(), estimated_peak)
+        return False  # Can't verify — be safe, skip FLAC
 
-    log.info("proc", "chdman memory check (FLAC): %.0fMB %s file, "
-             "estimated peak %dMB (%.1f× file), available %dMB",
-             file_size_mb, disc_type.upper(), estimated_peak,
-             _CHDMAN_FLAC_MEMORY_RATIO, available_mb)
+    if available_mb >= needed:
+        log.debug("proc", "chdman FLAC check: %.0fMB %s file, estimated peak "
+                  "%dMB, available %dMB — FLAC OK",
+                  file_size_mb, disc_type.upper(), estimated_peak, available_mb)
+        return True
 
-    if available_mb < needed:
-        needed_gb = needed / 1024
-        avail_gb = available_mb / 1024
-        log.error("proc", "chdman: not enough memory for FLAC compression — "
-                  "%.1fGB available, need ~%.1fGB for %.0fMB %s file",
-                  avail_gb, needed_gb, file_size_mb, disc_type.upper())
-        raise ProcessingError(
-            f"Not enough memory for CHD conversion with FLAC: "
-            f"{avail_gb:.1f}GB available, need ~{needed_gb:.1f}GB for this "
-            f"{file_size_mb:.0f}MB {disc_type.upper()} file. "
-            f"The FLAC codec uses ~{_CHDMAN_FLAC_MEMORY_RATIO}× the input "
-            f"file size in memory. Switch to the default compression preset "
-            f"(without FLAC) to use <100MB, or increase the container memory "
-            f"limit to at least {needed_gb:.0f}GB."
-        )
+    log.debug("proc", "chdman FLAC check: %.0fMB %s file, estimated peak "
+              "%dMB, available %dMB — dropping FLAC (insufficient memory)",
+              file_size_mb, disc_type.upper(), estimated_peak, available_mb)
+    return False
 
 
 def _get_chdman_threads(user_setting, disc_type="dvd", input_path=None):
@@ -112,7 +99,7 @@ def _get_chdman_threads(user_setting, disc_type="dvd", input_path=None):
 
     Since chdman's peak memory is file-size-dominated (not thread-dependent),
     thread count is chosen purely for CPU efficiency.  Memory checking is
-    handled separately by _check_chdman_memory().
+    handled separately by _can_use_flac().
 
     When *user_setting* is 0 (auto), use half the available CPUs (good
     balance of speed vs leaving resources for Grabia/OS).
@@ -878,8 +865,15 @@ class CHDCDProcessor(BaseProcessor):
     def _run_chdman_createcd(self, chdman, input_path, output_path):
         """Run chdman createcd with configured options."""
         compression = self.options.get("compression", "default")
-        flac = compression == "default" or "flac" in compression or "cdfl" in compression
-        _check_chdman_memory("cd", input_path, uses_flac=flac)
+        wants_flac = compression == "default" or "flac" in compression or "cdfl" in compression
+        if wants_flac and not _can_use_flac("cd", input_path):
+            # Fall back to non-FLAC CD codecs
+            if compression == "default":
+                compression = "cdlz,cdzl"
+            else:
+                # Strip FLAC/cdfl from a custom codec string
+                parts = [c for c in compression.split(",") if c not in ("flac", "cdfl")]
+                compression = ",".join(parts) if parts else "cdlz"
         cmd = [chdman, "createcd", "-i", input_path, "-o", output_path, "-f"]
         if compression != "default":
             cmd.extend(["-c", compression])
@@ -1104,19 +1098,34 @@ class CHDAutoProcessor(BaseProcessor):
                     pass
         return new_files
 
-    def _uses_flac(self, disc_type):
-        """Check if the chosen compression preset includes FLAC."""
+    # Fallback codecs when FLAC is dropped due to insufficient memory
+    _NO_FLAC_FALLBACK = {
+        "maximum": ("cdlz,cdzl,cdfl", "lzma,zlib,huff"),  # same as "default"
+        "flac":    ("cdlz", "lzma"),                        # fall back to LZMA
+    }
+
+    def _get_compression_args_checked(self, disc_type, input_path):
+        """Return -c flag arguments, dropping FLAC if memory is insufficient."""
         preset = self.options.get("compression", "default")
-        if preset in ("flac", "maximum"):
-            return True
         mapping = self._COMPRESSION_PRESETS.get(preset, (None, None))
         codec = mapping[0] if disc_type == "cd" else mapping[1]
-        return codec is not None and "flac" in codec or "cdfl" in (codec or "")
+
+        # Check if FLAC is involved (chdman built-in default includes FLAC)
+        wants_flac = codec is None or "flac" in (codec or "") or "cdfl" in (codec or "")
+        if wants_flac and not _can_use_flac(disc_type, input_path):
+            fallback = self._NO_FLAC_FALLBACK.get(preset)
+            if fallback:
+                codec = fallback[0] if disc_type == "cd" else fallback[1]
+            elif codec:
+                # Custom codec string — strip FLAC variants
+                parts = [c for c in codec.split(",") if c not in ("flac", "cdfl")]
+                codec = ",".join(parts) if parts else ("cdlz" if disc_type == "cd" else "lzma")
+
+        return ["-c", codec] if codec else []
 
     def _run_chdman_createcd(self, chdman, input_path, output_path):
-        _check_chdman_memory("cd", input_path, uses_flac=self._uses_flac("cd"))
         cmd = [chdman, "createcd", "-i", input_path, "-o", output_path, "-f"]
-        cmd.extend(self._get_compression_args("cd"))
+        cmd.extend(self._get_compression_args_checked("cd", input_path))
         threads = _get_chdman_threads(self.options.get("num_processors", 0))
         cmd.extend(["-np", str(threads)])
 
@@ -1131,9 +1140,8 @@ class CHDAutoProcessor(BaseProcessor):
         self._verify_chd(chdman, output_path)
 
     def _run_chdman_createdvd(self, chdman, input_path, output_path):
-        _check_chdman_memory("dvd", input_path, uses_flac=self._uses_flac("dvd"))
         cmd = [chdman, "createdvd", "-i", input_path, "-o", output_path, "-f"]
-        cmd.extend(self._get_compression_args("dvd"))
+        cmd.extend(self._get_compression_args_checked("dvd", input_path))
         threads = _get_chdman_threads(self.options.get("num_processors", 0))
         cmd.extend(["-np", str(threads)])
 
@@ -1267,13 +1275,21 @@ class CHDDVDProcessor(BaseProcessor):
 
     def _run_chdman_createdvd(self, chdman, input_path, output_path):
         compression = self.options.get("compression", "default")
-        flac = compression in ("maximum", "flac") or (
+        wants_flac = compression in ("maximum", "flac") or (
             compression not in self._DVD_COMPRESSION
             and "flac" in compression
         )
-        _check_chdman_memory("dvd", input_path, uses_flac=flac)
-        cmd = [chdman, "createdvd", "-i", input_path, "-o", output_path, "-f"]
         codec = self._DVD_COMPRESSION.get(compression, compression)
+        if wants_flac and not _can_use_flac("dvd", input_path):
+            # Fall back to non-FLAC codecs
+            if compression == "maximum":
+                codec = "lzma,zlib,huff"
+            elif compression == "flac":
+                codec = "lzma"
+            elif codec:
+                parts = [c for c in codec.split(",") if c != "flac"]
+                codec = ",".join(parts) if parts else "lzma"
+        cmd = [chdman, "createdvd", "-i", input_path, "-o", output_path, "-f"]
         if codec:
             cmd.extend(["-c", codec])
         threads = _get_chdman_threads(self.options.get("num_processors", 0))
