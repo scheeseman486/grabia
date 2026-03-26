@@ -271,10 +271,10 @@ def _extract_7z(path, dest_dir):
         raise ProcessingError("No 7z extraction tool available (install py7zr or 7z)")
     result = subprocess.run(
         [bin_path, "x", "-y", f"-o{dest_dir}", path],
-        capture_output=True, text=True, timeout=3600,
+        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, timeout=3600,
     )
     if result.returncode != 0:
-        raise ProcessingError(f"7z extraction failed: {result.stderr[:500]}")
+        raise ProcessingError(f"7z extraction failed: {(result.stderr or '')[:500]}")
     # Walk extracted files — only return safe paths
     extracted = []
     for root, _, files in os.walk(dest_dir):
@@ -291,10 +291,10 @@ def _extract_rar(path, dest_dir):
         raise ProcessingError("No RAR extraction tool available (install unrar)")
     result = subprocess.run(
         [bin_path, "x", "-y", "-o+", path, dest_dir + os.sep],
-        capture_output=True, text=True, timeout=3600,
+        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, timeout=3600,
     )
     if result.returncode != 0:
-        raise ProcessingError(f"unrar extraction failed: {result.stderr[:500]}")
+        raise ProcessingError(f"unrar extraction failed: {(result.stderr or '')[:500]}")
     # Walk extracted files — only return safe paths
     extracted = []
     for root, _, files in os.walk(dest_dir):
@@ -708,10 +708,11 @@ class CHDCDProcessor(BaseProcessor):
         self._check_cancel()
         result = subprocess.run(
             cmd,
-            capture_output=True, text=True, timeout=7200,
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+            text=True, timeout=7200,
         )
         if result.returncode != 0:
-            err = (result.stderr or result.stdout or "").strip()
+            err = (result.stderr or "").strip()
             log.error("proc", "chdman createcd failed (rc=%d): %s", result.returncode, err[:500])
             raise ProcessingError(f"chdman createcd failed: {err[:500]}")
 
@@ -719,7 +720,8 @@ class CHDCDProcessor(BaseProcessor):
         # Verify the output
         verify_result = subprocess.run(
             [chdman, "verify", "-i", output_path],
-            capture_output=True, text=True, timeout=3600,
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+            text=True, timeout=3600,
         )
         if verify_result.returncode != 0:
             os.remove(output_path)
@@ -920,9 +922,9 @@ class CHDAutoProcessor(BaseProcessor):
 
         log.debug("proc", "Running: %s", " ".join(cmd))
         self._check_cancel()
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=7200)
+        result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, timeout=7200)
         if result.returncode != 0:
-            err = (result.stderr or result.stdout or "").strip()
+            err = (result.stderr or "").strip()
             log.error("proc", "chdman createcd failed (rc=%d): %s", result.returncode, err[:500])
             raise ProcessingError(f"chdman createcd failed: {err[:500]}")
 
@@ -937,9 +939,9 @@ class CHDAutoProcessor(BaseProcessor):
 
         log.debug("proc", "Running: %s", " ".join(cmd))
         self._check_cancel()
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=14400)
+        result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, timeout=14400)
         if result.returncode != 0:
-            err = (result.stderr or result.stdout or "").strip()
+            err = (result.stderr or "").strip()
             log.error("proc", "chdman createdvd failed (rc=%d): %s", result.returncode, err[:500])
             raise ProcessingError(f"chdman createdvd failed: {err[:500]}")
 
@@ -949,7 +951,7 @@ class CHDAutoProcessor(BaseProcessor):
         log.debug("proc", "Verifying %s", os.path.basename(chd_path))
         verify_result = subprocess.run(
             [chdman, "verify", "-i", chd_path],
-            capture_output=True, text=True, timeout=7200,
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, timeout=7200,
         )
         if verify_result.returncode != 0:
             log.error("proc", "CHD verification failed for %s", os.path.basename(chd_path))
@@ -1064,14 +1066,14 @@ class CHDDVDProcessor(BaseProcessor):
             cmd.extend(["-np", str(num_proc)])
 
         self._check_cancel()
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=14400)
+        result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, timeout=14400)
         if result.returncode != 0:
-            err = (result.stderr or result.stdout or "").strip()
+            err = (result.stderr or "").strip()
             raise ProcessingError(f"chdman createdvd failed: {err[:500]}")
 
         verify_result = subprocess.run(
             [chdman, "verify", "-i", output_path],
-            capture_output=True, text=True, timeout=7200,
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, timeout=7200,
         )
         if verify_result.returncode != 0:
             os.remove(output_path)
@@ -1170,9 +1172,9 @@ class CISOProcessor(BaseProcessor):
             cmd.extend(["--block", block_size])
 
         self._check_cancel()
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=7200)
+        result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, timeout=7200)
         if result.returncode != 0:
-            err = (result.stderr or result.stdout or "").strip()
+            err = (result.stderr or "").strip()
             raise ProcessingError(f"maxcso failed: {err[:500]}")
 
 

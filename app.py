@@ -83,6 +83,12 @@ def broadcast_sse(event, data):
                 dead.append(q)
         for q in dead:
             sse_queues.remove(q)
+            # Drain the dead queue to free buffered messages
+            try:
+                while not q.empty():
+                    q.get_nowait()
+            except Exception:
+                pass
 
 
 # Hook download manager events into SSE
@@ -190,7 +196,7 @@ def index():
 @login_required
 def events():
     def stream():
-        q = queue.Queue(maxsize=200)
+        q = queue.Queue(maxsize=50)
         with sse_lock:
             sse_queues.append(q)
         try:
@@ -482,10 +488,13 @@ _scan_cancel = {}  # archive_id -> threading.Event
 _scan_lock = threading.Lock()
 
 
+_scan_conn = threading.local()  # holds the raw scan DB connection for cleanup
+
 def _scan_worker():
     """Background worker that processes scan jobs sequentially."""
     while True:
         archive_id = _scan_queue.get()
+        _scan_conn.conn = None
         try:
             _run_scan(archive_id)
         except Exception as e:
@@ -513,6 +522,13 @@ def _scan_worker():
                 "error": str(e),
             })
         finally:
+            # Ensure the raw scan DB connection is always closed
+            try:
+                if _scan_conn.conn is not None:
+                    _scan_conn.conn.close()
+                    _scan_conn.conn = None
+            except Exception:
+                pass
             with _scan_lock:
                 _scan_cancel.pop(archive_id, None)
             _scan_queue.task_done()
@@ -584,7 +600,6 @@ def _run_scan(archive_id):
         db.delete_notification(scan_notif_id)
         broadcast_sse("notification_dismissed", {"id": scan_notif_id})
         broadcast_sse("scan_progress", {"archive_id": archive_id, "phase": "cancelled", "current": processed, "total": total_manifest})
-        conn.close()
 
     # Time-based progress throttle
     last_progress = [0.0]  # mutable for closure
@@ -602,8 +617,11 @@ def _run_scan(archive_id):
             broadcast_sse("notification_updated", db.get_notification(scan_notif_id))
             last_notif_update[0] = now
 
-    # Clean slate
+    # Clean slate — use a raw connection for batched writes during the scan.
+    # Registered in _scan_conn so the worker's finally block can close it
+    # even if this function throws an unhandled exception.
     conn = db.get_db()
+    _scan_conn.conn = conn
     conn.execute(
         "DELETE FROM archive_files WHERE archive_id = ? AND origin = 'scan'",
         (archive_id,),
@@ -841,7 +859,7 @@ def _run_scan(archive_id):
         )
 
     conn.commit()
-    conn.close()
+    # conn is closed by _scan_worker's finally block via _scan_conn
 
     if unknown_files:
         log.debug("scan", "%d unknown files found on disk", len(unknown_files))

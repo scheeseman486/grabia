@@ -493,6 +493,9 @@ class DownloadManager:
                     # Update progress on a fixed interval
                     now = time.monotonic()
                     speed_samples.append((now, len(chunk)))
+                    # Hard cap to prevent unbounded growth between prune cycles
+                    if len(speed_samples) > 500:
+                        speed_samples = speed_samples[-250:]
                     if now >= next_update:
                         next_update += update_interval
                         # Guard against drift: if we fell behind, snap forward
