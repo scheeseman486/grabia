@@ -2183,6 +2183,14 @@ def get_activity_job(job_id):
     return jsonify(j)
 
 
+@app.route("/api/activity/jobs/<int:job_id>", methods=["DELETE"])
+@login_required
+def delete_activity_job(job_id):
+    """Delete an activity job and its log entries."""
+    activity.delete_job(job_id)
+    return jsonify({"ok": True})
+
+
 # --- Init ---
 
 def create_app():

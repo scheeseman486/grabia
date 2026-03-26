@@ -60,6 +60,18 @@
     let vsScrollRAF = null;         // requestAnimationFrame handle for scroll
     let vsLastRange = null;         // { start, end } of last rendered range
 
+    // --- Activity Log Virtual Scroll State ---
+    const AL_ROW_HEIGHT = 37;       // px per activity log row
+    const AL_OVERSCAN = 15;         // extra rows rendered above/below viewport
+    let alEntries = [];             // all activity entries from last fetch
+    let alScrollRAF = null;         // requestAnimationFrame handle
+    let alLastRange = null;         // { start, end } of last rendered range
+
+    // --- Activity Job Progress Tracking ---
+    // Maps archive_id → { current, total, phase } from SSE events
+    const jobProgressMap = new Map();
+    let showFinishedJobs = false;   // toggle for finished jobs visibility
+
     // --- Notifications ---
     let notifications = [];
     let notifIdCounter = 0;
@@ -563,11 +575,13 @@
         es.addEventListener("scan_progress", (e) => {
             const data = JSON.parse(e.data);
             updateScanProgress(data);
+            _updateJobProgress(data);
         });
 
         es.addEventListener("processing_progress", (e) => {
             const data = JSON.parse(e.data);
             updateProcessingProgress(data);
+            _updateJobProgress(data);
             // Refresh activity log if visible and job finished/cancelled
             if (data.phase === "done" || data.phase === "cancelled" || data.phase === "error") {
                 _refreshActivityIfVisible();
@@ -3688,57 +3702,91 @@
     async function loadActivityJobs(highlightJobId) {
         const banner = $("#activity-job-banner");
         try {
-            const data = await api("GET", "/api/activity/jobs?limit=10");
+            const data = await api("GET", "/api/activity/jobs?limit=50");
             const jobs = data.jobs || [];
             if (jobs.length === 0) {
                 banner.style.display = "none";
                 return;
             }
-            // If a specific job is highlighted, show it prominently
-            // Otherwise show active (running) jobs, or the most recent completed one
-            let displayJobs;
+
+            const running = jobs.filter(j => j.status === "running");
+            const finished = jobs.filter(j => j.status !== "running");
+
+            // If highlighting a specific job, ensure it's visible
             if (highlightJobId) {
                 activityJobFilter = highlightJobId;
-                displayJobs = jobs.filter(j => j.id === highlightJobId);
-                if (displayJobs.length === 0) {
-                    // Fetch it directly
+                const inRunning = running.some(j => j.id === highlightJobId);
+                const inFinished = finished.some(j => j.id === highlightJobId);
+                if (inFinished && !inRunning) showFinishedJobs = true;
+                if (!inRunning && !inFinished) {
+                    // Fetch it directly and prepend
                     try {
                         const j = await api("GET", `/api/activity/jobs/${highlightJobId}`);
-                        if (j) displayJobs = [j];
+                        if (j) {
+                            if (j.status === "running") running.unshift(j);
+                            else { finished.unshift(j); showFinishedJobs = true; }
+                        }
                     } catch (_) {}
                 }
-            } else {
-                // Show running jobs first, then most recent
-                const running = jobs.filter(j => j.status === "running");
-                displayJobs = running.length > 0 ? running : jobs.slice(0, 3);
             }
-            if (!displayJobs || displayJobs.length === 0) {
-                banner.style.display = "none";
-                return;
+
+            // Build HTML
+            let html = "";
+
+            // Running jobs — always visible
+            for (const j of running) {
+                html += buildJobCardHtml(j);
             }
-            banner.innerHTML = displayJobs.map(j => {
-                const started = new Date(j.started_at * 1000).toLocaleString();
-                const statusCls = j.status || "running";
-                const isFiltered = activityJobFilter === j.id;
-                const filterCls = isFiltered ? " job-card-active" : "";
-                const archiveName = j.archive_title || j.archive_identifier
-                    ? ` — ${esc(j.archive_title || j.archive_identifier)}`
-                    : "";
-                return `<div class="job-card${filterCls}" data-job-id="${j.id}">
-                    <span class="job-category">${esc(j.category)}</span>
-                    <span class="job-status ${statusCls}">${esc(j.status)}</span>
-                    <span class="job-time">${started}${archiveName}</span>
-                    ${j.summary ? `<span class="job-summary">${esc(j.summary)}</span>` : ""}
+
+            // Finished jobs section
+            if (finished.length > 0) {
+                const toggleLabel = showFinishedJobs
+                    ? `Hide finished (${finished.length})`
+                    : `Show finished (${finished.length})`;
+                html += `<div class="job-finished-toggle">
+                    <button class="job-toggle-btn" id="toggle-finished-jobs">${toggleLabel}</button>
+                    ${showFinishedJobs ? `<button class="job-clear-all-btn" id="clear-finished-jobs">Clear all</button>` : ""}
                 </div>`;
-            }).join("");
+                if (showFinishedJobs) {
+                    for (const j of finished) {
+                        html += buildJobCardHtml(j);
+                    }
+                }
+            }
+
+            banner.innerHTML = html;
             banner.style.display = "";
 
-            // Click on a job card to filter by it
+            // Wire up toggle finished
+            const toggleBtn = banner.querySelector("#toggle-finished-jobs");
+            if (toggleBtn) {
+                toggleBtn.addEventListener("click", (e) => {
+                    e.stopPropagation();
+                    showFinishedJobs = !showFinishedJobs;
+                    loadActivityJobs(activityJobFilter);
+                });
+            }
+
+            // Wire up clear all finished
+            const clearAllBtn = banner.querySelector("#clear-finished-jobs");
+            if (clearAllBtn) {
+                clearAllBtn.addEventListener("click", async (e) => {
+                    e.stopPropagation();
+                    for (const j of finished) {
+                        try { await api("DELETE", `/api/activity/jobs/${j.id}`); } catch (_) {}
+                    }
+                    loadActivityJobs(activityJobFilter);
+                });
+            }
+
+            // Wire up individual job card interactions
             banner.querySelectorAll(".job-card").forEach(el => {
-                el.addEventListener("click", () => {
-                    const jid = parseInt(el.dataset.jobId);
+                const jid = parseInt(el.dataset.jobId);
+
+                // Click card to filter log
+                el.addEventListener("click", (e) => {
+                    if (e.target.closest(".job-card-cancel") || e.target.closest(".job-card-dismiss")) return;
                     if (activityJobFilter === jid) {
-                        // Toggle off
                         activityJobFilter = null;
                         el.classList.remove("job-card-active");
                     } else {
@@ -3748,10 +3796,95 @@
                     }
                     loadActivityLog();
                 });
+
+                // Cancel button
+                const cancelBtn = el.querySelector(".job-card-cancel");
+                if (cancelBtn) {
+                    cancelBtn.addEventListener("click", (e) => {
+                        e.stopPropagation();
+                        const archiveId = parseInt(cancelBtn.dataset.archiveId);
+                        const cancelType = cancelBtn.dataset.cancelType;
+                        if (cancelType === "processing") cancelProcessing(archiveId);
+                        else if (cancelType === "scan") cancelScan(archiveId);
+                    });
+                }
+
+                // Dismiss button
+                const dismissBtn = el.querySelector(".job-card-dismiss");
+                if (dismissBtn) {
+                    dismissBtn.addEventListener("click", async (e) => {
+                        e.stopPropagation();
+                        try { await api("DELETE", `/api/activity/jobs/${jid}`); } catch (_) {}
+                        loadActivityJobs(activityJobFilter);
+                    });
+                }
             });
         } catch (_) {
             banner.style.display = "none";
         }
+    }
+
+    function buildJobCardHtml(j) {
+        const started = new Date(j.started_at * 1000).toLocaleString();
+        const statusCls = j.status || "running";
+        const isFiltered = activityJobFilter === j.id;
+        const filterCls = isFiltered ? " job-card-active" : "";
+        const isRunning = j.status === "running";
+        const archiveName = (j.archive_title || j.archive_identifier)
+            ? esc(j.archive_title || j.archive_identifier)
+            : "";
+
+        // Progress bar for running jobs
+        let progressHtml = "";
+        if (isRunning && j.archive_id) {
+            const prog = jobProgressMap.get(j.archive_id);
+            if (prog && prog.total > 0) {
+                const pct = Math.round((prog.current / prog.total) * 100);
+                progressHtml = `<div class="job-progress-track"><div class="job-progress-fill" style="width:${pct}%"></div></div>
+                    <span class="job-progress-text">${prog.current}/${prog.total}</span>`;
+            } else {
+                progressHtml = `<div class="job-progress-track"><div class="job-progress-fill indeterminate"></div></div>`;
+            }
+        }
+
+        // Action buttons
+        let actionsHtml = "";
+        if (isRunning && j.archive_id) {
+            const cancelType = j.category === "scan" ? "scan" : "processing";
+            actionsHtml = `<button class="job-card-cancel" data-archive-id="${j.archive_id}" data-cancel-type="${cancelType}" title="Cancel">Cancel</button>`;
+        } else if (!isRunning) {
+            actionsHtml = `<button class="job-card-dismiss" title="Remove">
+                <svg viewBox="0 0 24 24" width="12" height="12"><path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z" fill="currentColor"/></svg>
+            </button>`;
+        }
+
+        // Duration for finished jobs
+        let durationHtml = "";
+        if (!isRunning && j.completed_at && j.started_at) {
+            const dur = j.completed_at - j.started_at;
+            durationHtml = `<span class="job-duration">${formatDuration(dur)}</span>`;
+        }
+
+        return `<div class="job-card job-card-${statusCls}${filterCls}" data-job-id="${j.id}">
+            <div class="job-card-header">
+                <span class="job-category">${esc(j.category)}</span>
+                <span class="job-status ${statusCls}">${esc(j.status)}</span>
+                ${archiveName ? `<span class="job-archive">${archiveName}</span>` : ""}
+                <span class="job-time">${started}</span>
+                ${durationHtml}
+                ${actionsHtml}
+            </div>
+            ${progressHtml}
+            ${j.summary ? `<span class="job-summary">${esc(j.summary)}</span>` : ""}
+        </div>`;
+    }
+
+    function formatDuration(seconds) {
+        if (seconds < 60) return `${Math.round(seconds)}s`;
+        if (seconds < 3600) return `${Math.floor(seconds / 60)}m ${Math.round(seconds % 60)}s`;
+        const h = Math.floor(seconds / 3600);
+        const m = Math.floor((seconds % 3600) / 60);
+        return `${h}h ${m}m`;
     }
 
     async function populateActivityArchiveFilter() {
@@ -3809,6 +3942,7 @@
             const data = await api("GET", `/api/activity/log?${params}`);
             renderActivityLog(data.entries);
         } catch (err) {
+            alEntries = [];
             $("#activity-log-list").innerHTML = `<div class="activity-log-wrap"><div class="activity-empty">Failed to load activity log</div></div>`;
         }
     }
@@ -3816,27 +3950,16 @@
     function renderActivityLog(entries) {
         const list = $("#activity-log-list");
         if (!entries || entries.length === 0) {
+            alEntries = [];
+            alLastRange = null;
             list.innerHTML = `<div class="activity-log-wrap"><div class="activity-empty">No activity log entries</div></div>`;
             return;
         }
-        const rows = entries.map(e => {
-            const dt = new Date(e.timestamp * 1000);
-            const time = dt.toLocaleString();
-            const cat = e.resolved_category || e.category || "";
-            const lvl = e.level || "info";
-            const archiveLink = e.archive_identifier
-                ? ` — <span class="entry-archive" data-id="${e.archive_id}">${esc(e.archive_title || e.archive_identifier)}</span>`
-                : "";
-            const detail = e.detail
-                ? `<div class="entry-detail">${esc(e.detail)}</div>`
-                : "";
-            return `<tr>
-                <td class="col-time"><span class="entry-time">${esc(time)}</span></td>
-                <td class="col-category"><span class="entry-category">${esc(cat)}</span></td>
-                <td class="col-level"><span class="entry-level level-${lvl}">${esc(lvl)}</span></td>
-                <td><span class="entry-message">${esc(e.message)}${archiveLink}</span>${detail}</td>
-            </tr>`;
-        }).join("");
+        // Store entries for virtual scrolling
+        alEntries = entries;
+        alLastRange = null;
+
+        // Set up the table structure with empty tbody
         list.innerHTML = `<div class="activity-log-wrap"><table class="activity-table">
             <thead><tr>
                 <th class="col-time">Time</th>
@@ -3844,16 +3967,123 @@
                 <th class="col-level">Level</th>
                 <th>Message</th>
             </tr></thead>
-            <tbody>${rows}</tbody>
+            <tbody id="activity-log-tbody"></tbody>
         </table></div>`;
 
-        // Click on archive links
-        list.querySelectorAll(".entry-archive").forEach(el => {
-            el.addEventListener("click", () => {
-                const id = parseInt(el.dataset.id);
+        // Scroll to top and render visible rows
+        list.querySelector(".activity-log-wrap").scrollTop = 0;
+        alVsRenderVisible();
+    }
+
+    function buildActivityRow(e) {
+        const tr = document.createElement("tr");
+        const dt = new Date(e.timestamp * 1000);
+        const time = dt.toLocaleString();
+        const cat = e.resolved_category || e.category || "";
+        const lvl = e.level || "info";
+        const hasDetail = !!e.detail;
+
+        if (hasDetail) tr.classList.add("has-detail");
+
+        const tdTime = document.createElement("td");
+        tdTime.className = "col-time";
+        tdTime.innerHTML = `<span class="entry-time">${esc(time)}</span>`;
+
+        const tdCat = document.createElement("td");
+        tdCat.className = "col-category";
+        tdCat.innerHTML = `<span class="entry-category">${esc(cat)}</span>`;
+
+        const tdLevel = document.createElement("td");
+        tdLevel.className = "col-level";
+        tdLevel.innerHTML = `<span class="entry-level level-${lvl}">${esc(lvl)}</span>`;
+
+        const tdMsg = document.createElement("td");
+        let msgHtml = `<span class="entry-message">${esc(e.message)}`;
+        if (e.archive_identifier) {
+            msgHtml += ` — <span class="entry-archive" data-id="${e.archive_id}">${esc(e.archive_title || e.archive_identifier)}</span>`;
+        }
+        msgHtml += `</span>`;
+        tdMsg.innerHTML = msgHtml;
+
+        // Archive link click handler
+        const archiveEl = tdMsg.querySelector(".entry-archive");
+        if (archiveEl) {
+            archiveEl.addEventListener("click", (ev) => {
+                ev.stopPropagation();
+                const id = parseInt(archiveEl.dataset.id);
                 if (id) openArchiveDetail(id);
             });
-        });
+        }
+
+        // Click row to expand/collapse detail (outside virtual scroll, like file list)
+        if (hasDetail) {
+            tr.style.cursor = "pointer";
+            tr.addEventListener("click", () => {
+                const existing = tr.nextElementSibling;
+                if (existing && existing.classList.contains("al-detail-row")) {
+                    existing.remove();
+                    tr.classList.remove("al-expanded");
+                } else {
+                    const detailTr = document.createElement("tr");
+                    detailTr.className = "al-detail-row";
+                    detailTr.innerHTML = `<td colspan="4"><div class="entry-detail">${esc(e.detail)}</div></td>`;
+                    tr.after(detailTr);
+                    tr.classList.add("al-expanded");
+                }
+            });
+        }
+
+        tr.appendChild(tdTime);
+        tr.appendChild(tdCat);
+        tr.appendChild(tdLevel);
+        tr.appendChild(tdMsg);
+        return tr;
+    }
+
+    function alVsRenderVisible() {
+        const wrap = document.querySelector("#activity-log-list .activity-log-wrap");
+        const tbody = $("#activity-log-tbody");
+        if (!wrap || !tbody || alEntries.length === 0) return;
+
+        const totalRows = alEntries.length;
+        const scrollTop = wrap.scrollTop;
+        const viewHeight = wrap.clientHeight;
+
+        let startRow = Math.floor(scrollTop / AL_ROW_HEIGHT) - AL_OVERSCAN;
+        let endRow = Math.ceil((scrollTop + viewHeight) / AL_ROW_HEIGHT) + AL_OVERSCAN;
+        startRow = Math.max(0, startRow);
+        endRow = Math.min(totalRows - 1, endRow);
+
+        // Skip re-render if range hasn't changed
+        if (alLastRange && alLastRange.start === startRow && alLastRange.end === endRow) return;
+        alLastRange = { start: startRow, end: endRow };
+
+        const savedScroll = wrap.scrollTop;
+        tbody.innerHTML = "";
+
+        // Top spacer
+        if (startRow > 0) {
+            const spacer = document.createElement("tr");
+            spacer.className = "vs-spacer";
+            spacer.innerHTML = `<td colspan="4" style="height:${startRow * AL_ROW_HEIGHT}px;padding:0;border:none"></td>`;
+            tbody.appendChild(spacer);
+        }
+
+        // Visible rows
+        for (let i = startRow; i <= endRow; i++) {
+            tbody.appendChild(buildActivityRow(alEntries[i]));
+        }
+
+        // Bottom spacer
+        const bottomSpace = (totalRows - endRow - 1) * AL_ROW_HEIGHT;
+        if (bottomSpace > 0) {
+            const spacer = document.createElement("tr");
+            spacer.className = "vs-spacer";
+            spacer.innerHTML = `<td colspan="4" style="height:${bottomSpace}px;padding:0;border:none"></td>`;
+            tbody.appendChild(spacer);
+        }
+
+        wrap.scrollTop = savedScroll;
     }
 
     function clearActivityFilters() {
@@ -3872,6 +4102,54 @@
             loadActivityJobs(activityJobFilter);
             loadActivityLog();
         }
+    }
+
+    function _updateJobProgress(data) {
+        const { archive_id, phase, current, total } = data;
+        if (!archive_id) return;
+
+        const terminal = phase === "done" || phase === "cancelled" || phase === "error";
+
+        if (terminal) {
+            jobProgressMap.delete(archive_id);
+            // Full refresh on terminal events — job status changed
+            if ($("#page-activity").classList.contains("active")) {
+                loadActivityJobs(activityJobFilter);
+            }
+        } else if (current !== undefined && total !== undefined) {
+            jobProgressMap.set(archive_id, { current, total, phase });
+            // Update progress bar in-place without full re-render
+            _updateJobProgressBar(archive_id, current, total);
+        }
+    }
+
+    function _updateJobProgressBar(archiveId, current, total) {
+        const banner = $("#activity-job-banner");
+        if (!banner) return;
+        // Find job cards for this archive
+        banner.querySelectorAll(".job-card").forEach(card => {
+            const fill = card.querySelector(".job-progress-fill");
+            const text = card.querySelector(".job-progress-text");
+            if (!fill) return;
+            // Match by checking if this card's data relates to the archive
+            // We need to check the cancel button's archive id or walk the job data
+            const cancelBtn = card.querySelector(".job-card-cancel");
+            if (cancelBtn && parseInt(cancelBtn.dataset.archiveId) === archiveId) {
+                if (total > 0) {
+                    const pct = Math.round((current / total) * 100);
+                    fill.classList.remove("indeterminate");
+                    fill.style.width = pct + "%";
+                    if (text) text.textContent = `${current}/${total}`;
+                    else {
+                        // Add text element if missing
+                        const span = document.createElement("span");
+                        span.className = "job-progress-text";
+                        span.textContent = `${current}/${total}`;
+                        fill.closest(".job-progress-track").after(span);
+                    }
+                }
+            }
+        });
     }
 
     async function openCollections() {
@@ -4392,6 +4670,17 @@
                 vsRenderVisible();
             });
         });
+
+        // Virtual scroll for activity log table
+        $("#activity-log-list").addEventListener("scroll", (ev) => {
+            if (ev.target.classList.contains("activity-log-wrap")) {
+                if (alScrollRAF) return;
+                alScrollRAF = requestAnimationFrame(() => {
+                    alScrollRAF = null;
+                    alVsRenderVisible();
+                });
+            }
+        }, true);
 
         // Detail
         $("#btn-back").addEventListener("click", closeDetail);

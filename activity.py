@@ -102,6 +102,14 @@ def get_job(job_id):
         return dict(row) if row else None
 
 
+def delete_job(job_id):
+    """Delete an activity job and its associated log entries."""
+    with db._db() as conn:
+        conn.execute("DELETE FROM activity_log WHERE job_id = ?", (job_id,))
+        conn.execute("DELETE FROM activity_jobs WHERE id = ?", (job_id,))
+        conn.commit()
+
+
 def update_job_notification(job_id, notification_id):
     """Set the notification_id on an existing job (for when notification
     is created after the job)."""
