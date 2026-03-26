@@ -49,11 +49,26 @@ from logger import log
 #    (lzma+zlib+huff+flac), each thread allocates ~200 MB total.
 #    CD default (cdlz+cdzl+cdfl) is lighter at ~100 MB/thread.
 #
-_CHDMAN_BASE_OVERHEAD_MB = 200
-_CHDMAN_FILE_OVERHEAD_PCT = 0.20  # 20 % of input file size
-_CHDMAN_MB_PER_THREAD_DVD = 200   # per thread: LZMA 64MB dict + zlib + huff + flac
-_CHDMAN_MB_PER_THREAD_CD = 100    # per thread: cdlz + cdzl + cdfl
-_SYSTEM_RESERVE_MB = 512           # headroom for Grabia, OS, other containers
+# -- chdman memory model (see module docstring above) --
+#
+# Budget formula:  usable = available - base - file_overhead - reserve
+#                  threads = usable // per_thread
+#
+# The *minimum* constants are hard floors: if the container has less free
+# memory than the minimum, we refuse to run chdman at all (fail fast with
+# a clear error instead of letting the OOM killer fire after minutes of
+# work).  These were set empirically: a 2 GB container with ~1020 MB free
+# was consistently OOM-killed running a 7.3 GB DVD with 1 thread.
+#
+_CHDMAN_BASE_OVERHEAD_MB = 150     # process startup, CHD structures, output metadata
+_CHDMAN_FILE_OVERHEAD_PCT = 0.02   # ~2 % of input: hunk map + SHA1 tree (small)
+_CHDMAN_MB_PER_THREAD_DVD = 200    # per thread: LZMA 64MB dict + zlib + huff + flac
+_CHDMAN_MB_PER_THREAD_CD = 100     # per thread: cdlz + cdzl + cdfl
+_SYSTEM_RESERVE_MB = 300           # headroom for Grabia, Flask, Python GC, OS
+
+# Hard minimums — below this, don't even try
+_CHDMAN_MIN_MEMORY_DVD_MB = 1100   # 1 thread DVD needs ~800-900MB; pad for safety
+_CHDMAN_MIN_MEMORY_CD_MB = 600     # 1 thread CD is lighter
 
 
 def _get_chdman_threads(user_setting, disc_type="dvd", input_path=None):
@@ -100,9 +115,22 @@ def _get_chdman_threads(user_setting, disc_type="dvd", input_path=None):
         return threads
 
     mb_per_thread = _CHDMAN_MB_PER_THREAD_DVD if disc_type == "dvd" else _CHDMAN_MB_PER_THREAD_CD
+    min_required = _CHDMAN_MIN_MEMORY_DVD_MB if disc_type == "dvd" else _CHDMAN_MIN_MEMORY_CD_MB
+
+    # Check if there's enough memory to even attempt 1 thread
+    if available_mb < min_required:
+        log.error("proc", "chdman: not enough memory — %dMB available, "
+                  "need at least %dMB for 1-thread %s conversion of %.0fMB file",
+                  available_mb, min_required, disc_type.upper(), file_size_mb)
+        raise ProcessingError(
+            f"Not enough memory for CHD conversion: {available_mb}MB available, "
+            f"need at least {min_required}MB. Increase the container memory limit "
+            f"or reduce other running processes."
+        )
+
     usable = available_mb - total_base - _SYSTEM_RESERVE_MB
     if usable < mb_per_thread:
-        log.warning("proc", "chdman threads: very low memory "
+        log.warning("proc", "chdman threads: low memory "
                     "(%dMB available, %dMB base+file overhead), using 1 thread",
                     available_mb, total_base)
         return 1
