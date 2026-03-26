@@ -33,24 +33,26 @@ from logger import log
 
 # chdman memory usage has three components:
 #
-# 1. Base overhead — fixed per-process cost (~100 MB).
+# 1. Base overhead — fixed per-process cost: process startup, CHD header
+#    structures, output file metadata (~200 MB).
 #
-# 2. File-proportional — hunk map, SHA1 tracking, and I/O buffers scale
-#    with input size.  chdman divides the input into hunks (CD: ~18 KB,
-#    DVD: ~64 KB) and tracks metadata per hunk.  For large files this is
-#    significant: a 6 GB DVD ISO has ~98 000 hunks.  Empirically ~8 % of
-#    input size is a reasonable estimate for the combined hunk map, hash
-#    tables, and read-ahead buffers.
+# 2. File-proportional — hunk map, SHA1 hash tree, and I/O read-ahead
+#    buffers scale with input size.  DVD hunks are 64 KB; a 6 GB ISO
+#    produces ~98 000 hunks, each tracked with SHA1 + metadata.  The
+#    read-ahead buffer and codec trial buffers also scale with file size.
+#    Empirically ~20 % of input size covers the hunk map, hash tree,
+#    and working buffers.
 #
-# 3. Per-thread — each compression worker allocates codec state for every
-#    codec in the set being tried.  LZMA alone needs ~40-65 MB of
-#    dictionary memory per stream.  DVD default (lzma+zlib+huff+flac) is
-#    ~100 MB/thread; CD default (cdlz+cdzl+cdfl) is ~50 MB/thread.
+# 3. Per-thread — each compression worker allocates codec state for
+#    every codec in the set being tried.  LZMA alone needs a 64 MB
+#    dictionary per stream (mame default).  With DVD default compression
+#    (lzma+zlib+huff+flac), each thread allocates ~200 MB total.
+#    CD default (cdlz+cdzl+cdfl) is lighter at ~100 MB/thread.
 #
-_CHDMAN_BASE_OVERHEAD_MB = 100
-_CHDMAN_FILE_OVERHEAD_PCT = 0.08  # 8 % of input file size
-_CHDMAN_MB_PER_THREAD_DVD = 100   # per thread: LZMA dict + zlib + huff + flac
-_CHDMAN_MB_PER_THREAD_CD = 50     # per thread: cdlz + cdzl + cdfl
+_CHDMAN_BASE_OVERHEAD_MB = 200
+_CHDMAN_FILE_OVERHEAD_PCT = 0.20  # 20 % of input file size
+_CHDMAN_MB_PER_THREAD_DVD = 200   # per thread: LZMA 64MB dict + zlib + huff + flac
+_CHDMAN_MB_PER_THREAD_CD = 100    # per thread: cdlz + cdzl + cdfl
 _SYSTEM_RESERVE_MB = 512           # headroom for Grabia, OS, other containers
 
 
@@ -83,10 +85,18 @@ def _get_chdman_threads(user_setting, disc_type="dvd", input_path=None):
     # Try to read available memory from cgroup (Docker) first, then system
     available_mb = _get_available_memory_mb()
     if available_mb is None:
-        # Can't determine memory — be conservative: half of CPUs, min 1, max 4
-        threads = max(1, min(cpu_count // 2, 4))
-        log.debug("proc", "chdman threads: no memory info, defaulting to %d "
-                  "(cpus=%d, file=%.0fMB)", threads, cpu_count, file_size_mb)
+        # Can't determine memory — be very conservative since we're blind.
+        # File size is our only signal: large files need most memory for
+        # base overhead, so leave very few threads.
+        if file_size_mb > 2000:
+            threads = 1
+        elif file_size_mb > 500:
+            threads = max(1, min(cpu_count // 4, 2))
+        else:
+            threads = max(1, min(cpu_count // 2, 4))
+        log.warning("proc", "chdman threads: no cgroup/meminfo data, "
+                    "defaulting to %d (cpus=%d, file=%.0fMB)",
+                    threads, cpu_count, file_size_mb)
         return threads
 
     mb_per_thread = _CHDMAN_MB_PER_THREAD_DVD if disc_type == "dvd" else _CHDMAN_MB_PER_THREAD_CD
@@ -99,10 +109,10 @@ def _get_chdman_threads(user_setting, disc_type="dvd", input_path=None):
 
     mem_threads = int(usable // mb_per_thread)
     threads = max(1, min(mem_threads, cpu_count))
-    log.debug("proc", "chdman threads: %d (mem=%dMB, base=%dMB, file=%.0fMB, "
-              "%dMB/thread, usable=%dMB, cpus=%d)",
-              threads, available_mb, total_base, file_size_mb,
-              mb_per_thread, usable, cpu_count)
+    log.info("proc", "chdman threads: %d (avail=%dMB, base=%dMB, file=%.0fMB, "
+             "%dMB/thread, usable=%dMB, cpus=%d)",
+             threads, available_mb, total_base, file_size_mb,
+             mb_per_thread, usable, cpu_count)
     return threads
 
 
@@ -118,7 +128,12 @@ def _get_available_memory_mb():
             val = f.read().strip()
             if val != "max":
                 cgroup_limit = int(val) // (1024 * 1024)
-    except (OSError, ValueError):
+                log.debug("proc", "cgroup v2 memory.max: %dMB", cgroup_limit)
+            else:
+                log.debug("proc", "cgroup v2 memory.max: unlimited")
+    except OSError:
+        log.debug("proc", "cgroup v2 memory.max: not available")
+    except ValueError:
         pass
 
     # 2. Check cgroup v1 memory limit (older Docker / Unraid)
@@ -129,7 +144,12 @@ def _get_available_memory_mb():
                 # Very large values mean "no limit set"
                 if val < 2**62:
                     cgroup_limit = val // (1024 * 1024)
-        except (OSError, ValueError):
+                    log.debug("proc", "cgroup v1 memory.limit_in_bytes: %dMB", cgroup_limit)
+                else:
+                    log.debug("proc", "cgroup v1 memory.limit_in_bytes: unlimited (%d)", val)
+        except OSError:
+            log.debug("proc", "cgroup v1 memory.limit_in_bytes: not available")
+        except ValueError:
             pass
 
     # 3. Get current memory usage within the cgroup
@@ -148,6 +168,8 @@ def _get_available_memory_mb():
 
     if cgroup_limit is not None:
         available = cgroup_limit - (cgroup_usage or 0)
+        log.debug("proc", "cgroup memory: limit=%dMB, usage=%sMB, available=%dMB",
+                  cgroup_limit, cgroup_usage or "?", available)
         return max(available, 0)
 
     # 4. Fall back to system MemAvailable from /proc/meminfo
