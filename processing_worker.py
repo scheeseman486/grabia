@@ -25,6 +25,7 @@ import os
 import threading
 import time
 
+import activity
 import database as db
 from logger import log
 from processors import (
@@ -77,21 +78,33 @@ def queue_archive_processing(archive_id, profile_id, file_ids=None, options_over
 
     job_id = db.create_processing_job(archive_id, profile_id, file_ids, options_override)
 
+    # Create an activity job to track this processing run
+    archive = db.get_archive(archive_id)
+    group_id = archive["group_id"] if archive else None
+    act_job_id = activity.start_job(
+        "processing", archive_id=archive_id, group_id=group_id,
+        processing_job_id=job_id,
+    )
+
     pending = db.count_pending_processing_jobs()
 
     # Create a persistent notification for the queued job
-    archive = db.get_archive(archive_id)
     archive_name = archive["title"] or archive["identifier"] if archive else f"Archive #{archive_id}"
     if pending > 1:
         notif_id = db.create_notification(
             f'Processing "{archive_name}": queued (position {pending})',
             type="info", progress=0, processing_archive_id=archive_id,
+            job_id=act_job_id,
         )
     else:
         notif_id = db.create_notification(
             f'Processing "{archive_name}": starting...',
             type="info", progress=0, processing_archive_id=archive_id,
+            job_id=act_job_id,
         )
+
+    # Link the notification back to the activity job
+    activity.update_job_notification(act_job_id, notif_id)
 
     _broadcast("notification_created", db.get_notification(notif_id))
 
@@ -183,6 +196,16 @@ def _worker_loop():
                 _cancel_events.pop(job["archive_id"], None)
 
 
+def _find_activity_job(processing_job_id):
+    """Look up the activity job linked to a processing job."""
+    with db._db() as conn:
+        row = conn.execute(
+            "SELECT id FROM activity_jobs WHERE processing_job_id = ?",
+            (processing_job_id,),
+        ).fetchone()
+        return row["id"] if row else None
+
+
 def _run_processing(job):
     archive_id = job["archive_id"]
     profile_id = job["profile_id"]
@@ -193,6 +216,9 @@ def _run_processing(job):
 
     def _cancelled():
         return cancel_evt and cancel_evt.is_set()
+
+    # Find the activity job linked to this processing job
+    act_job_id = _find_activity_job(job["id"])
 
     log.info("worker", "Processing job started: archive=%d, profile=%d", archive_id, profile_id)
 
@@ -214,6 +240,10 @@ def _run_processing(job):
     profile = db.get_processing_profile(profile_id)
     if not profile:
         msg = "Processing profile not found"
+        if act_job_id:
+            activity.log(act_job_id, "error", msg, archive_id=archive_id)
+            activity.flush()
+            activity.finish_job(act_job_id, "failed", summary=msg)
         if notif_id:
             db.update_notification(notif_id, message=f'Processing "{archive_name}" failed: {msg}', type="error", progress=None)
             _broadcast("notification_updated", db.get_notification(notif_id))
@@ -225,12 +255,20 @@ def _run_processing(job):
         return
 
     if not archive:
+        if act_job_id:
+            activity.log(act_job_id, "error", "Archive not found", archive_id=archive_id)
+            activity.flush()
+            activity.finish_job(act_job_id, "failed", summary="Archive not found")
         return
 
     # Get processor class
     processor_cls = get_processor(profile["processor_type"])
     if not processor_cls:
         msg = f"Unknown processor type: {profile['processor_type']}"
+        if act_job_id:
+            activity.log(act_job_id, "error", msg, archive_id=archive_id)
+            activity.flush()
+            activity.finish_job(act_job_id, "failed", summary=msg)
         if notif_id:
             db.update_notification(notif_id, message=f'Processing "{archive_name}" failed: {msg}', type="error", progress=None)
             _broadcast("notification_updated", db.get_notification(notif_id))
@@ -277,6 +315,11 @@ def _run_processing(job):
 
     if not files:
         log.info("worker", "No files to process after filtering — done")
+        if act_job_id:
+            activity.log(act_job_id, "info", "No eligible files after filtering",
+                         archive_id=archive_id)
+            activity.flush()
+            activity.finish_job(act_job_id, "completed", summary="No eligible files")
         if notif_id:
             db.update_notification(notif_id, message=f'Processing "{archive_name}": no eligible files', type="info", progress=None)
             _broadcast("notification_updated", db.get_notification(notif_id))
@@ -295,6 +338,11 @@ def _run_processing(job):
         db.update_notification(notif_id, message=f'Processing "{archive_name}": starting...', progress=0)
         _broadcast("notification_updated", db.get_notification(notif_id))
 
+    if act_job_id:
+        activity.log(act_job_id, "info",
+                     f"Processing started: {len(files)} files with {profile['name']}",
+                     archive_id=archive_id)
+
     _broadcast("processing_progress", {
         "archive_id": archive_id,
         "phase": "starting",
@@ -307,6 +355,16 @@ def _run_processing(job):
         if _cancelled():
             for remaining in files[i:]:
                 db.set_file_processing_status(remaining["id"], "", error="Cancelled")
+            if act_job_id:
+                activity.log(act_job_id, "warning", "Processing cancelled by user",
+                             archive_id=archive_id)
+                activity.flush()
+                parts = []
+                if summary["processed"]: parts.append(f'{summary["processed"]} converted')
+                if summary["skipped"]: parts.append(f'{summary["skipped"]} skipped')
+                if summary["failed"]: parts.append(f'{summary["failed"]} failed')
+                activity.finish_job(act_job_id, "cancelled",
+                                    summary=", ".join(parts) if parts else "Cancelled before processing")
             # Notification is cleaned up by cancel_archive_processing();
             # only delete here if it still exists (e.g. ProcessingCancelled
             # raised by the processor itself without an explicit cancel call).
@@ -356,11 +414,16 @@ def _run_processing(job):
             result = processor.process(file_path, archive_dir)
 
             if result.get("skipped"):
-                log.info("worker", "Skipped %s: %s", filename, result.get("reason", "Not processable"))
+                reason = result.get("reason", "Not processable")
+                log.info("worker", "Skipped %s: %s", filename, reason)
                 db.set_file_processing_status(
                     file_id, "skipped",
-                    error=result.get("reason", "Not processable"),
+                    error=reason,
                 )
+                if act_job_id:
+                    activity.log(act_job_id, "info", f"Skipped: {filename}",
+                                 archive_id=archive_id, file_id=file_id,
+                                 detail=reason)
                 summary["skipped"] += 1
             else:
                 delete_original = merged_options.get("delete_original", "yes") == "yes"
@@ -378,6 +441,10 @@ def _run_processing(job):
                     processor_type=profile["processor_type"],
                     processed_files=result.get("processed_files"),
                 )
+                if act_job_id:
+                    activity.log(act_job_id, "success",
+                                 f"Converted: {filename} → {result['processed_filename']}",
+                                 archive_id=archive_id, file_id=file_id)
                 summary["processed"] += 1
 
             _broadcast("processing_progress", {
@@ -394,6 +461,17 @@ def _run_processing(job):
             db.set_file_processing_status(file_id, "", error="Cancelled")
             for remaining in files[i + 1:]:
                 db.set_file_processing_status(remaining["id"], "", error="Cancelled")
+            if act_job_id:
+                activity.log(act_job_id, "warning",
+                             f"Cancelled during: {filename}",
+                             archive_id=archive_id, file_id=file_id)
+                activity.flush()
+                parts = []
+                if summary["processed"]: parts.append(f'{summary["processed"]} converted')
+                if summary["skipped"]: parts.append(f'{summary["skipped"]} skipped')
+                if summary["failed"]: parts.append(f'{summary["failed"]} failed')
+                activity.finish_job(act_job_id, "cancelled",
+                                    summary=", ".join(parts) if parts else "Cancelled")
             # Notification is cleaned up by cancel_archive_processing();
             # only delete here if it still exists (e.g. ProcessingCancelled
             # raised by the processor itself without an explicit cancel call).
@@ -410,6 +488,10 @@ def _run_processing(job):
         except ProcessingError as e:
             log.error("worker", "Failed %s: %s", filename, e)
             db.set_file_processing_status(file_id, "failed", error=str(e))
+            if act_job_id:
+                activity.log(act_job_id, "error", f"Failed: {filename}",
+                             archive_id=archive_id, file_id=file_id,
+                             detail=str(e))
             summary["failed"] += 1
             _broadcast("processing_progress", {
                 "archive_id": archive_id,
@@ -423,6 +505,10 @@ def _run_processing(job):
 
         except Exception as e:
             db.set_file_processing_status(file_id, "failed", error=str(e))
+            if act_job_id:
+                activity.log(act_job_id, "error", f"Failed: {filename}",
+                             archive_id=archive_id, file_id=file_id,
+                             detail=str(e))
             summary["failed"] += 1
             _broadcast("processing_progress", {
                 "archive_id": archive_id,
@@ -436,6 +522,17 @@ def _run_processing(job):
 
     log.info("worker", "Processing complete for archive %d: %d processed, %d skipped, %d failed",
              archive_id, summary["processed"], summary["skipped"], summary["failed"])
+
+    # Flush activity log and finish the activity job
+    if act_job_id:
+        parts = []
+        if summary["processed"]: parts.append(f'{summary["processed"]} converted')
+        if summary["skipped"]: parts.append(f'{summary["skipped"]} skipped')
+        if summary["failed"]: parts.append(f'{summary["failed"]} failed')
+        summary_str = ", ".join(parts) if parts else "no eligible files"
+        status = "completed" if summary["failed"] == 0 else "completed"
+        activity.flush()
+        activity.finish_job(act_job_id, status, summary=summary_str)
 
     # Update notification with final result
     if notif_id:

@@ -2262,6 +2262,16 @@ tr.processed-detail-row td { padding: 0 !important; }
     font-weight: 600;
 }
 .notif-cancel:hover { color: #e55; text-decoration: underline; }
+.notif-view-log {
+    background: none;
+    border: none;
+    color: var(--accent);
+    font-size: 11px;
+    cursor: pointer;
+    padding: 0 2px;
+    font-weight: 600;
+}
+.notif-view-log:hover { text-decoration: underline; }
 
 /* Notification progress bar */
 .notif-progress-track {
@@ -2551,3 +2561,119 @@ tr.processed-detail-row td { padding: 0 !important; }
 }
 .collection-chip:hover { background: var(--accent); color: #fff; }
 .no-collections { color: var(--text-dim); font-size: 12px; }
+
+/* ── Activity Log ─────────────────────────────────────────────── */
+.activity-page { padding: 16px 24px; }
+.activity-header { margin-bottom: 16px; }
+.activity-header h2 { margin: 0; font-size: 20px; }
+
+.activity-filters {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+    align-items: center;
+    margin-bottom: 16px;
+}
+.activity-filters select,
+.activity-filters input {
+    padding: 6px 10px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--surface);
+    color: var(--text);
+    font-size: 13px;
+}
+.activity-search { width: 180px; }
+
+.activity-job-banner {
+    padding: 10px 14px;
+    border-radius: 8px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    margin-bottom: 16px;
+    font-size: 13px;
+}
+.activity-job-banner .job-status {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 10px;
+    font-size: 11px;
+    font-weight: 600;
+    margin-left: 8px;
+}
+.activity-job-banner .job-status.running { background: var(--accent); color: #fff; }
+.activity-job-banner .job-status.completed { background: var(--success); color: #fff; }
+.activity-job-banner .job-status.failed { background: var(--danger); color: #fff; }
+.activity-job-banner .job-status.cancelled { background: var(--warning); color: #000; }
+
+.activity-log-list { min-height: 200px; }
+.activity-empty { color: var(--text-dim); text-align: center; padding: 40px; }
+
+.activity-entry {
+    display: grid;
+    grid-template-columns: 150px 80px 80px 1fr;
+    gap: 8px;
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--border);
+    font-size: 13px;
+    align-items: start;
+}
+.activity-entry:hover { background: var(--surface); }
+.activity-entry .entry-time { color: var(--text-dim); font-size: 12px; font-family: monospace; }
+.activity-entry .entry-category {
+    font-size: 11px;
+    text-transform: uppercase;
+    font-weight: 600;
+    color: var(--text-dim);
+}
+.activity-entry .entry-level {
+    font-size: 11px;
+    font-weight: 600;
+    padding: 1px 6px;
+    border-radius: 4px;
+    text-align: center;
+    width: fit-content;
+}
+.entry-level.level-info { background: var(--border); color: var(--text); }
+.entry-level.level-success { background: var(--success); color: #fff; }
+.entry-level.level-warning { background: var(--warning); color: #000; }
+.entry-level.level-error { background: var(--danger); color: #fff; }
+
+.activity-entry .entry-message { line-height: 1.4; }
+.activity-entry .entry-detail {
+    grid-column: 1 / -1;
+    padding: 6px 10px;
+    margin-top: 4px;
+    background: var(--bg);
+    border-radius: 4px;
+    font-family: monospace;
+    font-size: 12px;
+    white-space: pre-wrap;
+    word-break: break-all;
+    color: var(--text-dim);
+}
+.activity-entry .entry-archive {
+    font-size: 11px;
+    color: var(--accent);
+    cursor: pointer;
+}
+.activity-entry .entry-archive:hover { text-decoration: underline; }
+
+.activity-pagination {
+    display: flex;
+    justify-content: center;
+    gap: 8px;
+    padding: 16px 0;
+}
+.activity-pagination button {
+    padding: 6px 14px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--surface);
+    color: var(--text);
+    cursor: pointer;
+    font-size: 13px;
+}
+.activity-pagination button:disabled { opacity: 0.4; cursor: default; }
+.activity-pagination button:hover:not(:disabled) { background: var(--border); }
+.activity-pagination .page-info { line-height: 32px; font-size: 13px; color: var(--text-dim); }

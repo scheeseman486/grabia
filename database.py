@@ -186,6 +186,36 @@ def init_db():
             position INTEGER NOT NULL DEFAULT 0,
             FOREIGN KEY (collection_id) REFERENCES collections(id) ON DELETE CASCADE
         );
+
+        CREATE TABLE IF NOT EXISTS activity_jobs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            category TEXT NOT NULL,
+            archive_id INTEGER DEFAULT NULL,
+            group_id INTEGER DEFAULT NULL,
+            processing_job_id INTEGER DEFAULT NULL,
+            notification_id INTEGER DEFAULT NULL,
+            started_at REAL NOT NULL,
+            completed_at REAL DEFAULT NULL,
+            status TEXT NOT NULL DEFAULT 'running',
+            summary TEXT DEFAULT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS activity_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp REAL NOT NULL,
+            category TEXT DEFAULT NULL,
+            level TEXT NOT NULL,
+            job_id INTEGER DEFAULT NULL,
+            archive_id INTEGER DEFAULT NULL,
+            file_id INTEGER DEFAULT NULL,
+            message TEXT NOT NULL,
+            detail TEXT DEFAULT NULL,
+            FOREIGN KEY (job_id) REFERENCES activity_jobs(id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_activity_log_job ON activity_log(job_id);
+        CREATE INDEX IF NOT EXISTS idx_activity_log_archive ON activity_log(archive_id);
+        CREATE INDEX IF NOT EXISTS idx_activity_log_timestamp ON activity_log(timestamp);
     """)
 
     # Default settings
@@ -267,6 +297,12 @@ def init_db():
             conn.execute("ALTER TABLE archive_files RENAME COLUMN selected TO queued")
         except sqlite3.OperationalError:
             pass  # Shouldn't happen, but don't break startup
+
+    # Add job_id to notifications for "View Log" linkage
+    try:
+        conn.execute("SELECT job_id FROM notifications LIMIT 1")
+    except sqlite3.OperationalError:
+        conn.execute("ALTER TABLE notifications ADD COLUMN job_id INTEGER DEFAULT NULL")
 
     # Fix any scan-inserted rows incorrectly tagged as 'manifest'.
     # Real IA files always have at least one metadata field populated;
@@ -1205,15 +1241,15 @@ def get_processing_queue_files(archive_id):
 # --- Notifications ---
 
 def create_notification(message, type="info", progress=None, scan_archive_id=None,
-                        processing_archive_id=None, adding_archive=False):
+                        processing_archive_id=None, adding_archive=False, job_id=None):
     """Create a persistent notification and return its ID."""
     with _db() as conn:
         conn.execute(
             """INSERT INTO notifications (message, type, created_at, progress, scan_archive_id,
-               processing_archive_id, adding_archive)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+               processing_archive_id, adding_archive, job_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
             (message, type, time.time(), progress, scan_archive_id,
-             processing_archive_id, 1 if adding_archive else 0),
+             processing_archive_id, 1 if adding_archive else 0, job_id),
         )
         nid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
         conn.commit()
@@ -1221,8 +1257,8 @@ def create_notification(message, type="info", progress=None, scan_archive_id=Non
 
 
 def update_notification(notif_id, **kwargs):
-    """Update fields on a notification. Supported: message, type, progress, dismissed."""
-    allowed = {"message", "type", "progress", "dismissed"}
+    """Update fields on a notification. Supported: message, type, progress, dismissed, job_id."""
+    allowed = {"message", "type", "progress", "dismissed", "job_id"}
     updates = {k: v for k, v in kwargs.items() if k in allowed}
     if not updates:
         return

@@ -149,6 +149,9 @@
                 : n.processing_archive_id
                 ? `<button class="notif-cancel" data-cancel-type="process" data-cancel-archive="${n.processing_archive_id}">Cancel</button>`
                 : "";
+            const viewLogHtml = n.job_id
+                ? `<button class="notif-view-log" data-job-id="${n.job_id}">View Log</button>`
+                : "";
             const dismissHtml = isActive ? "" : `
                 <button class="notif-dismiss" data-notif-id="${n.id}" title="Dismiss">
                     <svg viewBox="0 0 24 24" width="12" height="12"><path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z" fill="currentColor"/></svg>
@@ -159,6 +162,7 @@
                     ${progressHtml}
                     <span class="notif-time-row">
                         <span class="notif-time">${ago}</span>
+                        ${viewLogHtml}
                         ${cancelHtml}
                     </span>
                 </div>
@@ -179,6 +183,15 @@
                     } else {
                         cancelScan(archiveId);
                     }
+                });
+            }
+            const viewLogBtn = div.querySelector(".notif-view-log");
+            if (viewLogBtn) {
+                viewLogBtn.addEventListener("click", (e) => {
+                    e.stopPropagation();
+                    const jobId = parseInt(viewLogBtn.dataset.jobId);
+                    $("#notif-popup").classList.remove("open");
+                    openActivityLog({ job_id: jobId });
                 });
             }
             list.appendChild(div);
@@ -3644,6 +3657,173 @@
         $(`#${pageId}`).classList.add("active");
     }
 
+    // ── Activity Log ──────────────────────────────────────────────
+    let activityOffset = 0;
+    const ACTIVITY_PAGE_SIZE = 100;
+    let activityJobFilter = null;  // set when navigating from a notification
+
+    async function openActivityLog(opts) {
+        opts = opts || {};
+        activityOffset = 0;
+        activityJobFilter = opts.job_id || null;
+
+        // Pre-set filter dropdowns if requested
+        if (opts.job_id) {
+            // Load the job info and show banner
+            try {
+                const job = await api("GET", `/api/activity/jobs/${opts.job_id}`);
+                if (job) {
+                    const banner = $("#activity-job-banner");
+                    const started = new Date(job.started_at * 1000).toLocaleString();
+                    const statusCls = job.status || "running";
+                    banner.innerHTML = `<strong>${esc(job.category)}</strong> job #${job.id} — started ${started}` +
+                        ` <span class="job-status ${statusCls}">${esc(job.status)}</span>` +
+                        (job.summary ? ` — ${esc(job.summary)}` : "");
+                    banner.style.display = "";
+                }
+            } catch (_) {}
+        } else {
+            $("#activity-job-banner").style.display = "none";
+        }
+
+        if (opts.category) $("#activity-filter-category").value = opts.category;
+        if (opts.archive_id) $("#activity-filter-archive").value = opts.archive_id;
+
+        await populateActivityArchiveFilter();
+        await loadActivityLog();
+        showPage("page-activity");
+    }
+
+    async function populateActivityArchiveFilter() {
+        const sel = $("#activity-filter-archive");
+        const current = sel.value;
+        // Keep first option
+        while (sel.options.length > 1) sel.remove(1);
+        try {
+            const data = await api("GET", "/api/archives");
+            const archives = data.archives || data;
+            for (const a of archives) {
+                const opt = document.createElement("option");
+                opt.value = a.id;
+                opt.textContent = a.title || a.identifier;
+                sel.appendChild(opt);
+            }
+        } catch (_) {}
+        sel.value = current;
+
+        // Also populate group filter
+        const gSel = $("#activity-filter-group");
+        const gCurrent = gSel.value;
+        while (gSel.options.length > 1) gSel.remove(1);
+        try {
+            const groups = await api("GET", "/api/groups");
+            for (const g of (groups || [])) {
+                const opt = document.createElement("option");
+                opt.value = g.id;
+                opt.textContent = g.name;
+                gSel.appendChild(opt);
+            }
+        } catch (_) {}
+        gSel.value = gCurrent;
+    }
+
+    async function loadActivityLog() {
+        const params = new URLSearchParams();
+        if (activityJobFilter) {
+            params.set("job_id", activityJobFilter);
+        } else {
+            const cat = $("#activity-filter-category").value;
+            const lvl = $("#activity-filter-level").value;
+            const grp = $("#activity-filter-group").value;
+            const arc = $("#activity-filter-archive").value;
+            const srch = $("#activity-filter-search").value.trim();
+            if (cat) params.set("category", cat);
+            if (lvl) params.set("level", lvl);
+            if (grp) params.set("group_id", grp);
+            if (arc) params.set("archive_id", arc);
+            if (srch) params.set("search", srch);
+        }
+        params.set("limit", ACTIVITY_PAGE_SIZE);
+        params.set("offset", activityOffset);
+
+        try {
+            const data = await api("GET", `/api/activity/log?${params}`);
+            renderActivityLog(data.entries, data.total);
+        } catch (err) {
+            $("#activity-log-list").innerHTML = `<div class="activity-empty">Failed to load activity log</div>`;
+        }
+    }
+
+    function renderActivityLog(entries, total) {
+        const list = $("#activity-log-list");
+        if (!entries || entries.length === 0) {
+            list.innerHTML = `<div class="activity-empty">No activity log entries</div>`;
+            $("#activity-pagination").innerHTML = "";
+            return;
+        }
+        list.innerHTML = entries.map(e => {
+            const dt = new Date(e.timestamp * 1000);
+            const time = dt.toLocaleString();
+            const cat = e.resolved_category || e.category || "";
+            const lvl = e.level || "info";
+            const archiveLink = e.archive_identifier
+                ? `<span class="entry-archive" data-id="${e.archive_id}">${esc(e.archive_title || e.archive_identifier)}</span>`
+                : "";
+            const detail = e.detail
+                ? `<div class="entry-detail">${esc(e.detail)}</div>`
+                : "";
+            return `<div class="activity-entry">
+                <span class="entry-time">${esc(time)}</span>
+                <span class="entry-category">${esc(cat)}</span>
+                <span class="entry-level level-${lvl}">${esc(lvl)}</span>
+                <span class="entry-message">${esc(e.message)}${archiveLink ? " — " + archiveLink : ""}</span>
+                ${detail}
+            </div>`;
+        }).join("");
+
+        // Click on archive links
+        list.querySelectorAll(".entry-archive").forEach(el => {
+            el.addEventListener("click", () => {
+                const id = parseInt(el.dataset.id);
+                if (id) openArchiveDetail(id);
+            });
+        });
+
+        // Pagination
+        const pag = $("#activity-pagination");
+        const totalPages = Math.ceil(total / ACTIVITY_PAGE_SIZE);
+        const currentPage = Math.floor(activityOffset / ACTIVITY_PAGE_SIZE) + 1;
+        pag.innerHTML = `
+            <button ${activityOffset === 0 ? "disabled" : ""} id="activity-prev">Previous</button>
+            <span class="page-info">Page ${currentPage} of ${totalPages} (${total} entries)</span>
+            <button ${activityOffset + ACTIVITY_PAGE_SIZE >= total ? "disabled" : ""} id="activity-next">Next</button>
+        `;
+        if (activityOffset > 0) {
+            $("#activity-prev").addEventListener("click", () => {
+                activityOffset = Math.max(0, activityOffset - ACTIVITY_PAGE_SIZE);
+                loadActivityLog();
+            });
+        }
+        if (activityOffset + ACTIVITY_PAGE_SIZE < total) {
+            $("#activity-next").addEventListener("click", () => {
+                activityOffset += ACTIVITY_PAGE_SIZE;
+                loadActivityLog();
+            });
+        }
+    }
+
+    function clearActivityFilters() {
+        $("#activity-filter-category").value = "";
+        $("#activity-filter-level").value = "";
+        $("#activity-filter-group").value = "";
+        $("#activity-filter-archive").value = "";
+        $("#activity-filter-search").value = "";
+        activityJobFilter = null;
+        $("#activity-job-banner").style.display = "none";
+        activityOffset = 0;
+        loadActivityLog();
+    }
+
     async function openCollections() {
         await refreshCollections();
         renderCollectionList();
@@ -4073,6 +4253,11 @@
 
         // Navigation
         $("#btn-archives").addEventListener("click", openArchiveList);
+        // Activity Log
+        $("#btn-activity").addEventListener("click", () => openActivityLog());
+        $("#activity-filter-apply").addEventListener("click", () => { activityOffset = 0; activityJobFilter = null; $("#activity-job-banner").style.display = "none"; loadActivityLog(); });
+        $("#activity-filter-clear").addEventListener("click", clearActivityFilters);
+        $("#activity-filter-search").addEventListener("keydown", (e) => { if (e.key === "Enter") { activityOffset = 0; activityJobFilter = null; loadActivityLog(); } });
         // Collections
         $("#btn-collections").addEventListener("click", openCollections);
         $("#btn-create-collection").addEventListener("click", () => openCollectionModal());

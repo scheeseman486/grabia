@@ -25,6 +25,7 @@ import hashlib
 import threading
 import functools
 from flask import Flask, render_template, request, jsonify, Response, session, redirect, url_for
+import activity
 import database as db
 import ia_client
 from downloader import download_manager
@@ -493,6 +494,20 @@ def _scan_worker():
             if scan_notif:
                 db.update_notification(scan_notif["id"], message=f'Scan failed: {e}', type="error", progress=None)
                 broadcast_sse("notification_updated", db.get_notification(scan_notif["id"]))
+            # Try to find and close the activity job for this scan
+            try:
+                with db._db() as conn:
+                    row = conn.execute(
+                        "SELECT id FROM activity_jobs WHERE category = 'scan' AND archive_id = ? AND status = 'running' ORDER BY id DESC LIMIT 1",
+                        (archive_id,),
+                    ).fetchone()
+                    if row:
+                        activity.log(row["id"], "error", f"Scan crashed: {e}",
+                                     archive_id=archive_id, detail=str(e))
+                        activity.flush()
+                        activity.finish_job(row["id"], "failed", summary=str(e))
+            except Exception:
+                pass
             broadcast_sse("scan_progress", {
                 "archive_id": archive_id, "phase": "error",
                 "error": str(e),
@@ -517,6 +532,10 @@ def _run_scan(archive_id):
         return
 
     archive_name = archive["title"] or archive["identifier"]
+    group_id = archive.get("group_id")
+
+    # Create activity job for this scan
+    act_job_id = activity.start_job("scan", archive_id=archive_id, group_id=group_id)
 
     # Create or find existing scan notification
     scan_notif = db.find_notification_by_scan(archive_id)
@@ -524,10 +543,15 @@ def _run_scan(archive_id):
         scan_notif_id = db.create_notification(
             f'Scanning "{archive_name}": starting...',
             type="info", progress=0, scan_archive_id=archive_id,
+            job_id=act_job_id,
         )
         broadcast_sse("notification_created", db.get_notification(scan_notif_id))
     else:
         scan_notif_id = scan_notif["id"]
+        # Link existing notification to the activity job
+        db.update_notification(scan_notif_id, job_id=act_job_id)
+
+    activity.update_job_notification(act_job_id, scan_notif_id)
 
     # Read update rate from settings (milliseconds -> seconds)
     update_rate = int(db.get_setting("sse_update_rate", "500")) / 1000.0
@@ -536,11 +560,15 @@ def _run_scan(archive_id):
     base_dir = os.path.realpath(os.path.join(download_dir, archive["identifier"]))
 
     if not os.path.isdir(base_dir):
+        msg = f"Download folder not found: {base_dir}"
+        activity.log(act_job_id, "error", msg, archive_id=archive_id)
+        activity.flush()
+        activity.finish_job(act_job_id, "failed", summary="Folder not found")
         db.update_notification(scan_notif_id, message=f'Scan "{archive_name}" failed: folder not found', type="error", progress=None)
         broadcast_sse("notification_updated", db.get_notification(scan_notif_id))
         broadcast_sse("scan_progress", {
             "archive_id": archive_id, "phase": "error",
-            "error": f"Download folder not found: {base_dir}",
+            "error": msg,
         })
         return
 
@@ -548,6 +576,11 @@ def _run_scan(archive_id):
         return cancel_evt and cancel_evt.is_set()
 
     def _abort():
+        activity.log(act_job_id, "warning", "Scan cancelled by user",
+                     archive_id=archive_id)
+        activity.flush()
+        activity.finish_job(act_job_id, "cancelled",
+                            summary=f"Cancelled at {processed}/{total_manifest}")
         db.delete_notification(scan_notif_id)
         broadcast_sse("notification_dismissed", {"id": scan_notif_id})
         broadcast_sse("scan_progress", {"archive_id": archive_id, "phase": "cancelled", "current": processed, "total": total_manifest})
@@ -608,6 +641,10 @@ def _run_scan(archive_id):
         conn.commit()
         pending_writes.clear()
         db.recompute_archive_status(archive_id)
+
+    activity.log(act_job_id, "info",
+                 f"Scan started: {total_manifest} manifest files to verify",
+                 archive_id=archive_id)
 
     broadcast_sse("scan_progress", {"archive_id": archive_id, "phase": "verify", "current": 0, "total": total_manifest})
 
@@ -829,6 +866,29 @@ def _run_scan(archive_id):
     ntype = "success" if summary["conflict"] == 0 and summary["missing"] == 0 else "warning"
     db.update_notification(scan_notif_id, message=f'Scan "{archive_name}": {result_msg}', type=ntype, progress=None)
     broadcast_sse("notification_updated", db.get_notification(scan_notif_id))
+
+    # Log scan summary to activity log
+    if summary["conflict"] > 0:
+        activity.log(act_job_id, "warning",
+                     f'{summary["conflict"]} file(s) have conflicts',
+                     archive_id=archive_id)
+    if summary["missing"] > 0:
+        activity.log(act_job_id, "warning",
+                     f'{summary["missing"]} file(s) not found on disk',
+                     archive_id=archive_id)
+    if summary["partial"] > 0:
+        activity.log(act_job_id, "info",
+                     f'{summary["partial"]} partial download(s) re-queued',
+                     archive_id=archive_id)
+    if summary["unknown"] > 0:
+        activity.log(act_job_id, "info",
+                     f'{summary["unknown"]} unknown file(s) found on disk',
+                     archive_id=archive_id)
+
+    activity.log(act_job_id, "success" if ntype == "success" else "warning",
+                 f"Scan complete: {result_msg}", archive_id=archive_id)
+    activity.flush()
+    activity.finish_job(act_job_id, "completed", summary=result_msg)
 
     broadcast_sse("scan_progress", {
         "archive_id": archive_id, "phase": "done",
@@ -2070,6 +2130,57 @@ def get_collections_settings():
         "collections_dir": collection_sync.get_collections_dir(),
         "download_dir": collection_sync.get_download_dir(),
     })
+
+
+# --- Activity Log API ---
+
+@app.route("/api/activity/log", methods=["GET"])
+@login_required
+def get_activity_log():
+    """Return activity log entries with optional filters."""
+    job_id = request.args.get("job_id", type=int)
+    archive_id = request.args.get("archive_id", type=int)
+    group_id = request.args.get("group_id", type=int)
+    category = request.args.get("category")
+    level = request.args.get("level")
+    search = request.args.get("search")
+    limit = request.args.get("limit", 200, type=int)
+    offset = request.args.get("offset", 0, type=int)
+    entries = activity.get_log_entries(
+        job_id=job_id, archive_id=archive_id, group_id=group_id,
+        category=category, level=level, search=search,
+        limit=limit, offset=offset,
+    )
+    total = activity.get_log_count(
+        job_id=job_id, archive_id=archive_id, group_id=group_id,
+        category=category, level=level, search=search,
+    )
+    return jsonify({"entries": entries, "total": total})
+
+
+@app.route("/api/activity/jobs", methods=["GET"])
+@login_required
+def get_activity_jobs():
+    """Return recent activity jobs."""
+    category = request.args.get("category")
+    archive_id = request.args.get("archive_id", type=int)
+    limit = request.args.get("limit", 50, type=int)
+    offset = request.args.get("offset", 0, type=int)
+    jobs = activity.get_jobs(
+        category=category, archive_id=archive_id,
+        limit=limit, offset=offset,
+    )
+    return jsonify({"jobs": jobs})
+
+
+@app.route("/api/activity/jobs/<int:job_id>", methods=["GET"])
+@login_required
+def get_activity_job(job_id):
+    """Return a single activity job."""
+    j = activity.get_job(job_id)
+    if not j:
+        return jsonify({"error": "Not found"}), 404
+    return jsonify(j)
 
 
 # --- Init ---
