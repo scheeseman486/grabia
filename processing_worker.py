@@ -211,6 +211,16 @@ def _worker_loop():
         except Exception as e:
             log.error("worker", "Processing job %d failed: %s", job["id"], e)
             db.complete_processing_job(job["id"], error_message=str(e))
+
+            # Reset any files left stuck in 'processing' or 'queued' for this archive
+            _reset_stuck_files(job["archive_id"])
+
+            # Close the activity job if it's still running
+            _fail_activity_job(job["id"], str(e))
+
+            # Dismiss the processing notification
+            _dismiss_processing_notification(job["archive_id"], str(e))
+
             _broadcast("processing_progress", {
                 "archive_id": job["archive_id"],
                 "phase": "error",
@@ -219,6 +229,51 @@ def _worker_loop():
         finally:
             with _processing_lock:
                 _cancel_events.pop(job["archive_id"], None)
+
+
+def _reset_stuck_files(archive_id):
+    """Reset files stuck in 'processing' or 'queued' for this archive after a crash."""
+    try:
+        with db._db() as conn:
+            conn.execute(
+                "UPDATE archive_files SET processing_status = '', processing_error = 'Interrupted by error' "
+                "WHERE archive_id = ? AND processing_status IN ('processing', 'queued')",
+                (archive_id,),
+            )
+            conn.commit()
+    except Exception:
+        pass
+
+
+def _fail_activity_job(processing_job_id, error_msg):
+    """Close the activity job linked to a processing job as failed."""
+    try:
+        act_job_id = _find_activity_job(processing_job_id)
+        if act_job_id:
+            activity.log(act_job_id, "error", f"Processing crashed: {error_msg[:200]}",
+                         archive_id=None)
+            activity.flush()
+            activity.finish_job(act_job_id, "failed", summary=f"Crashed: {error_msg[:100]}")
+    except Exception:
+        pass
+
+
+def _dismiss_processing_notification(archive_id, error_msg):
+    """Update the processing notification for a crashed job."""
+    try:
+        notif = db.find_notification_by_processing(archive_id)
+        if notif:
+            archive = db.get_archive(archive_id)
+            name = (archive["title"] or archive["identifier"]) if archive else f"Archive #{archive_id}"
+            db.update_notification(
+                notif["id"],
+                message=f'Processing "{name}" failed: {error_msg[:150]}',
+                type="error",
+                progress=None,
+            )
+            _broadcast("notification_updated", db.get_notification(notif["id"]))
+    except Exception:
+        pass
 
 
 def _find_activity_job(processing_job_id):

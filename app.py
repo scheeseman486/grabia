@@ -2215,6 +2215,7 @@ def delete_activity_job(job_id):
 def create_app():
     db.init_db()
     db.reset_downloading_files()
+    db.reset_stale_processing()
     # Prune old dismissed notifications and stale activity log entries on startup
     try:
         db.prune_notifications(max_age_days=7, max_dismissed=200)

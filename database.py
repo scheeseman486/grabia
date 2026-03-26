@@ -823,6 +823,64 @@ def reset_downloading_files():
         conn.commit()
 
 
+def reset_stale_processing():
+    """Reset files and jobs stuck in processing states after a crash.
+
+    - Files stuck in 'processing' or 'queued' → reset to '' (unprocessed)
+    - Processing jobs stuck in 'running' → mark as 'failed'
+    - Notifications for stale processing jobs → dismissed
+    - Activity jobs stuck in 'running' for processing → marked failed
+    """
+    with _db() as conn:
+        # Reset stuck files
+        stuck_files = conn.execute(
+            "SELECT COUNT(*) as cnt FROM archive_files WHERE processing_status IN ('processing', 'queued')"
+        ).fetchone()["cnt"]
+        if stuck_files:
+            conn.execute(
+                "UPDATE archive_files SET processing_status = '', processing_error = 'Reset after crash' "
+                "WHERE processing_status IN ('processing', 'queued')"
+            )
+
+        # Fail stuck processing jobs and collect their archive IDs for notification cleanup
+        stuck_jobs = conn.execute(
+            "SELECT id, archive_id FROM processing_jobs WHERE status = 'running'"
+        ).fetchall()
+        for row in stuck_jobs:
+            conn.execute(
+                "UPDATE processing_jobs SET status = 'failed', error_message = 'Interrupted by crash/restart', "
+                "completed_at = ? WHERE id = ?",
+                (time.time(), row["id"]),
+            )
+            # Dismiss the processing notification for this archive
+            conn.execute(
+                "UPDATE notifications SET dismissed = 1 WHERE processing_archive_id = ? AND dismissed = 0",
+                (row["archive_id"],),
+            )
+
+        # Also fail stuck activity jobs for processing
+        conn.execute(
+            "UPDATE activity_jobs SET status = 'failed', completed_at = ?, "
+            "summary = 'Interrupted by crash/restart' "
+            "WHERE category = 'processing' AND status = 'running'",
+            (time.time(),),
+        )
+
+        # Also reset stuck scan activity jobs
+        conn.execute(
+            "UPDATE activity_jobs SET status = 'failed', completed_at = ?, "
+            "summary = 'Interrupted by crash/restart' "
+            "WHERE category = 'scan' AND status = 'running'",
+            (time.time(),),
+        )
+
+        conn.commit()
+
+        if stuck_files or stuck_jobs:
+            log.info("Reset %d stuck files and %d stuck processing jobs after restart",
+                     stuck_files, len(stuck_jobs))
+
+
 def reset_failed_files(archive_id):
     """Reset all failed files in an archive back to pending with retry count zeroed."""
     with _db() as conn:
