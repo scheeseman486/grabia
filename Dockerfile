@@ -40,11 +40,19 @@ COPY *.py ./
 COPY static/ ./static/
 COPY templates/ ./templates/
 
-RUN mkdir -p /app/data /app/downloads
+RUN mkdir -p /app/data /app/downloads /tempstorage
 
 ENV GRABIA_HOST=0.0.0.0
 ENV GRABIA_PORT=5000
 ENV GRABIA_DATA_DIR=/app/data
+
+# Direct all temp files (chdman, 7z, maxcso, unrar, Python tempfile) to
+# /tempstorage so they land on a real disk volume instead of the container's
+# overlay filesystem (docker.img).  Mount a host path to /tempstorage in
+# your docker-compose or Unraid template.
+ENV TMPDIR=/tempstorage
+ENV TEMP=/tempstorage
+ENV TMP=/tempstorage
 
 EXPOSE 5000
 

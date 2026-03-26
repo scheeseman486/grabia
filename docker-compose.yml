@@ -6,9 +6,11 @@ services:
     volumes:
       - grabia-data:/app/data
       - ./downloads:/app/downloads
+      - grabia-temp:/tempstorage
     environment:
       - GRABIA_PORT=5000
     restart: unless-stopped
 
 volumes:
   grabia-data:
+  grabia-temp:

@@ -520,12 +520,21 @@ class BaseProcessor:
         return ext in self.input_extensions
 
     def get_temp_dir(self, file_path):
-        """Create a temp directory for processing, respecting user settings."""
+        """Create a temp directory for processing, respecting user settings.
+
+        Priority: 1) processing_temp_dir setting, 2) TMPDIR env var
+        (set to /tempstorage in the Docker image), 3) alongside the file.
+        """
         import database as db_mod
         temp_base = db_mod.get_setting("processing_temp_dir", "")
         if temp_base and os.path.isdir(temp_base):
             return tempfile.mkdtemp(prefix="grabia_proc_", dir=temp_base)
-        # Default: temp dir alongside the file
+        # Honour TMPDIR (set to /tempstorage in the Docker image) so that
+        # extraction temp files land on a real disk, not the container overlay.
+        env_tmp = os.environ.get("TMPDIR", "")
+        if env_tmp and os.path.isdir(env_tmp):
+            return tempfile.mkdtemp(prefix="grabia_proc_", dir=env_tmp)
+        # Last resort: temp dir alongside the file
         return tempfile.mkdtemp(prefix="grabia_proc_", dir=os.path.dirname(file_path))
 
     def process(self, file_path, download_dir):
