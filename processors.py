@@ -31,22 +31,35 @@ from logger import log
 # Memory-aware thread scaling for chdman
 # ---------------------------------------------------------------------------
 
-# Approximate per-thread memory for chdman compression buffers.
-# DVD default compression (lzma+zlib+huff+flac) is ~50 MB/thread;
-# CD default compression (cdlz+cdzl+cdfl) is ~25 MB/thread.
-# These are conservative estimates that include hunk I/O buffers.
-_CHDMAN_MB_PER_THREAD_DVD = 50
-_CHDMAN_MB_PER_THREAD_CD = 25
-_CHDMAN_BASE_OVERHEAD_MB = 150  # hunk map, SHA1 tracking, I/O buffers, etc.
-_SYSTEM_RESERVE_MB = 512        # leave headroom for Grabia, OS, other containers
+# chdman memory usage has three components:
+#
+# 1. Base overhead — fixed per-process cost (~100 MB).
+#
+# 2. File-proportional — hunk map, SHA1 tracking, and I/O buffers scale
+#    with input size.  chdman divides the input into hunks (CD: ~18 KB,
+#    DVD: ~64 KB) and tracks metadata per hunk.  For large files this is
+#    significant: a 6 GB DVD ISO has ~98 000 hunks.  Empirically ~8 % of
+#    input size is a reasonable estimate for the combined hunk map, hash
+#    tables, and read-ahead buffers.
+#
+# 3. Per-thread — each compression worker allocates codec state for every
+#    codec in the set being tried.  LZMA alone needs ~40-65 MB of
+#    dictionary memory per stream.  DVD default (lzma+zlib+huff+flac) is
+#    ~100 MB/thread; CD default (cdlz+cdzl+cdfl) is ~50 MB/thread.
+#
+_CHDMAN_BASE_OVERHEAD_MB = 100
+_CHDMAN_FILE_OVERHEAD_PCT = 0.08  # 8 % of input file size
+_CHDMAN_MB_PER_THREAD_DVD = 100   # per thread: LZMA dict + zlib + huff + flac
+_CHDMAN_MB_PER_THREAD_CD = 50     # per thread: cdlz + cdzl + cdfl
+_SYSTEM_RESERVE_MB = 512           # headroom for Grabia, OS, other containers
 
 
-def _get_chdman_threads(user_setting, disc_type="dvd"):
+def _get_chdman_threads(user_setting, disc_type="dvd", input_path=None):
     """Return the number of chdman threads to use, respecting available memory.
 
     When *user_setting* is 0 (auto), compute a thread count that fits within
-    the container / system memory.  When it's a positive integer, honour it
-    directly (the user explicitly chose it).
+    the container / system memory, accounting for the input file size.
+    When it's a positive integer, honour it directly (the user chose it).
 
     Returns an int >= 1.
     """
@@ -56,24 +69,40 @@ def _get_chdman_threads(user_setting, disc_type="dvd"):
     import multiprocessing
     cpu_count = multiprocessing.cpu_count()
 
+    # Determine input file size for proportional overhead estimate
+    file_size_mb = 0
+    if input_path:
+        try:
+            file_size_mb = os.path.getsize(input_path) / (1024 * 1024)
+        except OSError:
+            pass
+
+    file_overhead = int(file_size_mb * _CHDMAN_FILE_OVERHEAD_PCT)
+    total_base = _CHDMAN_BASE_OVERHEAD_MB + file_overhead
+
     # Try to read available memory from cgroup (Docker) first, then system
     available_mb = _get_available_memory_mb()
     if available_mb is None:
         # Can't determine memory — be conservative: half of CPUs, min 1, max 4
         threads = max(1, min(cpu_count // 2, 4))
-        log.debug("proc", "chdman threads: no memory info, defaulting to %d (cpus=%d)", threads, cpu_count)
+        log.debug("proc", "chdman threads: no memory info, defaulting to %d "
+                  "(cpus=%d, file=%.0fMB)", threads, cpu_count, file_size_mb)
         return threads
 
     mb_per_thread = _CHDMAN_MB_PER_THREAD_DVD if disc_type == "dvd" else _CHDMAN_MB_PER_THREAD_CD
-    usable = available_mb - _CHDMAN_BASE_OVERHEAD_MB - _SYSTEM_RESERVE_MB
+    usable = available_mb - total_base - _SYSTEM_RESERVE_MB
     if usable < mb_per_thread:
-        log.warning("proc", "chdman threads: very low memory (%d MB available), using 1 thread", available_mb)
+        log.warning("proc", "chdman threads: very low memory "
+                    "(%dMB available, %dMB base+file overhead), using 1 thread",
+                    available_mb, total_base)
         return 1
 
     mem_threads = int(usable // mb_per_thread)
     threads = max(1, min(mem_threads, cpu_count))
-    log.debug("proc", "chdman threads: %d (mem=%dMB, usable=%dMB, %dMB/thread, cpus=%d)",
-              threads, available_mb, usable, mb_per_thread, cpu_count)
+    log.debug("proc", "chdman threads: %d (mem=%dMB, base=%dMB, file=%.0fMB, "
+              "%dMB/thread, usable=%dMB, cpus=%d)",
+              threads, available_mb, total_base, file_size_mb,
+              mb_per_thread, usable, cpu_count)
     return threads
 
 
@@ -815,7 +844,7 @@ class CHDCDProcessor(BaseProcessor):
         compression = self.options.get("compression", "default")
         if compression != "default":
             cmd.extend(["-c", compression])
-        threads = _get_chdman_threads(self.options.get("num_processors", 0), disc_type="cd")
+        threads = _get_chdman_threads(self.options.get("num_processors", 0), disc_type="cd", input_path=input_path)
         cmd.extend(["-np", str(threads)])
 
         log.debug("proc", "Running: %s", " ".join(cmd))
@@ -1030,7 +1059,7 @@ class CHDAutoProcessor(BaseProcessor):
     def _run_chdman_createcd(self, chdman, input_path, output_path):
         cmd = [chdman, "createcd", "-i", input_path, "-o", output_path, "-f"]
         cmd.extend(self._get_compression_args("cd"))
-        threads = _get_chdman_threads(self.options.get("num_processors", 0), disc_type="cd")
+        threads = _get_chdman_threads(self.options.get("num_processors", 0), disc_type="cd", input_path=input_path)
         cmd.extend(["-np", str(threads)])
 
         log.debug("proc", "Running: %s", " ".join(cmd))
@@ -1046,7 +1075,7 @@ class CHDAutoProcessor(BaseProcessor):
     def _run_chdman_createdvd(self, chdman, input_path, output_path):
         cmd = [chdman, "createdvd", "-i", input_path, "-o", output_path, "-f"]
         cmd.extend(self._get_compression_args("dvd"))
-        threads = _get_chdman_threads(self.options.get("num_processors", 0), disc_type="dvd")
+        threads = _get_chdman_threads(self.options.get("num_processors", 0), disc_type="dvd", input_path=input_path)
         cmd.extend(["-np", str(threads)])
 
         log.debug("proc", "Running: %s", " ".join(cmd))
@@ -1173,7 +1202,7 @@ class CHDDVDProcessor(BaseProcessor):
         compression = self.options.get("compression", "default")
         if compression != "default":
             cmd.extend(["-c", compression])
-        threads = _get_chdman_threads(self.options.get("num_processors", 0), disc_type="dvd")
+        threads = _get_chdman_threads(self.options.get("num_processors", 0), disc_type="dvd", input_path=input_path)
         cmd.extend(["-np", str(threads)])
 
         self._check_cancel()
