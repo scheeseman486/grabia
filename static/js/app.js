@@ -3965,7 +3965,7 @@
                 <th class="col-time">Time</th>
                 <th class="col-category">Category</th>
                 <th class="col-level">Level</th>
-                <th>Message</th>
+                <th class="col-message">Message</th>
             </tr></thead>
             <tbody id="activity-log-tbody"></tbody>
         </table></div>`;
@@ -3982,8 +3982,7 @@
         const cat = e.resolved_category || e.category || "";
         const lvl = e.level || "info";
         const hasDetail = !!e.detail;
-
-        if (hasDetail) tr.classList.add("has-detail");
+        const archiveName = e.archive_title || e.archive_identifier || "";
 
         const tdTime = document.createElement("td");
         tdTime.className = "col-time";
@@ -3997,10 +3996,13 @@
         tdLevel.className = "col-level";
         tdLevel.innerHTML = `<span class="entry-level level-${lvl}">${esc(lvl)}</span>`;
 
+        // Message cell — CSS handles visual truncation via text-overflow: ellipsis.
+        // Full text is in the DOM so the browser measures overflow correctly.
         const tdMsg = document.createElement("td");
+        tdMsg.className = "col-message";
         let msgHtml = `<span class="entry-message">${esc(e.message)}`;
-        if (e.archive_identifier) {
-            msgHtml += ` — <span class="entry-archive" data-id="${e.archive_id}">${esc(e.archive_title || e.archive_identifier)}</span>`;
+        if (archiveName) {
+            msgHtml += ` — <span class="entry-archive" data-id="${e.archive_id}">${esc(archiveName)}</span>`;
         }
         msgHtml += `</span>`;
         tdMsg.innerHTML = msgHtml;
@@ -4015,23 +4017,50 @@
             });
         }
 
-        // Click row to expand/collapse detail (outside virtual scroll, like file list)
-        if (hasDetail) {
-            tr.style.cursor = "pointer";
-            tr.addEventListener("click", () => {
-                const existing = tr.nextElementSibling;
-                if (existing && existing.classList.contains("al-detail-row")) {
-                    existing.remove();
-                    tr.classList.remove("al-expanded");
-                } else {
-                    const detailTr = document.createElement("tr");
-                    detailTr.className = "al-detail-row";
-                    detailTr.innerHTML = `<td colspan="4"><div class="entry-detail">${esc(e.detail)}</div></td>`;
-                    tr.after(detailTr);
-                    tr.classList.add("al-expanded");
-                }
+        // Click row to expand/collapse full message + detail.
+        // Every row gets the handler; on click we check whether there's
+        // actually something worth expanding (overflow or detail text).
+        tr.addEventListener("click", (ev) => {
+            if (ev.target.closest(".entry-archive")) return;
+            const existing = tr.nextElementSibling;
+            if (existing && existing.classList.contains("al-detail-row")) {
+                existing.remove();
+                tr.classList.remove("al-expanded");
+                return;
+            }
+            // Only expand if the message is visually clipped or has detail
+            const isOverflowing = tdMsg.scrollWidth > tdMsg.clientWidth;
+            if (!isOverflowing && !hasDetail) return;
+
+            const detailTr = document.createElement("tr");
+            detailTr.className = "al-detail-row";
+
+            let cellHtml = `<div class="al-detail-wrap">`;
+            cellHtml += `<div class="al-detail-label">Full message</div>`;
+            cellHtml += `<div class="al-detail-message">${esc(e.message)}`;
+            if (archiveName) {
+                cellHtml += ` — <span class="entry-archive" data-id="${e.archive_id}">${esc(archiveName)}</span>`;
+            }
+            cellHtml += `</div>`;
+            if (hasDetail) {
+                cellHtml += `<div class="al-detail-label">Detail</div>`;
+                cellHtml += `<div class="al-detail-extra">${esc(e.detail)}</div>`;
+            }
+            cellHtml += `</div>`;
+            detailTr.innerHTML = `<td colspan="4">${cellHtml}</td>`;
+
+            // Archive link in expanded detail
+            detailTr.querySelectorAll(".entry-archive").forEach(el => {
+                el.addEventListener("click", (ev2) => {
+                    ev2.stopPropagation();
+                    const id = parseInt(el.dataset.id);
+                    if (id) openArchiveDetail(id);
+                });
             });
-        }
+
+            tr.after(detailTr);
+            tr.classList.add("al-expanded");
+        });
 
         tr.appendChild(tdTime);
         tr.appendChild(tdCat);
