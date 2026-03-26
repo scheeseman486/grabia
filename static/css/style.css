@@ -2563,19 +2563,15 @@ tr.processed-detail-row td { padding: 0 !important; }
 .no-collections { color: var(--text-dim); font-size: 12px; }
 
 /* ── Activity Log ─────────────────────────────────────────────── */
-.activity-page { padding: 16px 24px; }
-.activity-header { margin-bottom: 16px; }
-.activity-header h2 { margin: 0; font-size: 20px; }
-
-.activity-filters {
+#page-activity .activity-filters {
     display: flex;
     gap: 8px;
     flex-wrap: wrap;
     align-items: center;
-    margin-bottom: 16px;
+    margin-bottom: 12px;
 }
-.activity-filters select,
-.activity-filters input {
+#page-activity .activity-filters select,
+#page-activity .activity-filters input {
     padding: 6px 10px;
     border: 1px solid var(--border);
     border-radius: 6px;
@@ -2590,7 +2586,7 @@ tr.processed-detail-row td { padding: 0 !important; }
     border-radius: 8px;
     background: var(--surface);
     border: 1px solid var(--border);
-    margin-bottom: 16px;
+    margin-bottom: 12px;
     font-size: 13px;
 }
 .activity-job-banner .job-status {
