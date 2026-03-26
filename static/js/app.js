@@ -4013,7 +4013,6 @@
             api("POST", "/api/download/start").then((r) => {
                 if (!r.has_work) {
                     addNotification("Nothing queued for download", "warning");
-                    api("POST", "/api/download/stop");
                 }
             });
         });

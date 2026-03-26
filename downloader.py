@@ -203,9 +203,8 @@ class DownloadManager:
 
             file_info = db.get_next_download_file()
             if not file_info:
-                # No more files to download, idle briefly then check again
-                time.sleep(2)
-                continue
+                # Queue is empty — auto-stop the download manager
+                break
 
             # If this is a retry of a previously failed file, wait retry_delay first
             if file_info.get("download_status") == "failed":
@@ -219,10 +218,21 @@ class DownloadManager:
 
             self._download_file(file_info)
 
-        # stop() handles state notification after reset_downloading_files(),
-        # so don't notify here to avoid a race where the client refreshes
-        # before the DB has been updated.
-        self._current_file_info = None
+        # Clean up after loop exit
+        auto_stopped = False
+        with self._lock:
+            self._current_file_info = None
+            self._current_speed = 0
+            # If the loop exited because the queue emptied (not user stop),
+            # transition to stopped state and notify clients.
+            if not self._stop_event.is_set():
+                self.state = "stopped"
+                self._stop_event.set()
+                self._thread = None
+                auto_stopped = True
+        if auto_stopped:
+            db.reset_downloading_files()
+            self._notify("state", "stopped")
 
     def _download_file(self, file_info):
         self._skip_file_event.clear()

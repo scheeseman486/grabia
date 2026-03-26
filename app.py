@@ -1520,10 +1520,11 @@ def retry_single_file(file_id):
 @app.route("/api/download/start", methods=["POST"])
 @login_required
 def start_download():
-    # Check if there's anything to download before starting
     has_work = db.get_next_download_file() is not None
+    if not has_work:
+        return jsonify({"state": download_manager.state, "has_work": False})
     download_manager.start()
-    return jsonify({"state": download_manager.state, "has_work": has_work})
+    return jsonify({"state": download_manager.state, "has_work": True})
 
 
 @app.route("/api/download/pause", methods=["POST"])
