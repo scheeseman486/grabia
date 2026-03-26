@@ -3662,13 +3662,10 @@
     }
 
     // ── Activity Log ──────────────────────────────────────────────
-    let activityOffset = 0;
-    const ACTIVITY_PAGE_SIZE = 100;
     let activityJobFilter = null;  // set when navigating from a notification
 
     async function openActivityLog(opts) {
         opts = opts || {};
-        activityOffset = 0;
         activityJobFilter = opts.job_id || null;
 
         // Reset filters unless navigating with specific opts
@@ -3749,7 +3746,6 @@
                         banner.querySelectorAll(".job-card").forEach(c => c.classList.remove("job-card-active"));
                         el.classList.add("job-card-active");
                     }
-                    activityOffset = 0;
                     loadActivityLog();
                 });
             });
@@ -3807,22 +3803,20 @@
             if (arc) params.set("archive_id", arc);
             if (srch) params.set("search", srch);
         }
-        params.set("limit", ACTIVITY_PAGE_SIZE);
-        params.set("offset", activityOffset);
+        params.set("limit", 5000);
 
         try {
             const data = await api("GET", `/api/activity/log?${params}`);
-            renderActivityLog(data.entries, data.total);
+            renderActivityLog(data.entries);
         } catch (err) {
             $("#activity-log-list").innerHTML = `<div class="activity-log-wrap"><div class="activity-empty">Failed to load activity log</div></div>`;
         }
     }
 
-    function renderActivityLog(entries, total) {
+    function renderActivityLog(entries) {
         const list = $("#activity-log-list");
         if (!entries || entries.length === 0) {
             list.innerHTML = `<div class="activity-log-wrap"><div class="activity-empty">No activity log entries</div></div>`;
-            $("#activity-pagination").innerHTML = "";
             return;
         }
         const rows = entries.map(e => {
@@ -3860,28 +3854,6 @@
                 if (id) openArchiveDetail(id);
             });
         });
-
-        // Pagination
-        const pag = $("#activity-pagination");
-        const totalPages = Math.ceil(total / ACTIVITY_PAGE_SIZE);
-        const currentPage = Math.floor(activityOffset / ACTIVITY_PAGE_SIZE) + 1;
-        pag.innerHTML = `
-            <button ${activityOffset === 0 ? "disabled" : ""} id="activity-prev">Previous</button>
-            <span class="page-info">Page ${currentPage} of ${totalPages} (${total} entries)</span>
-            <button ${activityOffset + ACTIVITY_PAGE_SIZE >= total ? "disabled" : ""} id="activity-next">Next</button>
-        `;
-        if (activityOffset > 0) {
-            $("#activity-prev").addEventListener("click", () => {
-                activityOffset = Math.max(0, activityOffset - ACTIVITY_PAGE_SIZE);
-                loadActivityLog();
-            });
-        }
-        if (activityOffset + ACTIVITY_PAGE_SIZE < total) {
-            $("#activity-next").addEventListener("click", () => {
-                activityOffset += ACTIVITY_PAGE_SIZE;
-                loadActivityLog();
-            });
-        }
     }
 
     function clearActivityFilters() {
@@ -3891,7 +3863,6 @@
         $("#activity-filter-archive").value = "";
         $("#activity-filter-search").value = "";
         activityJobFilter = null;
-        activityOffset = 0;
         loadActivityJobs(null);
         loadActivityLog();
     }
@@ -4334,9 +4305,9 @@
         $("#btn-archives").addEventListener("click", openArchiveList);
         // Activity Log
         $("#btn-activity").addEventListener("click", () => openActivityLog());
-        $("#activity-filter-apply").addEventListener("click", () => { activityOffset = 0; loadActivityLog(); });
+        $("#activity-filter-apply").addEventListener("click", () => loadActivityLog());
         $("#activity-filter-clear").addEventListener("click", clearActivityFilters);
-        $("#activity-filter-search").addEventListener("keydown", (e) => { if (e.key === "Enter") { activityOffset = 0; loadActivityLog(); } });
+        $("#activity-filter-search").addEventListener("keydown", (e) => { if (e.key === "Enter") loadActivityLog(); });
         // Collections
         $("#btn-collections").addEventListener("click", openCollections);
         $("#btn-create-collection").addEventListener("click", () => openCollectionModal());
