@@ -139,7 +139,32 @@ def cancel_archive_processing(archive_id):
             db.delete_notification(notif["id"])
             _broadcast("notification_dismissed", {"id": notif["id"]})
 
+        # Close any running activity job for this archive.
+        # The processing loop may also call finish_job when it detects the
+        # cancel event, but that's harmless (just an extra UPDATE).
+        _cancel_activity_job(archive_id)
+
     return cancelled
+
+
+def _cancel_activity_job(archive_id):
+    """Find and close the running activity job for a cancelled archive."""
+    try:
+        with db._db() as conn:
+            row = conn.execute(
+                """SELECT id FROM activity_jobs
+                   WHERE category = 'processing' AND archive_id = ?
+                         AND status = 'running'
+                   ORDER BY id DESC LIMIT 1""",
+                (archive_id,),
+            ).fetchone()
+            if row:
+                activity.log(row["id"], "warning", "Cancelled by user",
+                             archive_id=archive_id)
+                activity.flush()
+                activity.finish_job(row["id"], "cancelled", summary="Cancelled by user")
+    except Exception:
+        pass
 
 
 def is_processing(archive_id):

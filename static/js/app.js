@@ -568,6 +568,10 @@
         es.addEventListener("processing_progress", (e) => {
             const data = JSON.parse(e.data);
             updateProcessingProgress(data);
+            // Refresh activity log if visible and job finished/cancelled
+            if (data.phase === "done" || data.phase === "cancelled" || data.phase === "error") {
+                _refreshActivityIfVisible();
+            }
         });
 
         es.addEventListener("notification_created", (e) => {
@@ -3882,6 +3886,13 @@
         activityOffset = 0;
         loadActivityJobs(null);
         loadActivityLog();
+    }
+
+    function _refreshActivityIfVisible() {
+        if ($("#page-activity").classList.contains("active")) {
+            loadActivityJobs(activityJobFilter);
+            loadActivityLog();
+        }
     }
 
     async function openCollections() {
