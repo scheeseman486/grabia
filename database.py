@@ -1300,13 +1300,13 @@ def delete_notification(notif_id):
 
 
 def get_notifications(include_dismissed=False):
-    """Return all notifications, newest first."""
+    """Return notifications, newest first (capped to prevent unbounded results)."""
     with _db() as conn:
         if include_dismissed:
-            rows = conn.execute("SELECT * FROM notifications ORDER BY created_at DESC").fetchall()
+            rows = conn.execute("SELECT * FROM notifications ORDER BY created_at DESC LIMIT 500").fetchall()
         else:
             rows = conn.execute(
-                "SELECT * FROM notifications WHERE dismissed = 0 ORDER BY created_at DESC"
+                "SELECT * FROM notifications WHERE dismissed = 0 ORDER BY created_at DESC LIMIT 200"
             ).fetchall()
         return [dict(r) for r in rows]
 
@@ -1328,6 +1328,30 @@ def clear_notifications():
               AND processing_archive_id IS NULL
               AND adding_archive = 0
         """)
+        conn.commit()
+
+
+def prune_notifications(max_age_days=7, max_dismissed=200):
+    """Delete old dismissed notifications to prevent unbounded growth.
+
+    Keeps at most *max_dismissed* dismissed notifications and removes any
+    dismissed notification older than *max_age_days*.
+    """
+    import time as _time
+    cutoff = _time.time() - (max_age_days * 86400)
+    with _db() as conn:
+        # Delete old dismissed notifications
+        conn.execute(
+            "DELETE FROM notifications WHERE dismissed = 1 AND created_at < ?",
+            (cutoff,),
+        )
+        # Cap total dismissed count — keep the newest max_dismissed
+        conn.execute("""
+            DELETE FROM notifications WHERE dismissed = 1 AND id NOT IN (
+                SELECT id FROM notifications WHERE dismissed = 1
+                ORDER BY created_at DESC LIMIT ?
+            )
+        """, (max_dismissed,))
         conn.commit()
 
 

@@ -2215,6 +2215,13 @@ def delete_activity_job(job_id):
 def create_app():
     db.init_db()
     db.reset_downloading_files()
+    # Prune old dismissed notifications and stale activity log entries on startup
+    try:
+        db.prune_notifications(max_age_days=7, max_dismissed=200)
+        import activity
+        activity.prune(max_age_days=30)
+    except Exception:
+        pass  # Non-critical — don't block startup
     # Configure debug logging from saved settings
     configure_logging(
         enabled=db.get_setting("debug_enabled", "0") == "1",

@@ -353,183 +353,186 @@ class DownloadManager:
             headers["Range"] = f"bytes={existing_size}-"
 
         resp = requests.get(url, headers=headers, cookies=cookies, stream=True, timeout=60)
+        try:
+            if resp.status_code == 416:
+                resp.close()
+                # Range not satisfiable, file might be complete
+                if expected_md5 and self._verify_md5(local_path, expected_md5):
+                    return True
+                existing_size = 0
+                if os.path.exists(local_path):
+                    os.remove(local_path)
+                headers.pop("Range", None)
+                resp = requests.get(url, headers=headers, cookies=cookies, stream=True, timeout=60)
 
-        if resp.status_code == 416:
-            # Range not satisfiable, file might be complete
-            if expected_md5 and self._verify_md5(local_path, expected_md5):
-                return True
-            existing_size = 0
-            if os.path.exists(local_path):
-                os.remove(local_path)
-            headers.pop("Range", None)
-            resp = requests.get(url, headers=headers, cookies=cookies, stream=True, timeout=60)
+            resp.raise_for_status()
 
-        resp.raise_for_status()
+            mode = "ab" if existing_size > 0 and resp.status_code == 206 else "wb"
+            if mode == "wb":
+                existing_size = 0
 
-        mode = "ab" if existing_size > 0 and resp.status_code == 206 else "wb"
-        if mode == "wb":
-            existing_size = 0
+            downloaded = existing_size
+            chunk_size = 8192
+            update_interval = 0.5
+            next_update = time.monotonic() + update_interval
+            # Token bucket for bandwidth limiting
+            tokens = 0.0
+            token_time = time.monotonic()
+            # For speed measurement: track bytes in a rolling window
+            speed_samples = []
 
-        downloaded = existing_size
-        chunk_size = 8192
-        update_interval = 0.5
-        next_update = time.monotonic() + update_interval
-        # Token bucket for bandwidth limiting
-        tokens = 0.0
-        token_time = time.monotonic()
-        # For speed measurement: track bytes in a rolling window
-        speed_samples = []
+            with open(local_path, mode) as f:
+                for chunk in resp.iter_content(chunk_size=chunk_size):
+                    if self._stop_event.is_set() or self._skip_file_event.is_set():
+                        return False
 
-        with open(local_path, mode) as f:
-            for chunk in resp.iter_content(chunk_size=chunk_size):
-                if self._stop_event.is_set() or self._skip_file_event.is_set():
-                    return False
-
-                # Wait if paused — reset timer on resume to avoid burst
-                if not self._pause_event.is_set():
-                    self._pause_event.wait()
-                    next_update = time.monotonic() + update_interval
-                    token_time = time.monotonic()
-                if self._stop_event.is_set() or self._skip_file_event.is_set():
-                    return False
-
-                if chunk:
-                    f.write(chunk)
-                    downloaded += len(chunk)
-
-                    # --- Bandwidth limiting ---
-                    # Determine effective limit: schedule takes priority unless manually overridden
-                    scheduled = get_scheduled_limit()
-                    bw_notify = None
-
-                    with self._lock:
-                        if scheduled is not None:
-                            # A schedule rule is active
-                            if scheduled != self._last_schedule_limit:
-                                # Schedule transition: clear manual override, apply new schedule
-                                self._last_schedule_limit = scheduled
-                                self._schedule_overridden = False
-                                bw_notify = {"limit": scheduled, "source": "schedule"}
-                            if self._schedule_overridden:
-                                limit = self._bandwidth_limit  # User manually overrode
-                            else:
-                                limit = scheduled
-                        else:
-                            # No schedule rule active
-                            if self._last_schedule_limit is not None:
-                                # Transitioning out of schedule
-                                self._last_schedule_limit = None
-                                self._schedule_overridden = False
-                                bw_notify = {"limit": self._bandwidth_limit, "source": "manual"}
-                            limit = self._bandwidth_limit
-
-                    if bw_notify is not None:
-                        self._notify("bandwidth_update", bw_notify)
-
-                    # 0 = schedule-driven pause (manual 0 already triggers real pause via setter)
-                    if limit == 0:
-                        # Pause via event so UI reflects it
-                        do_pause_notify = False
-                        with self._lock:
-                            if self.state == "running":
-                                self._pause_event.clear()
-                                self.state = "paused"
-                                self._paused_by_bandwidth = True
-                                do_pause_notify = True
-                        if do_pause_notify:
-                            self._notify("state", "paused")
-                        # Block until limit changes
-                        while limit == 0 and not self._stop_event.is_set():
-                            time.sleep(0.25)
-                            with self._lock:
-                                # Check for manual override
-                                if self._schedule_overridden:
-                                    limit = self._bandwidth_limit
-                                    break
-                            # Re-check schedule
-                            new_scheduled = get_scheduled_limit()
-                            if new_scheduled != scheduled:
-                                with self._lock:
-                                    self._last_schedule_limit = new_scheduled
-                                    if new_scheduled is not None:
-                                        limit = new_scheduled
-                                    else:
-                                        limit = self._bandwidth_limit
-                                self._notify("bandwidth_update", {"limit": limit, "source": "schedule" if new_scheduled is not None else "manual"})
-                                break
-                        # Resume after schedule-driven pause
-                        do_resume_notify = False
-                        with self._lock:
-                            if limit != 0 and self._paused_by_bandwidth:
-                                self._pause_event.set()
-                                self.state = "running"
-                                self._paused_by_bandwidth = False
-                                do_resume_notify = True
-                        if do_resume_notify:
-                            self._notify("state", "running")
-                        tokens = 0.0
-                        token_time = time.monotonic()
+                    # Wait if paused — reset timer on resume to avoid burst
+                    if not self._pause_event.is_set():
+                        self._pause_event.wait()
                         next_update = time.monotonic() + update_interval
-                        if self._stop_event.is_set():
-                            return False
+                        token_time = time.monotonic()
+                    if self._stop_event.is_set() or self._skip_file_event.is_set():
+                        return False
 
-                    # Positive limit: throttle via token bucket
-                    if limit > 0:
-                        now = time.monotonic()
-                        elapsed = now - token_time
-                        token_time = now
-                        tokens += elapsed * limit
-                        if tokens > limit:
-                            tokens = limit
-                        tokens -= len(chunk)
-                        if tokens < 0:
-                            sleep_time = -tokens / limit
-                            if sleep_time > 0.001:
-                                time.sleep(sleep_time)
+                    if chunk:
+                        f.write(chunk)
+                        downloaded += len(chunk)
+
+                        # --- Bandwidth limiting ---
+                        # Determine effective limit: schedule takes priority unless manually overridden
+                        scheduled = get_scheduled_limit()
+                        bw_notify = None
+
+                        with self._lock:
+                            if scheduled is not None:
+                                # A schedule rule is active
+                                if scheduled != self._last_schedule_limit:
+                                    # Schedule transition: clear manual override, apply new schedule
+                                    self._last_schedule_limit = scheduled
+                                    self._schedule_overridden = False
+                                    bw_notify = {"limit": scheduled, "source": "schedule"}
+                                if self._schedule_overridden:
+                                    limit = self._bandwidth_limit  # User manually overrode
+                                else:
+                                    limit = scheduled
+                            else:
+                                # No schedule rule active
+                                if self._last_schedule_limit is not None:
+                                    # Transitioning out of schedule
+                                    self._last_schedule_limit = None
+                                    self._schedule_overridden = False
+                                    bw_notify = {"limit": self._bandwidth_limit, "source": "manual"}
+                                limit = self._bandwidth_limit
+
+                        if bw_notify is not None:
+                            self._notify("bandwidth_update", bw_notify)
+
+                        # 0 = schedule-driven pause (manual 0 already triggers real pause via setter)
+                        if limit == 0:
+                            # Pause via event so UI reflects it
+                            do_pause_notify = False
+                            with self._lock:
+                                if self.state == "running":
+                                    self._pause_event.clear()
+                                    self.state = "paused"
+                                    self._paused_by_bandwidth = True
+                                    do_pause_notify = True
+                            if do_pause_notify:
+                                self._notify("state", "paused")
+                            # Block until limit changes
+                            while limit == 0 and not self._stop_event.is_set():
+                                time.sleep(0.25)
+                                with self._lock:
+                                    # Check for manual override
+                                    if self._schedule_overridden:
+                                        limit = self._bandwidth_limit
+                                        break
+                                # Re-check schedule
+                                new_scheduled = get_scheduled_limit()
+                                if new_scheduled != scheduled:
+                                    with self._lock:
+                                        self._last_schedule_limit = new_scheduled
+                                        if new_scheduled is not None:
+                                            limit = new_scheduled
+                                        else:
+                                            limit = self._bandwidth_limit
+                                    self._notify("bandwidth_update", {"limit": limit, "source": "schedule" if new_scheduled is not None else "manual"})
+                                    break
+                            # Resume after schedule-driven pause
+                            do_resume_notify = False
+                            with self._lock:
+                                if limit != 0 and self._paused_by_bandwidth:
+                                    self._pause_event.set()
+                                    self.state = "running"
+                                    self._paused_by_bandwidth = False
+                                    do_resume_notify = True
+                            if do_resume_notify:
+                                self._notify("state", "running")
                             tokens = 0.0
                             token_time = time.monotonic()
-                    # limit == -1: unlimited, no throttling
+                            next_update = time.monotonic() + update_interval
+                            if self._stop_event.is_set():
+                                return False
 
-                    # Update progress on a fixed interval
-                    now = time.monotonic()
-                    speed_samples.append((now, len(chunk)))
-                    # Hard cap to prevent unbounded growth between prune cycles
-                    if len(speed_samples) > 500:
-                        speed_samples = speed_samples[-250:]
-                    if now >= next_update:
-                        next_update += update_interval
-                        # Guard against drift: if we fell behind, snap forward
-                        if next_update <= now:
-                            next_update = now + update_interval
-                        # Calculate speed from recent samples (last 2 seconds)
-                        cutoff = now - 2.0
-                        speed_samples = [(t, s) for t, s in speed_samples if t > cutoff]
-                        if len(speed_samples) >= 2:
-                            window_time = speed_samples[-1][0] - speed_samples[0][0]
-                            window_bytes = sum(s for _, s in speed_samples)
-                            speed = window_bytes / max(window_time, 0.001)
-                        else:
-                            speed = 0
-                        with self._lock:
-                            if self._current_file_info:
-                                self._current_file_info["downloaded"] = downloaded
-                                self._current_speed = speed
-                        db.set_file_download_status(file_id, "downloading", downloaded_bytes=downloaded)
-                        self._notify("file_progress", {
-                            "file_id": file_id,
-                            "downloaded": downloaded,
-                            "size": expected_size,
-                            "speed": speed,
-                        })
+                        # Positive limit: throttle via token bucket
+                        if limit > 0:
+                            now = time.monotonic()
+                            elapsed = now - token_time
+                            token_time = now
+                            tokens += elapsed * limit
+                            if tokens > limit:
+                                tokens = limit
+                            tokens -= len(chunk)
+                            if tokens < 0:
+                                sleep_time = -tokens / limit
+                                if sleep_time > 0.001:
+                                    time.sleep(sleep_time)
+                                tokens = 0.0
+                                token_time = time.monotonic()
+                        # limit == -1: unlimited, no throttling
 
-        # Verify hash if available — skip for files with no size in metadata,
-        # as IA regenerates them dynamically and the stored hash is stale
-        if expected_md5 and expected_size > 0:
-            if not self._verify_md5(local_path, expected_md5):
-                os.remove(local_path)
-                raise Exception("MD5 hash mismatch after download")
+                        # Update progress on a fixed interval
+                        now = time.monotonic()
+                        speed_samples.append((now, len(chunk)))
+                        # Hard cap to prevent unbounded growth between prune cycles
+                        if len(speed_samples) > 500:
+                            speed_samples = speed_samples[-250:]
+                        if now >= next_update:
+                            next_update += update_interval
+                            # Guard against drift: if we fell behind, snap forward
+                            if next_update <= now:
+                                next_update = now + update_interval
+                            # Calculate speed from recent samples (last 2 seconds)
+                            cutoff = now - 2.0
+                            speed_samples = [(t, s) for t, s in speed_samples if t > cutoff]
+                            if len(speed_samples) >= 2:
+                                window_time = speed_samples[-1][0] - speed_samples[0][0]
+                                window_bytes = sum(s for _, s in speed_samples)
+                                speed = window_bytes / max(window_time, 0.001)
+                            else:
+                                speed = 0
+                            with self._lock:
+                                if self._current_file_info:
+                                    self._current_file_info["downloaded"] = downloaded
+                                    self._current_speed = speed
+                            db.set_file_download_status(file_id, "downloading", downloaded_bytes=downloaded)
+                            self._notify("file_progress", {
+                                "file_id": file_id,
+                                "downloaded": downloaded,
+                                "size": expected_size,
+                                "speed": speed,
+                            })
 
-        return True
+            # Verify hash if available — skip for files with no size in metadata,
+            # as IA regenerates them dynamically and the stored hash is stale
+            if expected_md5 and expected_size > 0:
+                if not self._verify_md5(local_path, expected_md5):
+                    os.remove(local_path)
+                    raise Exception("MD5 hash mismatch after download")
+
+            return True
+        finally:
+            resp.close()
 
     def _verify_md5(self, filepath, expected_md5):
         md5 = hashlib.md5()
@@ -539,8 +542,7 @@ class DownloadManager:
         return md5.hexdigest() == expected_md5
 
     def _check_archive_completion(self, archive_id):
-        conn = db.get_db()
-        try:
+        with db._db() as conn:
             row = conn.execute("""
                 SELECT
                     COUNT(*) as total,
@@ -550,8 +552,6 @@ class DownloadManager:
                 FROM archive_files
                 WHERE archive_id = ? AND (queued = 1 OR download_status IN ('completed', 'conflict'))
             """, (archive_id,)).fetchone()
-        finally:
-            conn.close()
 
         if row["total"] == 0:
             db.set_archive_status(archive_id, "idle")

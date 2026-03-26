@@ -90,8 +90,11 @@ def fetch_metadata(identifier, ia_email=None, ia_password=None, use_http=False):
     cookies, _ = get_download_cookies(ia_email or "", ia_password or "")
 
     resp = requests.get(url, cookies=cookies, timeout=30)
-    resp.raise_for_status()
-    data = resp.json()
+    try:
+        resp.raise_for_status()
+        data = resp.json()
+    finally:
+        resp.close()
 
     if not data or "metadata" not in data:
         raise ValueError(f"Item '{identifier}' not found or has no metadata.")
@@ -155,7 +158,10 @@ def _login(email, password):
             timeout=15,
         )
 
-        data = resp.json()
+        try:
+            data = resp.json()
+        finally:
+            resp.close()
 
         if data.get("success"):
             values = data.get("values", {})
