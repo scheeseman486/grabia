@@ -2760,8 +2760,8 @@ tr.processed-detail-row td { padding: 0 !important; }
     padding: 0; background: var(--bg-secondary); border-bottom: 1px solid var(--border);
 }
 
-.activity-table .col-time { width: 155px; }
-.activity-table .col-category { width: 90px; }
+.activity-table .col-time { width: 175px; }
+.activity-table .col-category { width: 100px; }
 .activity-table .col-level { width: 80px; }
 .activity-table .col-message { /* auto — takes remaining space */ }
 
