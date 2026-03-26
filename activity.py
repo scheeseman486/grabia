@@ -265,20 +265,26 @@ def get_log_count(job_id=None, archive_id=None, group_id=None,
 
 
 def get_jobs(category=None, archive_id=None, limit=50, offset=0):
-    """Return recent activity jobs."""
+    """Return recent activity jobs with archive info."""
     conditions = []
     params = []
     if category:
-        conditions.append("category = ?")
+        conditions.append("aj.category = ?")
         params.append(category)
     if archive_id is not None:
-        conditions.append("archive_id = ?")
+        conditions.append("aj.archive_id = ?")
         params.append(archive_id)
     where = (" WHERE " + " AND ".join(conditions)) if conditions else ""
     params.extend([limit, offset])
     with db._db() as conn:
         rows = conn.execute(
-            f"SELECT * FROM activity_jobs{where} ORDER BY started_at DESC LIMIT ? OFFSET ?",
+            f"""SELECT aj.*,
+                       a.identifier AS archive_identifier,
+                       a.title AS archive_title
+                FROM activity_jobs aj
+                LEFT JOIN archives a ON aj.archive_id = a.id
+                {where}
+                ORDER BY aj.started_at DESC LIMIT ? OFFSET ?""",
             params,
         ).fetchall()
         return [dict(r) for r in rows]

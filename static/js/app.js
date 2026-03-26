@@ -3667,31 +3667,91 @@
         activityOffset = 0;
         activityJobFilter = opts.job_id || null;
 
-        // Pre-set filter dropdowns if requested
-        if (opts.job_id) {
-            // Load the job info and show banner
-            try {
-                const job = await api("GET", `/api/activity/jobs/${opts.job_id}`);
-                if (job) {
-                    const banner = $("#activity-job-banner");
-                    const started = new Date(job.started_at * 1000).toLocaleString();
-                    const statusCls = job.status || "running";
-                    banner.innerHTML = `<strong>${esc(job.category)}</strong> job #${job.id} — started ${started}` +
-                        ` <span class="job-status ${statusCls}">${esc(job.status)}</span>` +
-                        (job.summary ? ` — ${esc(job.summary)}` : "");
-                    banner.style.display = "";
-                }
-            } catch (_) {}
-        } else {
-            $("#activity-job-banner").style.display = "none";
+        // Reset filters unless navigating with specific opts
+        if (!opts.job_id && !opts.category && !opts.archive_id) {
+            $("#activity-filter-category").value = "";
+            $("#activity-filter-level").value = "";
+            $("#activity-filter-group").value = "";
+            $("#activity-filter-archive").value = "";
+            $("#activity-filter-search").value = "";
         }
-
         if (opts.category) $("#activity-filter-category").value = opts.category;
-        if (opts.archive_id) $("#activity-filter-archive").value = opts.archive_id;
+        if (opts.archive_id) $("#activity-filter-archive").value = String(opts.archive_id);
 
         await populateActivityArchiveFilter();
+        await loadActivityJobs(opts.job_id || null);
         await loadActivityLog();
         showPage("page-activity");
+    }
+
+    async function loadActivityJobs(highlightJobId) {
+        const banner = $("#activity-job-banner");
+        try {
+            const data = await api("GET", "/api/activity/jobs?limit=10");
+            const jobs = data.jobs || [];
+            if (jobs.length === 0) {
+                banner.style.display = "none";
+                return;
+            }
+            // If a specific job is highlighted, show it prominently
+            // Otherwise show active (running) jobs, or the most recent completed one
+            let displayJobs;
+            if (highlightJobId) {
+                activityJobFilter = highlightJobId;
+                displayJobs = jobs.filter(j => j.id === highlightJobId);
+                if (displayJobs.length === 0) {
+                    // Fetch it directly
+                    try {
+                        const j = await api("GET", `/api/activity/jobs/${highlightJobId}`);
+                        if (j) displayJobs = [j];
+                    } catch (_) {}
+                }
+            } else {
+                // Show running jobs first, then most recent
+                const running = jobs.filter(j => j.status === "running");
+                displayJobs = running.length > 0 ? running : jobs.slice(0, 3);
+            }
+            if (!displayJobs || displayJobs.length === 0) {
+                banner.style.display = "none";
+                return;
+            }
+            banner.innerHTML = displayJobs.map(j => {
+                const started = new Date(j.started_at * 1000).toLocaleString();
+                const statusCls = j.status || "running";
+                const isFiltered = activityJobFilter === j.id;
+                const filterCls = isFiltered ? " job-card-active" : "";
+                const archiveName = j.archive_title || j.archive_identifier
+                    ? ` — ${esc(j.archive_title || j.archive_identifier)}`
+                    : "";
+                return `<div class="job-card${filterCls}" data-job-id="${j.id}">
+                    <span class="job-category">${esc(j.category)}</span>
+                    <span class="job-status ${statusCls}">${esc(j.status)}</span>
+                    <span class="job-time">${started}${archiveName}</span>
+                    ${j.summary ? `<span class="job-summary">${esc(j.summary)}</span>` : ""}
+                </div>`;
+            }).join("");
+            banner.style.display = "";
+
+            // Click on a job card to filter by it
+            banner.querySelectorAll(".job-card").forEach(el => {
+                el.addEventListener("click", () => {
+                    const jid = parseInt(el.dataset.jobId);
+                    if (activityJobFilter === jid) {
+                        // Toggle off
+                        activityJobFilter = null;
+                        el.classList.remove("job-card-active");
+                    } else {
+                        activityJobFilter = jid;
+                        banner.querySelectorAll(".job-card").forEach(c => c.classList.remove("job-card-active"));
+                        el.classList.add("job-card-active");
+                    }
+                    activityOffset = 0;
+                    loadActivityLog();
+                });
+            });
+        } catch (_) {
+            banner.style.display = "none";
+        }
     }
 
     async function populateActivityArchiveFilter() {
@@ -3819,8 +3879,8 @@
         $("#activity-filter-archive").value = "";
         $("#activity-filter-search").value = "";
         activityJobFilter = null;
-        $("#activity-job-banner").style.display = "none";
         activityOffset = 0;
+        loadActivityJobs(null);
         loadActivityLog();
     }
 

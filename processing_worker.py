@@ -492,6 +492,7 @@ def _run_processing(job):
                 activity.log(act_job_id, "error", f"Failed: {filename}",
                              archive_id=archive_id, file_id=file_id,
                              detail=str(e))
+                activity.flush()  # errors flush immediately for visibility
             summary["failed"] += 1
             _broadcast("processing_progress", {
                 "archive_id": archive_id,
@@ -509,6 +510,7 @@ def _run_processing(job):
                 activity.log(act_job_id, "error", f"Failed: {filename}",
                              archive_id=archive_id, file_id=file_id,
                              detail=str(e))
+                activity.flush()  # errors flush immediately for visibility
             summary["failed"] += 1
             _broadcast("processing_progress", {
                 "archive_id": archive_id,
@@ -519,6 +521,10 @@ def _run_processing(job):
                 "current": i + 1,
                 "total": len(files),
             })
+
+        # Periodic flush so entries are visible during long jobs
+        if act_job_id and (i + 1) % 25 == 0:
+            activity.flush()
 
     log.info("worker", "Processing complete for archive %d: %d processed, %d skipped, %d failed",
              archive_id, summary["processed"], summary["skipped"], summary["failed"])
