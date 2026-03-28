@@ -2347,7 +2347,7 @@ def add_scan_queue_entry(file_id, archive_id, batch_id=None, priority=False):
         )
         # Set file status to scan_pending
         conn.execute(
-            "UPDATE archive_files SET download_status = 'scan_pending' WHERE id = ? AND download_status NOT IN ('downloading',)",
+            "UPDATE archive_files SET download_status = 'scan_pending' WHERE id = ? AND download_status NOT IN ('downloading')",
             (file_id,),
         )
         conn.commit()
@@ -2369,7 +2369,7 @@ def add_scan_queue_entries_batch(archive_id, file_ids, batch_id=None):
         if file_ids:
             placeholders = ",".join("?" * len(file_ids))
             conn.execute(
-                f"UPDATE archive_files SET download_status = 'scan_pending' WHERE id IN ({placeholders}) AND download_status NOT IN ('downloading',)",
+                f"UPDATE archive_files SET download_status = 'scan_pending' WHERE id IN ({placeholders}) AND download_status NOT IN ('downloading')",
                 file_ids,
             )
         conn.commit()

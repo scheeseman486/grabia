@@ -53,6 +53,14 @@ def _get_secret_key():
 app.secret_key = os.environ.get("GRABIA_SECRET_KEY") or os.environ.get("HORNBEAM_SECRET_KEY") or _get_secret_key()
 
 
+@app.errorhandler(500)
+def handle_500(e):
+    """Return JSON for API 500 errors instead of Flask's default HTML page."""
+    if request.path.startswith("/api/"):
+        return jsonify({"error": f"Internal server error: {e}"}), 500
+    return e
+
+
 @app.context_processor
 def cache_buster():
     """Add file mtime as cache-busting query param for static assets."""
