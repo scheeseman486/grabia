@@ -1611,6 +1611,36 @@ def download_queue():
     return jsonify(db.get_download_queue())
 
 
+@app.route("/api/download/queue/clear", methods=["POST"])
+@login_required
+def clear_download_queue():
+    """Remove all pending files from the download queue."""
+    count = db.clear_download_queue()
+    broadcast_sse("queue_update", {"queue_type": "download", "action": "removed",
+                                    "data": {"cleared": count}})
+    return jsonify({"ok": True, "cleared": count})
+
+
+@app.route("/api/processing/queue/clear", methods=["POST"])
+@login_required
+def clear_processing_queue():
+    """Remove all pending entries from the processing queue (does not cancel active work)."""
+    count = db.cancel_all_pending_processing()
+    broadcast_sse("queue_update", {"queue_type": "processing", "action": "removed",
+                                    "data": {"cleared": count}})
+    return jsonify({"ok": True, "cleared": count})
+
+
+@app.route("/api/scan/queue/clear", methods=["POST"])
+@login_required
+def clear_scan_queue():
+    """Remove all pending entries from the scan queue (does not cancel active work)."""
+    count = db.cancel_all_pending_scans()
+    broadcast_sse("queue_update", {"queue_type": "scan", "action": "removed",
+                                    "data": {"cleared": count}})
+    return jsonify({"ok": True, "cleared": count})
+
+
 @app.route("/api/download/bandwidth", methods=["POST"])
 @login_required
 def set_bandwidth():

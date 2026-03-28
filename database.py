@@ -817,6 +817,21 @@ def clear_file_queue_position(file_id):
         conn.commit()
 
 
+def clear_download_queue():
+    """Remove all pending files from the download queue. Returns count cleared.
+    Does not affect files currently downloading (download_status='downloading')."""
+    with _db() as conn:
+        conn.execute(
+            """UPDATE archive_files
+               SET queue_position = NULL, queued = 0, download_batch_id = NULL
+               WHERE queue_position IS NOT NULL
+                 AND download_status NOT IN ('downloading')""",
+        )
+        count = conn.execute("SELECT changes()").fetchone()[0]
+        conn.commit()
+        return count
+
+
 def set_all_files_queued(archive_id, queued, batch_id=None):
     """Batch-add or remove all files in an archive from the download queue.
     Returns (added_count, skipped_count) when queuing."""

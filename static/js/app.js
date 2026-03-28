@@ -3215,6 +3215,7 @@
         confirm_cancel_processing:   { label: "Warn before cancelling all processing",             default: true },
         confirm_cancel_scans:        { label: "Warn before cancelling all scans",                  default: true },
         confirm_scan_archive:        { label: "Warn before scanning an entire archive",            default: true },
+        confirm_clear_queue:         { label: "Warn before clearing a queue",                      default: true },
     };
 
     // Runtime state — loaded from settings on init
@@ -4080,6 +4081,20 @@
             await api("POST", "/api/download/stop");
         });
 
+        // Download clear
+        $("#queue-dl-clear").addEventListener("click", () => {
+            confirmAction("confirm_clear_queue", "Clear Download Queue",
+                "Remove all pending files from the download queue? Active downloads are not affected.",
+                async () => {
+                    const r = await api("POST", "/api/download/queue/clear");
+                    addNotification(`Cleared ${r.cleared || 0} files from download queue`, "info");
+                    queueStale.download = true;
+                    loadQueueTab("download");
+                    refreshQueueCounts();
+                    refreshArchives();
+                });
+        });
+
         // Processing controls
         $("#queue-proc-pause").addEventListener("click", async () => {
             const paused = !db_processing_paused;
@@ -4091,6 +4106,17 @@
                 "Cancel the current file and remove all pending entries from the processing queue?",
                 async () => {
                     await api("POST", "/api/processing/cancel");
+                    queueStale.processing = true;
+                    loadQueueTab("processing");
+                    refreshQueueCounts();
+                });
+        });
+        $("#queue-proc-clear").addEventListener("click", () => {
+            confirmAction("confirm_clear_queue", "Clear Processing Queue",
+                "Remove all pending entries from the processing queue? Active processing is not affected.",
+                async () => {
+                    const r = await api("POST", "/api/processing/queue/clear");
+                    addNotification(`Cleared ${r.cleared || 0} entries from processing queue`, "info");
                     queueStale.processing = true;
                     loadQueueTab("processing");
                     refreshQueueCounts();
@@ -4108,6 +4134,17 @@
                 "Cancel all pending scan queue entries?",
                 async () => {
                     await api("POST", "/api/scan/cancel");
+                    queueStale.scan = true;
+                    loadQueueTab("scan");
+                    refreshQueueCounts();
+                });
+        });
+        $("#queue-scan-clear").addEventListener("click", () => {
+            confirmAction("confirm_clear_queue", "Clear Scan Queue",
+                "Remove all pending entries from the scan queue? Active scanning is not affected.",
+                async () => {
+                    const r = await api("POST", "/api/scan/queue/clear");
+                    addNotification(`Cleared ${r.cleared || 0} entries from scan queue`, "info");
                     queueStale.scan = true;
                     loadQueueTab("scan");
                     refreshQueueCounts();
