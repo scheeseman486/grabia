@@ -1596,12 +1596,14 @@ def clear_notifications():
                   SELECT archive_id FROM processing_jobs WHERE status IN ('pending', 'running')
               )
         """)
-        # Clear stale scan notifications (scans don't have a persistent job table,
-        # so any scan notification at clear time is stale)
+        # Clear stale scan notifications (no pending/running scan queue entries remain)
         conn.execute("""
             UPDATE notifications SET dismissed = 1, scan_archive_id = NULL
             WHERE dismissed = 0
               AND scan_archive_id IS NOT NULL
+              AND scan_archive_id NOT IN (
+                  SELECT DISTINCT archive_id FROM scan_queue WHERE status IN ('pending', 'running')
+              )
         """)
         conn.commit()
 

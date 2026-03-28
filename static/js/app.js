@@ -106,12 +106,11 @@
     }
 
     function clearAllNotifications() {
-        api("POST", "/api/notifications/clear").catch(() => {});
-        notifications = notifications.filter((n) =>
-            n.scan_archive_id != null || n.processing_archive_id != null || (n.adding_archive && n.adding_archive !== 0)
-        );
-        renderNotifBadge();
-        renderNotifList();
+        api("POST", "/api/notifications/clear").then(() => {
+            // Re-fetch to get the server's authoritative dismissed state,
+            // which correctly handles completed scan/processing notifications
+            loadNotifications();
+        }).catch(() => {});
     }
 
     function loadNotifications() {
