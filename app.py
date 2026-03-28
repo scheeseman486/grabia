@@ -584,13 +584,14 @@ def _scan_single_file_on_disk(f, base_dir):
             # Processed output exists — check if original is still on disk
             if not os.path.isfile(local_path):
                 # Original deleted but processed files remain → downloaded = 0
-                # This triggers strikethrough rendering in the UI
-                with db._db() as conn:
-                    conn.execute(
-                        "UPDATE archive_files SET downloaded = 0 WHERE id = ?",
-                        (file_id,),
-                    )
-                    conn.commit()
+                # Only write if the flag actually needs changing
+                if f.get("downloaded") != 0:
+                    with db._db() as conn:
+                        conn.execute(
+                            "UPDATE archive_files SET downloaded = 0 WHERE id = ?",
+                            (file_id,),
+                        )
+                        conn.commit()
             return "matched"
         # Processed output gone — reset processing status
         with db._db() as conn:
@@ -739,13 +740,17 @@ def _run_archive_scan_entry(entry):
             db.complete_scan_queue_entry(entry["id"], error_message="Archive not found")
             return
 
-    archive = db.get_archive(archive_id)
-    if not archive:
-        db.complete_scan_queue_entry(entry["id"], error_message="Archive not found")
-        return
+    # Use cached archive/base_dir for the current group to avoid per-file DB lookups
+    if "archive" not in ctx or ctx["archive"]["id"] != archive_id:
+        archive = db.get_archive(archive_id)
+        if not archive:
+            db.complete_scan_queue_entry(entry["id"], error_message="Archive not found")
+            return
+        download_dir = db.get_setting("download_dir", os.path.expanduser("~/ia-downloads"))
+        ctx["archive"] = archive
+        ctx["base_dir"] = os.path.realpath(os.path.join(download_dir, archive["identifier"]))
 
-    download_dir = db.get_setting("download_dir", os.path.expanduser("~/ia-downloads"))
-    base_dir = os.path.realpath(os.path.join(download_dir, archive["identifier"]))
+    base_dir = ctx["base_dir"]
 
     f = db.get_file(file_id)
     if not f:
@@ -779,7 +784,10 @@ def _update_scan_progress(archive_id):
     ctx = _scan_current_archive
     if ctx["id"] != archive_id:
         return
-    update_rate = int(db.get_setting("sse_update_rate", "500")) / 1000.0
+    # Cache the update rate for the duration of the scan group
+    if "update_rate" not in ctx:
+        ctx["update_rate"] = int(db.get_setting("sse_update_rate", "500")) / 1000.0
+    update_rate = ctx["update_rate"]
     now = time.monotonic()
     done = ctx["processed"] == ctx["total"]
 
@@ -791,7 +799,7 @@ def _update_scan_progress(archive_id):
         ctx["last_progress"] = now
 
     if now - ctx["last_notif"] >= 2.0 or done:
-        archive = db.get_archive(archive_id)
+        archive = ctx.get("archive") or db.get_archive(archive_id)
         archive_name = (archive["title"] or archive["identifier"]) if archive else str(archive_id)
         pct = int((ctx["processed"] / ctx["total"]) * 100) if ctx["total"] > 0 else 0
         db.update_notification(ctx["notif_id"],
