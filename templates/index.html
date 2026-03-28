@@ -52,19 +52,18 @@
             </div>
         </div>
         <div class="topbar-center">
-            <button class="queue-display state-stopped" id="queue-display" title="View download queue">
+            <button class="queue-display state-stopped" id="queue-display" title="View queues">
                 <div class="queue-display-fill" id="queue-display-fill"></div>
-                <span class="queue-status-dot" id="queue-status-dot"></span>
-                <span class="queue-display-text" id="queue-display-text">Queue is empty</span>
+                <span class="queue-display-text" id="queue-display-text">Idle</span>
+                <span class="queue-display-cycle" id="queue-display-cycle" style="display:none" title="Click to cycle through active tasks"></span>
+                <span class="queue-display-badge" id="queue-display-badge" style="display:none"></span>
             </button>
             <div class="queue-dropdown" id="queue-dropdown">
                 <div class="queue-dropdown-header">
-                    <span class="queue-dropdown-title">Download Queue</span>
-                    <span class="queue-dropdown-count" id="queue-dropdown-count"></span>
+                    <span class="queue-dropdown-title">Active Tasks</span>
                 </div>
-                <ul class="queue-dropdown-list" id="queue-dropdown-list">
-                    <li class="queue-dropdown-empty">Queue is empty</li>
-                </ul>
+                <div id="queue-dropdown-rows"></div>
+                <div id="queue-dropdown-empty" class="activity-ongoing-empty">No active tasks</div>
             </div>
         </div>
         <div class="topbar-right">
@@ -77,6 +76,10 @@
             </button>
             <button id="btn-collections" class="action-btn" title="Collections">
                 <svg viewBox="0 0 24 24" width="18" height="18"><path d="M3 13h2v-2H3v2zm0 4h2v-2H3v2zm0-8h2V7H3v2zm4 4h14v-2H7v2zm0 4h14v-2H7v2zM7 7v2h14V7H7z" fill="currentColor"/></svg>
+            </button>
+            <button id="btn-queues" class="action-btn" title="Queues">
+                <svg viewBox="0 0 24 24" width="18" height="18"><path d="M4 6h16v2H4zm0 5h16v2H4zm0 5h16v2H4z" fill="currentColor"/></svg>
+                <span class="queue-badge" id="queue-badge" style="display:none">0</span>
             </button>
             <button id="btn-activity" class="action-btn" title="Activity Log">
                 <svg viewBox="0 0 24 24" width="18" height="18"><path d="M13 3c-4.97 0-9 4.03-9 9H1l3.89 3.89.07.14L9 12H6c0-3.87 3.13-7 7-7s7 3.13 7 7-3.13 7-7 7c-1.93 0-3.68-.79-4.94-2.06l-1.42 1.42A8.954 8.954 0 0013 21c4.97 0 9-4.03 9-9s-4.03-9-9-9zm-1 5v5l4.28 2.54.72-1.21-3.5-2.08V8H12z" fill="currentColor"/></svg>
@@ -192,7 +195,7 @@
                 <button class="action-btn" id="btn-refresh-meta" title="Re-check Internet Archive for file list changes">Refresh Archive Metadata</button>
                 <button class="action-btn" id="btn-scan-files" title="Scan local folder for existing files that match this archive">Scan For Files</button>
                 <button class="action-btn" id="btn-process-all-files" title="Convert downloaded files (e.g. to CHD or CISO)">Process All Files</button>
-                <button class="action-btn" id="btn-reset-queue-order" title="Reset download order to alphabetical" style="display:none">Reset Queue Order</button>
+
                 <button class="action-btn" id="btn-clear-changes" title="Dismiss change highlights" style="display:none">
                     <svg viewBox="0 0 24 24" width="16" height="16"><path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z" fill="currentColor"/></svg>
                     Clear Highlights
@@ -214,7 +217,6 @@
                 <div class="sort-control">
                     <label for="file-sort">Sort by</label>
                     <select id="file-sort">
-                        <option value="priority">Download Order</option>
                         <option value="name">Name</option>
                         <option value="size">Size</option>
                         <option value="modified">Modified</option>
@@ -314,6 +316,107 @@
             </div>
         </section>
 
+        <!-- Queues Page -->
+        <section id="page-queues" class="page">
+            <div class="detail-header">
+                <div class="detail-info">
+                    <h2>Queues</h2>
+                    <p>Manage download, processing, and scan queues</p>
+                </div>
+            </div>
+            <div class="queue-tabs">
+                <button class="queue-tab active" data-queue="download">
+                    Downloads <span class="queue-tab-badge" id="queue-tab-download-badge"></span>
+                </button>
+                <button class="queue-tab" data-queue="processing">
+                    Processing <span class="queue-tab-badge" id="queue-tab-processing-badge"></span>
+                </button>
+                <button class="queue-tab" data-queue="scan">
+                    File Scans <span class="queue-tab-badge" id="queue-tab-scan-badge"></span>
+                </button>
+            </div>
+            <!-- Download Queue Tab -->
+            <div class="queue-panel active" id="queue-panel-download">
+                <div class="queue-controls">
+                    <button class="action-btn" id="queue-dl-play" title="Start downloads">
+                        <svg viewBox="0 0 24 24" width="16" height="16"><path d="M8 5v14l11-7z" fill="currentColor"/></svg>
+                    </button>
+                    <button class="action-btn" id="queue-dl-pause" title="Pause downloads">
+                        <svg viewBox="0 0 24 24" width="16" height="16"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z" fill="currentColor"/></svg>
+                    </button>
+                    <button class="action-btn" id="queue-dl-stop" title="Stop downloads">
+                        <svg viewBox="0 0 24 24" width="16" height="16"><path d="M6 6h12v12H6z" fill="currentColor"/></svg>
+                    </button>
+                    <span class="queue-progress-text" id="queue-dl-progress"></span>
+                </div>
+                <div class="file-table-wrap">
+                    <table class="file-table" id="queue-dl-table">
+                        <thead><tr>
+                            <th class="col-grip"></th>
+                            <th class="col-name">File</th>
+                            <th class="col-archive">Archive</th>
+                            <th class="col-size">Size</th>
+                            <th class="col-status">Status</th>
+                            <th class="col-actions"></th>
+                        </tr></thead>
+                        <tbody id="queue-dl-tbody"></tbody>
+                    </table>
+                </div>
+                <div class="queue-empty" id="queue-dl-empty" style="display:none">No files in download queue</div>
+            </div>
+            <!-- Processing Queue Tab -->
+            <div class="queue-panel" id="queue-panel-processing">
+                <div class="queue-controls">
+                    <button class="action-btn" id="queue-proc-pause" title="Pause processing">
+                        <svg viewBox="0 0 24 24" width="16" height="16"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z" fill="currentColor"/></svg>
+                    </button>
+                    <button class="action-btn danger" id="queue-proc-cancel" title="Cancel and remove all">
+                        <svg viewBox="0 0 24 24" width="16" height="16"><path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z" fill="currentColor"/></svg>
+                    </button>
+                    <span class="queue-progress-text" id="queue-proc-progress"></span>
+                </div>
+                <div class="file-table-wrap">
+                    <table class="file-table" id="queue-proc-table">
+                        <thead><tr>
+                            <th class="col-grip"></th>
+                            <th class="col-name">File</th>
+                            <th class="col-archive">Archive</th>
+                            <th class="col-profile">Profile</th>
+                            <th class="col-status">Status</th>
+                            <th class="col-actions"></th>
+                        </tr></thead>
+                        <tbody id="queue-proc-tbody"></tbody>
+                    </table>
+                </div>
+                <div class="queue-empty" id="queue-proc-empty" style="display:none">No files in processing queue</div>
+            </div>
+            <!-- Scan Queue Tab -->
+            <div class="queue-panel" id="queue-panel-scan">
+                <div class="queue-controls">
+                    <button class="action-btn" id="queue-scan-pause" title="Pause scanning">
+                        <svg viewBox="0 0 24 24" width="16" height="16"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z" fill="currentColor"/></svg>
+                    </button>
+                    <button class="action-btn danger" id="queue-scan-cancel" title="Cancel and remove all">
+                        <svg viewBox="0 0 24 24" width="16" height="16"><path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z" fill="currentColor"/></svg>
+                    </button>
+                    <span class="queue-progress-text" id="queue-scan-progress"></span>
+                </div>
+                <div class="file-table-wrap">
+                    <table class="file-table" id="queue-scan-table">
+                        <thead><tr>
+                            <th class="col-grip"></th>
+                            <th class="col-name">File</th>
+                            <th class="col-archive">Archive</th>
+                            <th class="col-status">Status</th>
+                            <th class="col-actions"></th>
+                        </tr></thead>
+                        <tbody id="queue-scan-tbody"></tbody>
+                    </table>
+                </div>
+                <div class="queue-empty" id="queue-scan-empty" style="display:none">No files in scan queue</div>
+            </div>
+        </section>
+
         <!-- Activity Log -->
         <section id="page-activity" class="page">
             <div class="detail-header">
@@ -321,6 +424,10 @@
                     <h2>Activity Log</h2>
                     <p>View scan and processing history</p>
                 </div>
+            </div>
+            <div id="activity-ongoing" class="activity-ongoing">
+                <div id="activity-ongoing-rows"></div>
+                <div id="activity-ongoing-empty" class="activity-ongoing-empty">No active tasks</div>
             </div>
             <div id="activity-job-banner" class="activity-job-banner" style="display:none"></div>
             <div class="activity-filters">
@@ -624,10 +731,6 @@
                         <p class="settings-desc">Choose which destructive actions show a confirmation dialog before proceeding. Uncheck to skip the warning.</p>
                         <div class="settings-form">
                             <label class="checkbox-label">
-                                <input type="checkbox" id="set-confirm-reset-order" checked>
-                                Warn before resetting download order
-                            </label>
-                            <label class="checkbox-label">
                                 <input type="checkbox" id="set-confirm-delete-file" checked>
                                 Warn before deleting a file
                             </label>
@@ -646,6 +749,18 @@
                             <label class="checkbox-label">
                                 <input type="checkbox" id="set-confirm-delete-profile" checked>
                                 Warn before deleting a processing profile
+                            </label>
+                            <label class="checkbox-label">
+                                <input type="checkbox" id="set-confirm-cancel-processing" checked>
+                                Warn before cancelling all processing
+                            </label>
+                            <label class="checkbox-label">
+                                <input type="checkbox" id="set-confirm-cancel-scans" checked>
+                                Warn before cancelling all scans
+                            </label>
+                            <label class="checkbox-label">
+                                <input type="checkbox" id="set-confirm-scan-archive" checked>
+                                Warn before scanning an entire archive
                             </label>
                         </div>
                     </div>

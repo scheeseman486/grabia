@@ -26,7 +26,7 @@
     let archives = [];
     let groups = [];
     let currentArchiveId = null;
-    let currentSort = "priority";
+    let currentSort = "name";
     let currentSortDir = ""; // empty = use backend default
     let fileSearchQuery = "";
     let fileSearchTimer = null;
@@ -299,7 +299,7 @@
     const archiveListWrap = archiveListEl.closest(".archive-list-wrap");
     const emptyState = $("#empty-state");
     const fileListEl = $("#file-list");
-    const queueStatusDot = $("#queue-status-dot");
+    // queue-status-dot removed in queue overhaul — replaced by queue-display-badge
     const speedDisplay = $("#speed-display");
     const sparkCanvas = $("#speed-sparkline");
     const sparkCtx = sparkCanvas.getContext("2d");
@@ -543,11 +543,12 @@
 
         es.addEventListener("file_complete", (e) => {
             const data = JSON.parse(e.data);
-            updateFileRow(data.file_id, { download_status: "completed" });
+            updateFileRow(data.file_id, { download_status: "completed", downloaded: 1, queue_position: null });
             lastProgressRefresh = 0; // force immediate refresh
             throttledProgressRefresh();
             refreshQueueCount();
             if (queueDropdownOpen) loadQueueDropdown();
+            refreshOngoingActivity();
         });
 
         es.addEventListener("file_error", (e) => {
@@ -576,16 +577,38 @@
             const data = JSON.parse(e.data);
             updateScanProgress(data);
             _updateJobProgress(data);
+            // Track ongoing scanning state
+            if (data.phase === "done" || data.phase === "cancelled" || data.phase === "error") {
+                ongoingScanning = null;
+            } else {
+                ongoingScanning = {
+                    archive_id: data.archive_id,
+                    phase: data.phase || "",
+                    current: data.current || 0,
+                    total: data.total || 0,
+                };
+            }
+            refreshOngoingActivity();
         });
 
         es.addEventListener("processing_progress", (e) => {
             const data = JSON.parse(e.data);
             updateProcessingProgress(data);
             _updateJobProgress(data);
-            // Refresh activity log if visible and job finished/cancelled
+            // Track ongoing processing state
             if (data.phase === "done" || data.phase === "cancelled" || data.phase === "error") {
+                ongoingProcessing = null;
                 _refreshActivityIfVisible();
+            } else {
+                ongoingProcessing = {
+                    archive_id: data.archive_id,
+                    filename: data.filename || "",
+                    current: data.current || 0,
+                    total: data.total || 0,
+                    phase: data.phase || "",
+                };
             }
+            refreshOngoingActivity();
         });
 
         es.addEventListener("notification_created", (e) => {
@@ -634,6 +657,94 @@
             const s = JSON.parse(e.data);
             if (s.theme) applyTheme(s.theme);
             updateLockIndicator(s.use_http === "1");
+        });
+
+        // ── Queue SSE events ──────────────────────────────────────
+        es.addEventListener("batch_added", (e) => {
+            const data = JSON.parse(e.data);
+            // Mark relevant queue tab stale and refresh counts
+            const queueType = data.queue_type; // "download", "processing", "scan"
+            if (queueType && queueStale.hasOwnProperty(queueType)) {
+                queueStale[queueType] = true;
+                // If the queue page is visible and this tab is active, auto-reload
+                if ($("#page-queues").classList.contains("active") && activeQueueTab === queueType) {
+                    loadQueueTab(queueType);
+                }
+            }
+            refreshQueueCounts();
+            // Also refresh archives list for download batches (affects progress)
+            if (queueType === "download") {
+                lastProgressRefresh = 0;
+                throttledProgressRefresh();
+            }
+        });
+
+        es.addEventListener("queue_update", (e) => {
+            const data = JSON.parse(e.data);
+            const queueType = data.queue_type || data.queue; // normalise key
+            if (!queueType || !queueStale.hasOwnProperty(queueType)) { refreshQueueCounts(); return; }
+
+            const action = data.action;
+            const isVisible = $("#page-queues").classList.contains("active") && activeQueueTab === queueType;
+
+            // --- In-place array splice/update when possible ---
+            if (action === "removed" && data.file_ids) {
+                const ids = new Set(data.file_ids.map(Number));
+                queueData[queueType] = queueData[queueType].filter(item => {
+                    const itemId = item.file_id || item.id;
+                    return !ids.has(itemId);
+                });
+                if (isVisible) renderQueueTable(queueType);
+            } else if (action === "completed" || (action === "status_changed" && ["completed", "done", "failed", "cancelled"].includes(data.status))) {
+                // Mark item as completing (3-second grey-out)
+                const entryId = data.entry_id || data.file_id;
+                if (entryId) {
+                    const key = `${queueType}:${entryId}`;
+                    if (!completingItems.has(key)) {
+                        // Update the item status in local data
+                        const item = queueData[queueType].find(i => (i.id === entryId || i.file_id === entryId));
+                        if (item) item.status = data.status || "completed";
+                        completingItems.set(key, setTimeout(() => {
+                            completingItems.delete(key);
+                            queueData[queueType] = queueData[queueType].filter(i => {
+                                const iid = i.id === entryId || i.file_id === entryId;
+                                return !iid;
+                            });
+                            if ($("#page-queues").classList.contains("active") && activeQueueTab === queueType) {
+                                renderQueueTable(queueType);
+                            }
+                            refreshQueueCounts();
+                        }, 3000));
+                    }
+                    if (isVisible) renderQueueTable(queueType);
+                } else {
+                    queueStale[queueType] = true;
+                    if (isVisible) loadQueueTab(queueType);
+                }
+            } else if (action === "added") {
+                // New item added — refetch to get full data
+                queueStale[queueType] = true;
+                if (isVisible) loadQueueTab(queueType);
+            } else if (action === "reordered") {
+                // Reorder — refetch to get new positions
+                queueStale[queueType] = true;
+                if (isVisible) loadQueueTab(queueType);
+            } else if (action === "status_changed") {
+                // Non-terminal status change — update in place
+                const entryId = data.entry_id || data.file_id;
+                if (entryId) {
+                    const item = queueData[queueType].find(i => (i.id === entryId || i.file_id === entryId));
+                    if (item && data.status) item.status = data.status;
+                    if (isVisible) renderQueueTable(queueType);
+                } else {
+                    queueStale[queueType] = true;
+                    if (isVisible) loadQueueTab(queueType);
+                }
+            } else {
+                queueStale[queueType] = true;
+                if (isVisible) loadQueueTab(queueType);
+            }
+            refreshQueueCounts();
         });
 
         es.addEventListener("bandwidth_update", (e) => {
@@ -696,12 +807,33 @@
     const queueDisplay = $("#queue-display");
     const queueDisplayText = $("#queue-display-text");
     const queueDisplayFill = $("#queue-display-fill");
+    const queueDisplayBadge = $("#queue-display-badge");
     const queueDropdown = $("#queue-dropdown");
-    const queueDropdownList = $("#queue-dropdown-list");
-    const queueDropdownCount = $("#queue-dropdown-count");
     let queueDropdownOpen = false;
     let currentDownloadInfo = null; // {file_id, filename, identifier, archive_id, size, downloaded}
     let lastQueueCount = 0;
+    let displayCycleIndex = 0; // which active task to show when cycling
+
+    function _getActiveActivities() {
+        const activities = [];
+        if (currentDownloadInfo && (dlState === "running" || dlState === "paused")) {
+            activities.push("download");
+        }
+        if (ongoingProcessing && ongoingProcessing.phase !== "done" && ongoingProcessing.phase !== "error" && ongoingProcessing.phase !== "cancelled") {
+            activities.push("processing");
+        }
+        if (ongoingScanning && ongoingScanning.phase !== "done" && ongoingScanning.phase !== "error" && ongoingScanning.phase !== "cancelled") {
+            activities.push("scan");
+        }
+        return activities;
+    }
+
+    function cycleQueueDisplay() {
+        const activities = _getActiveActivities();
+        if (activities.length <= 1) return;
+        displayCycleIndex = (displayCycleIndex + 1) % activities.length;
+        updateQueueDisplayText();
+    }
 
     function updateQueueDisplayText() {
         // State class
@@ -709,59 +841,76 @@
         queueDisplay.classList.add("state-" + dlState);
         if (queueDisplay.classList.contains("active")) queueDisplay.classList.add("active");
 
-        if (currentDownloadInfo && (dlState === "running" || dlState === "paused")) {
+        const activities = _getActiveActivities();
+        const otherCount = activities.length > 1 ? activities.length - 1 : 0;
+
+        // Determine which activity to display
+        let displayActivity = null;
+        if (activities.length > 0) {
+            const idx = displayCycleIndex % activities.length;
+            displayActivity = activities[idx];
+        }
+
+        if (displayActivity === "download") {
             queueDisplayText.textContent = currentDownloadInfo.filename;
             queueDisplay.title = `${dlState === "running" ? "Downloading" : "Paused"}: ${currentDownloadInfo.filename} (${currentDownloadInfo.identifier})`;
-            // Progress fill
             const pct = currentDownloadInfo.size > 0
                 ? Math.min(100, (currentDownloadInfo.downloaded || 0) / currentDownloadInfo.size * 100)
                 : 0;
             queueDisplayFill.style.width = pct.toFixed(1) + "%";
+        } else if (displayActivity === "processing") {
+            queueDisplayFill.style.width = "0";
+            const prog = ongoingProcessing.total > 0 ? ` (${ongoingProcessing.current}/${ongoingProcessing.total})` : "";
+            queueDisplayText.textContent = `Processing: ${ongoingProcessing.filename}${prog}`;
+            queueDisplay.title = `Processing file`;
+        } else if (displayActivity === "scan") {
+            queueDisplayFill.style.width = "0";
+            const prog = ongoingScanning.total > 0 ? ` ${ongoingScanning.current}/${ongoingScanning.total}` : "";
+            queueDisplayText.textContent = `Scanning${prog}`;
+            queueDisplay.title = `Scanning files`;
         } else {
             queueDisplayFill.style.width = "0";
-            if (lastQueueCount > 0) {
-                queueDisplayText.textContent = lastQueueCount + (lastQueueCount === 1 ? " file queued" : " files queued");
-                queueDisplay.title = lastQueueCount + " pending";
+            const total = (queueCounts.download || 0) + (queueCounts.processing || 0) + (queueCounts.scan || 0);
+            if (total > 0) {
+                queueDisplayText.textContent = total + (total === 1 ? " item queued" : " items queued");
+                queueDisplay.title = total + " pending across queues";
             } else {
-                queueDisplayText.textContent = "Queue is empty";
-                queueDisplay.title = "View download queue";
+                queueDisplayText.textContent = "Idle";
+                queueDisplay.title = "View queues";
             }
+        }
+
+        // "+N active" cycling indicator
+        const cycleEl = $("#queue-display-cycle");
+        if (cycleEl) {
+            if (otherCount > 0) {
+                cycleEl.textContent = `+${otherCount} active`;
+                cycleEl.style.display = "";
+            } else {
+                cycleEl.style.display = "none";
+            }
+        }
+
+        // Update badge
+        const total = (queueCounts.download || 0) + (queueCounts.processing || 0) + (queueCounts.scan || 0);
+        if (total > 0) {
+            queueDisplayBadge.textContent = total > 999 ? "999+" : total;
+            queueDisplayBadge.style.display = "";
+        } else {
+            queueDisplayBadge.style.display = "none";
         }
     }
 
     async function refreshQueueCount() {
-        try {
-            const items = await api("GET", "/api/download/queue");
-            lastQueueCount = items.length;
-        } catch (_) {}
+        await refreshQueueCounts();  // reuse the queue page's count fetch
         updateQueueDisplayText();
     }
 
-    async function loadQueueDropdown() {
-        try {
-            const items = await api("GET", "/api/download/queue");
-            queueDropdownCount.textContent = items.length + (items.length === 1 ? " file" : " files");
-            if (items.length === 0) {
-                queueDropdownList.innerHTML = '<li class="queue-dropdown-empty">Queue is empty</li>';
-                return;
-            }
-            queueDropdownList.innerHTML = "";
-            items.forEach((f, i) => {
-                const li = document.createElement("li");
-                li.className = "queue-item" + (f.download_status === "downloading" ? " downloading" : "");
-                li.innerHTML = `
-                    <span class="queue-item-index">${i + 1}</span>
-                    <span class="queue-item-name" title="${escapeHtml(f.name)}">${escapeHtml(f.name)}</span>
-                    <span class="queue-item-archive" title="${escapeHtml(f.title || f.identifier)}">${escapeHtml(f.title || f.identifier)}</span>
-                    <span class="queue-item-size">${formatBytes(f.size)}</span>
-                `;
-                li.addEventListener("click", () => {
-                    closeQueueDropdown();
-                    navigateToFile(f.archive_id, f.id);
-                });
-                queueDropdownList.appendChild(li);
-            });
-        } catch (e) { /* ignore */ }
+    function loadQueueDropdown() {
+        // Render the ongoing activity summary into the dropdown
+        const rows = $("#queue-dropdown-rows");
+        const empty = $("#queue-dropdown-empty");
+        if (rows && empty) renderOngoingActivity(rows, empty);
     }
 
     function openQueueDropdown() {
@@ -786,6 +935,14 @@
     document.addEventListener("click", () => {
         if (queueDropdownOpen) closeQueueDropdown();
     });
+    // "+N active" cycling click
+    const cycleBtn = $("#queue-display-cycle");
+    if (cycleBtn) {
+        cycleBtn.addEventListener("click", (e) => {
+            e.stopPropagation();
+            cycleQueueDisplay();
+        });
+    }
 
     async function navigateToFile(archiveId, fileId) {
         // Open the archive if not already open
@@ -1312,9 +1469,27 @@
     }
 
     async function toggleArchiveDownload(id, enabled) {
+        if (enabled) {
+            // Use the file-level queue-all endpoint for feedback
+            const result = await api("POST", `/api/archives/${id}/files/queue-all`, { queued: true });
+            if (result.added !== undefined) {
+                const total = result.added + result.skipped;
+                if (result.skipped > 0) {
+                    addNotification(`Added ${result.added.toLocaleString()} of ${total.toLocaleString()} files to queue (${result.skipped.toLocaleString()} already queued)`, "info");
+                } else if (result.added > 0) {
+                    addNotification(`Added ${result.added.toLocaleString()} files to queue`, "info");
+                } else {
+                    addNotification("All files already queued", "info");
+                }
+            }
+        } else {
+            await api("POST", `/api/archives/${id}/files/queue-all`, { queued: false });
+        }
+        // Also toggle the archive download_enabled flag
         await api("POST", `/api/archives/${id}/download`, { enabled });
         await refreshArchives();
         refreshStatus();
+        refreshQueueCount();
     }
 
     // --- Archive-Level Controls (all archives) ---
@@ -1487,17 +1662,21 @@
     async function scanExistingFiles() {
         if (!currentArchiveId) return;
         const archiveName = getArchiveName(currentArchiveId);
-        try {
-            await api("POST", `/api/archives/${currentArchiveId}/scan`);
-            // Server creates the notification and broadcasts via SSE
-            updateScanButton();
-        } catch (e) {
-            if (e.message && e.message.includes("already queued")) {
-                addNotification(`Scan "${archiveName}": already queued`, "info");
-            } else {
-                addNotification(`Scan "${archiveName}" failed: ` + e.message, "error");
+        const fileCount = vsFiles.length;
+        const msg = `This archive has ${fileCount.toLocaleString()} file${fileCount !== 1 ? "s" : ""}. Add all to scan queue?`;
+        confirmAction("confirm_scan_archive", "Scan Archive", msg, async () => {
+            try {
+                await api("POST", `/api/archives/${currentArchiveId}/scan`);
+                // Server creates the notification and broadcasts via SSE
+                updateScanButton();
+            } catch (e) {
+                if (e.message && e.message.includes("already queued")) {
+                    addNotification(`Scan "${archiveName}": already queued`, "info");
+                } else {
+                    addNotification(`Scan "${archiveName}" failed: ` + e.message, "error");
+                }
             }
-        }
+        });
     }
 
     async function cancelScan(archiveId) {
@@ -1575,14 +1754,14 @@
     async function openArchiveDetail(id) {
         currentArchiveId = id;
 
-        currentSort = "priority";
+        currentSort = "name";
         currentSortDir = "";
         fileSearchQuery = "";
         selectedFileIds.clear();
         vsFiles = [];
         vsLastRange = null;
         vsExpandedIds.clear();
-        $("#file-sort").value = "priority";
+        $("#file-sort").value = "name";
         $("#file-search").value = "";
         $(".file-table-wrap").scrollTop = 0;
         $$(".page").forEach((p) => p.classList.remove("active"));
@@ -1695,7 +1874,7 @@
             if (queueBtn) {
                 const allQueued = [...selectedFileIds].every(id => {
                     const f = vsFiles.find(f => f.id === id);
-                    return f && f.queued;
+                    return f && f.queue_position != null;
                 });
                 queueBtn.textContent = allQueued ? "Unqueue" : "Queue";
             }
@@ -1722,9 +1901,6 @@
         if (isPriority) {
             thead.innerHTML += '<th class="col-priority"></th>';
         }
-        // Show/hide reset order button based on sort mode
-        const resetBtn = $("#btn-reset-queue-order");
-        if (resetBtn) resetBtn.style.display = isPriority ? "" : "none";
         // Re-attach handlers
         $("#select-all-files").addEventListener("change", (e) => toggleSelectAll(e.target.checked));
         // Priority column sort header (stack icon)
@@ -1902,13 +2078,13 @@
     // Returns an array of { type, file?, idx? } objects.
     function vsGetRowDescriptors(files, isPriority) {
         const rows = [];
-        const hasQueued = isPriority && files.some(f => f.queued);
-        const hasUnqueued = isPriority && files.some(f => !f.queued);
+        const hasQueued = isPriority && files.some(f => f.queue_position != null);
+        const hasUnqueued = isPriority && files.some(f => f.queue_position == null);
         const needsDivider = hasQueued && hasUnqueued;
         let dividerInserted = false;
         for (let i = 0; i < files.length; i++) {
             const f = files[i];
-            if (needsDivider && !dividerInserted && !f.queued) {
+            if (needsDivider && !dividerInserted && f.queue_position == null) {
                 dividerInserted = true;
                 rows.push({ type: "divider" });
             }
@@ -1933,19 +2109,20 @@
 
         let html = "";
         const isUnknown = f.download_status === "unknown";
+        const isQueued = f.queue_position != null;
 
         // Grip column
         if (isPriority) {
-            html += (f.queued && !isUnknown) ? buildGripCell() : '<td class="col-grip"></td>';
+            html += (isQueued && !isUnknown) ? buildGripCell() : '<td class="col-grip"></td>';
         }
 
         const procStatus = f.processing_status || "";
-        const sourceDeleted = (f.download_status === "pending" && procStatus === "processed");
+        const sourceDeleted = (f.downloaded === 0 && procStatus === "processed");
         const hasProcessedOutput = (procStatus === "processed");
         const hideQueue = isUnknown || (hasProcessedOutput && !sourceDeleted);
         if (hideQueue) {
             html += '<td class="col-queue"></td>';
-        } else if (f.queued) {
+        } else if (isQueued) {
             html += `<td class="col-queue"><button class="queue-toggle queue-remove" data-queue-id="${f.id}" title="Remove from queue">` +
                 `<svg viewBox="0 0 16 16" width="14" height="14"><rect x="3" y="7" width="10" height="2" rx="1" fill="currentColor"/></svg></button></td>`;
         } else {
@@ -1981,7 +2158,7 @@
             : "";
         html += `<td class="col-name"><div class="file-name-wrap">` +
             unknownGrip +
-            renderFileName(f.name, sourceDeleted ? "file-name-deleted" : "") + changeIcon +
+            renderFileName(f.name, sourceDeleted ? "file-name-deleted" : f.downloaded ? "file-name-downloaded" : "") + changeIcon +
             `<span class="file-actions">` +
             renameBtn + processBtn + rescanBtn + deleteBtn +
             `</span></div></td>`;
@@ -1989,7 +2166,7 @@
         html += `<td class="col-size" style="text-align:right">${formatBytes(f.size)}</td>`;
         html += `<td class="col-modified">${formatDate(f.mtime)}</td>`;
         const displayStatus = formatFileStatus(f);
-        const isSkipped = !f.queued && f.download_status === "pending";
+        const isSkipped = !isQueued && f.download_status === "pending";
         const statusClass = procStatus === "processed" ? "processed"
             : procStatus === "failed" ? "proc-failed"
             : procStatus === "processing" || procStatus === "queued" ? "proc-active"
@@ -2008,7 +2185,7 @@
             `</td>`;
 
         if (isPriority) {
-            if (f.queued && !isUnknown) {
+            if (isQueued && !isUnknown) {
                 const selIdx = queuedFiles.indexOf(f);
                 html += buildPriorityCell(f.id, selIdx === 0, selIdx === lastQueuedIdx);
             } else {
@@ -2057,7 +2234,7 @@
                 else if (action === "delete") confirmDeleteFile(fid, btn.dataset.fileName, btn.dataset.fileOrigin);
             });
         });
-        if (isPriority && f.queued && !isUnknown) {
+        if (isPriority && isQueued && !isUnknown) {
             attachPriorityDrag(tr, f.id);
             const upBtn = tr.querySelector(`[data-move-up="${f.id}"]`);
             const downBtn = tr.querySelector(`[data-move-down="${f.id}"]`);
@@ -2093,7 +2270,7 @@
         if (!wrap || vsFiles.length === 0) return;
 
         const isPriority = currentSort === "priority";
-        const queuedFiles = isPriority ? vsFiles.filter(f => f.queued && f.download_status !== "unknown") : [];
+        const queuedFiles = isPriority ? vsFiles.filter(f => f.queue_position != null && f.download_status !== "unknown") : [];
         const lastQueuedIdx = queuedFiles.length - 1;
         const descriptors = vsGetRowDescriptors(vsFiles, isPriority);
         const totalRows = descriptors.length;
@@ -2190,7 +2367,7 @@
             if (f.processing_status === "failed") return "proc. failed";
             if (f.processing_status === "skipped") return "proc. skipped";
         }
-        if (!f.queued && f.download_status === "pending") {
+        if (f.queue_position == null && f.download_status === "pending") {
             if (f.downloaded_bytes > 0 && f.size > 0) {
                 const pct = ((f.downloaded_bytes / f.size) * 100).toFixed(1);
                 return `${pct}%`;
@@ -2471,7 +2648,7 @@
         if (!currentArchiveId || selectedFileIds.size === 0) return;
         const allQueued = [...selectedFileIds].every(id => {
             const f = vsFiles.find(f => f.id === id);
-            return f && f.queued;
+            return f && f.queue_position != null;
         });
         const queued = !allQueued; // toggle: if all queued → unqueue, otherwise queue
         const ids = Array.from(selectedFileIds);
@@ -2551,6 +2728,8 @@
             if (updates.download_status) vsFile.download_status = updates.download_status;
             if (updates.downloaded_bytes !== undefined) vsFile.downloaded_bytes = updates.downloaded_bytes;
             if (updates.size !== undefined) vsFile.size = updates.size;
+            if (updates.downloaded !== undefined) vsFile.downloaded = updates.downloaded;
+            if (updates.queue_position !== undefined) vsFile.queue_position = updates.queue_position;
         }
         // Update the visible DOM row if present
         const tr = fileListEl.querySelector(`tr[data-file-id="${fileId}"]`);
@@ -3028,12 +3207,14 @@
 
     // Keys and their default-enabled state (true = warn by default)
     const CONFIRM_KEYS = {
-        confirm_reset_order:         { label: "Warn before resetting download order",              default: true },
         confirm_delete_file:         { label: "Warn before deleting a file",                       default: true },
         confirm_batch_delete_files:  { label: "Warn before batch-deleting files",                  default: true },
         confirm_delete_folders:      { label: "Warn before deleting download folders",             default: true },
         confirm_delete_processed:    { label: "Warn before deleting processed output files",       default: true },
         confirm_delete_profile:      { label: "Warn before deleting a processing profile",         default: true },
+        confirm_cancel_processing:   { label: "Warn before cancelling all processing",             default: true },
+        confirm_cancel_scans:        { label: "Warn before cancelling all scans",                  default: true },
+        confirm_scan_archive:        { label: "Warn before scanning an entire archive",            default: true },
     };
 
     // Runtime state — loaded from settings on init
@@ -3081,25 +3262,6 @@
         });
 
         modal.classList.add("open");
-    }
-
-    // --- Reset Download Order ---
-
-    function confirmResetOrder() {
-        if (!currentArchiveId) return;
-        confirmAction(
-            "confirm_reset_order",
-            "Reset Queue Order",
-            "This will reset the download priority of all files in this archive back to alphabetical order by filename. Any custom ordering you have set will be lost.",
-            doResetOrder,
-            { confirmText: "Reset Queue Order" }
-        );
-    }
-
-    async function doResetOrder() {
-        if (!currentArchiveId) return;
-        await api("POST", `/api/archives/${currentArchiveId}/files/reset-order`);
-        await loadFiles();
     }
 
     // --- Bandwidth ---
@@ -3675,6 +3837,289 @@
         $(`#${pageId}`).classList.add("active");
     }
 
+    // ── Ongoing Activity State ───────────────────────────────────────
+    // Tracks what's happening now, shared by Phase 2 (activity page) and Phase 4 (dropdown)
+    let ongoingProcessing = null;  // {archive_id, filename, current, total, phase}
+    let ongoingScanning = null;    // {archive_id, phase, current, total}
+
+    /**
+     * Render the compact ongoing-activity rows.
+     * @param {HTMLElement} container  — the element to fill with rows
+     * @param {HTMLElement} emptyEl    — the "no active tasks" element to show/hide
+     */
+    function renderOngoingActivity(container, emptyEl) {
+        let html = "";
+
+        // Download row
+        if (currentDownloadInfo && (dlState === "running" || dlState === "paused")) {
+            const fname = escapeHtml(currentDownloadInfo.filename || "");
+            const archive = escapeHtml(currentDownloadInfo.identifier || "");
+            const pct = currentDownloadInfo.size > 0
+                ? ((currentDownloadInfo.downloaded || 0) / currentDownloadInfo.size * 100).toFixed(1) + "%"
+                : "";
+            const speed = speedDisplay.textContent || "";
+            const badge = queueCounts.download > 0 ? `<span class="activity-ongoing-badge">${queueCounts.download}</span>` : "";
+            html += `<div class="activity-ongoing-row" data-navigate="download">`;
+            html += `<span class="activity-ongoing-label">${dlState === "paused" ? "Paused" : "Downloading"}</span>`;
+            html += `<span class="activity-ongoing-detail">${fname} (${archive}) ${pct} ${speed}</span>`;
+            html += badge;
+            html += `</div>`;
+        }
+
+        // Processing row
+        if (ongoingProcessing && ongoingProcessing.phase !== "done" && ongoingProcessing.phase !== "error" && ongoingProcessing.phase !== "cancelled") {
+            const fname = escapeHtml(ongoingProcessing.filename || "");
+            const prog = ongoingProcessing.total > 0 ? `${ongoingProcessing.current}/${ongoingProcessing.total}` : "";
+            const badge = queueCounts.processing > 0 ? `<span class="activity-ongoing-badge">${queueCounts.processing}</span>` : "";
+            html += `<div class="activity-ongoing-row" data-navigate="processing">`;
+            html += `<span class="activity-ongoing-label">Processing</span>`;
+            html += `<span class="activity-ongoing-detail">${fname} ${prog}</span>`;
+            html += badge;
+            html += `</div>`;
+        }
+
+        // Scanning row
+        if (ongoingScanning && ongoingScanning.phase !== "done" && ongoingScanning.phase !== "error" && ongoingScanning.phase !== "cancelled") {
+            const prog = ongoingScanning.total > 0 ? `${ongoingScanning.current}/${ongoingScanning.total}` : "";
+            const badge = queueCounts.scan > 0 ? `<span class="activity-ongoing-badge">${queueCounts.scan}</span>` : "";
+            html += `<div class="activity-ongoing-row" data-navigate="scan">`;
+            html += `<span class="activity-ongoing-label">Scanning</span>`;
+            html += `<span class="activity-ongoing-detail">${prog} ${ongoingScanning.phase || ""}</span>`;
+            html += badge;
+            html += `</div>`;
+        }
+
+        container.innerHTML = html;
+        emptyEl.style.display = html ? "none" : "";
+
+        // Click handlers to navigate to queue tabs
+        container.querySelectorAll(".activity-ongoing-row").forEach((row) => {
+            row.addEventListener("click", () => {
+                const tab = row.dataset.navigate;
+                if (tab) openQueues(tab);
+            });
+        });
+    }
+
+    function refreshOngoingActivity() {
+        const container = $("#activity-ongoing-rows");
+        const empty = $("#activity-ongoing-empty");
+        if (container && empty) renderOngoingActivity(container, empty);
+    }
+
+    // ── Queue Page ──────────────────────────────────────────────────
+    let queueCounts = { download: 0, processing: 0, scan: 0 };
+    let queueData = { download: [], processing: [], scan: [] };
+    let queueStale = { download: true, processing: true, scan: true };
+    let activeQueueTab = "download";
+    // Track items completing with 3-second grey-out before removal
+    // Map of "queueType:entryId" -> setTimeout handle
+    let completingItems = new Map();
+
+    async function openQueues(tab) {
+        if (tab) activeQueueTab = tab;
+        showPage("page-queues");
+        switchQueueTab(activeQueueTab);
+        await refreshQueueCounts();
+        await loadQueueTab(activeQueueTab);
+    }
+
+    function switchQueueTab(tab) {
+        activeQueueTab = tab;
+        $$(".queue-tab").forEach((t) => t.classList.toggle("active", t.dataset.queue === tab));
+        $$(".queue-panel").forEach((p) => p.classList.toggle("active", p.id === `queue-panel-${tab}`));
+        if (queueStale[tab]) loadQueueTab(tab);
+    }
+
+    async function refreshQueueCounts() {
+        try {
+            const counts = await api("GET", "/api/queues/counts");
+            queueCounts = counts;
+            updateQueueBadges();
+        } catch (e) { /* ignore */ }
+    }
+
+    function updateQueueBadges() {
+        const total = queueCounts.download + queueCounts.processing + queueCounts.scan;
+        const badge = $("#queue-badge");
+        if (total > 0) {
+            badge.textContent = total > 999 ? "999+" : total;
+            badge.style.display = "";
+        } else {
+            badge.style.display = "none";
+        }
+        const dlBadge = $("#queue-tab-download-badge");
+        const procBadge = $("#queue-tab-processing-badge");
+        const scanBadge = $("#queue-tab-scan-badge");
+        dlBadge.textContent = queueCounts.download > 0 ? `(${queueCounts.download})` : "";
+        procBadge.textContent = queueCounts.processing > 0 ? `(${queueCounts.processing})` : "";
+        scanBadge.textContent = queueCounts.scan > 0 ? `(${queueCounts.scan})` : "";
+    }
+
+    async function loadQueueTab(tab) {
+        queueStale[tab] = false;
+        const endpoints = {
+            download: "/api/download/queue",
+            processing: "/api/processing/queue",
+            scan: "/api/scan/queue",
+        };
+        try {
+            const data = await api("GET", endpoints[tab]);
+            queueData[tab] = data;
+            renderQueueTable(tab);
+        } catch (e) {
+            console.error("Failed to load queue:", e);
+        }
+    }
+
+    function renderQueueTable(tab) {
+        const data = queueData[tab];
+        const tbody = $(`#queue-${tab === "download" ? "dl" : tab === "processing" ? "proc" : "scan"}-tbody`);
+        const empty = $(`#queue-${tab === "download" ? "dl" : tab === "processing" ? "proc" : "scan"}-empty`);
+        const table = tbody.closest(".file-table-wrap");
+
+        if (!data || data.length === 0) {
+            table.style.display = "none";
+            empty.style.display = "";
+            return;
+        }
+        table.style.display = "";
+        empty.style.display = "none";
+
+        let html = "";
+        for (const item of data) {
+            const fname = escapeHtml(item.file_name || item.name || "");
+            const archiveName = escapeHtml(item.archive_identifier || item.identifier || "");
+            const bold = item.downloaded ? " file-name-downloaded" : "";
+            const archiveId = item.archive_id;
+            const fileId = item.file_id || item.id;
+            const entryId = item.id || item.file_id;
+            const isCompleting = completingItems.has(`${tab}:${entryId}`);
+            const rowClass = isCompleting ? " class=\"queue-completing\"" : "";
+
+            if (tab === "download") {
+                const size = formatBytes(item.size || item.file_size || 0);
+                const status = item.download_status || "queued";
+                html += `<tr${rowClass} data-file-id="${fileId}" data-archive-id="${archiveId}">`;
+                html += `<td class="col-grip"><div class="grip"><div class="grip-dots"><span></span><span></span></div><div class="grip-dots"><span></span><span></span></div></div></td>`;
+                html += `<td class="col-name"><span class="file-name${bold}">${fname}</span></td>`;
+                html += `<td class="col-archive">${archiveName}</td>`;
+                html += `<td class="col-size">${size}</td>`;
+                html += `<td class="col-status"><span class="status-badge status-${status}">${status}</span></td>`;
+                html += `<td class="col-actions"><button class="icon-btn queue-remove-btn" data-file-id="${fileId}" title="Remove from queue">&times;</button></td>`;
+                html += `</tr>`;
+            } else if (tab === "processing") {
+                const profile = escapeHtml(item.profile_name || "");
+                const status = item.status || "pending";
+                html += `<tr${rowClass} data-entry-id="${item.id}" data-archive-id="${archiveId}">`;
+                html += `<td class="col-grip"><div class="grip"><div class="grip-dots"><span></span><span></span></div><div class="grip-dots"><span></span><span></span></div></div></td>`;
+                html += `<td class="col-name"><span class="file-name${bold}">${fname}</span></td>`;
+                html += `<td class="col-archive">${archiveName}</td>`;
+                html += `<td class="col-profile">${profile}</td>`;
+                html += `<td class="col-status"><span class="status-badge status-${status}">${status}</span></td>`;
+                html += `<td class="col-actions"></td>`;
+                html += `</tr>`;
+            } else {
+                const status = item.status || "pending";
+                html += `<tr${rowClass} data-entry-id="${item.id}" data-archive-id="${archiveId}">`;
+                html += `<td class="col-grip"><div class="grip"><div class="grip-dots"><span></span><span></span></div><div class="grip-dots"><span></span><span></span></div></div></td>`;
+                html += `<td class="col-name"><span class="file-name${bold}">${fname}</span></td>`;
+                html += `<td class="col-archive">${archiveName}</td>`;
+                html += `<td class="col-status"><span class="status-badge status-${status}">${status}</span></td>`;
+                html += `<td class="col-actions"></td>`;
+                html += `</tr>`;
+            }
+        }
+        tbody.innerHTML = html;
+
+        // Attach click handlers for navigate-to-file
+        tbody.querySelectorAll("tr").forEach((tr) => {
+            tr.addEventListener("click", (e) => {
+                if (e.target.closest(".queue-remove-btn")) return;
+                const archiveId = tr.dataset.archiveId;
+                const fileId = tr.dataset.fileId;
+                if (archiveId) {
+                    openArchiveDetail(parseInt(archiveId));
+                    if (fileId) {
+                        setTimeout(() => {
+                            const row = $(`#file-table-body tr[data-id="${fileId}"]`);
+                            if (row) flashElement(row);
+                        }, 300);
+                    }
+                }
+            });
+        });
+
+        // Attach remove-from-queue handlers
+        tbody.querySelectorAll(".queue-remove-btn").forEach((btn) => {
+            btn.addEventListener("click", async (e) => {
+                e.stopPropagation();
+                const fileId = btn.dataset.fileId;
+                await api("POST", `/api/files/${fileId}/queue`, { queued: false });
+                queueStale.download = true;
+                loadQueueTab("download");
+                refreshQueueCounts();
+            });
+        });
+    }
+
+    function initQueuePage() {
+        // Tab switching
+        $$(".queue-tab").forEach((tab) => {
+            tab.addEventListener("click", () => switchQueueTab(tab.dataset.queue));
+        });
+
+        // Download controls
+        $("#queue-dl-play").addEventListener("click", async () => {
+            await api("POST", "/api/download/start");
+        });
+        $("#queue-dl-pause").addEventListener("click", async () => {
+            await api("POST", "/api/download/pause");
+        });
+        $("#queue-dl-stop").addEventListener("click", async () => {
+            await api("POST", "/api/download/stop");
+        });
+
+        // Processing controls
+        $("#queue-proc-pause").addEventListener("click", async () => {
+            const paused = !db_processing_paused;
+            await api("POST", "/api/processing/pause", { paused });
+            db_processing_paused = paused;
+        });
+        $("#queue-proc-cancel").addEventListener("click", () => {
+            confirmAction("confirm_cancel_processing", "Cancel Processing",
+                "Cancel the current file and remove all pending entries from the processing queue?",
+                async () => {
+                    await api("POST", "/api/processing/cancel");
+                    queueStale.processing = true;
+                    loadQueueTab("processing");
+                    refreshQueueCounts();
+                });
+        });
+
+        // Scan controls
+        $("#queue-scan-pause").addEventListener("click", async () => {
+            const paused = !db_scan_paused;
+            await api("POST", "/api/scan/pause", { paused });
+            db_scan_paused = paused;
+        });
+        $("#queue-scan-cancel").addEventListener("click", () => {
+            confirmAction("confirm_cancel_scans", "Cancel Scans",
+                "Cancel all pending scan queue entries?",
+                async () => {
+                    await api("POST", "/api/scan/cancel");
+                    queueStale.scan = true;
+                    loadQueueTab("scan");
+                    refreshQueueCounts();
+                });
+        });
+
+        // Seed badge on page load
+        refreshQueueCounts();
+    }
+    let db_processing_paused = false;
+    let db_scan_paused = false;
+
     // ── Activity Log ──────────────────────────────────────────────
     let activityJobFilter = null;  // set when navigating from a notification
 
@@ -3696,6 +4141,7 @@
         await populateActivityArchiveFilter();
         await loadActivityJobs(opts.job_id || null);
         await loadActivityLog();
+        refreshOngoingActivity();
         showPage("page-activity");
     }
 
@@ -4610,6 +5056,9 @@
 
         // Navigation
         $("#btn-archives").addEventListener("click", openArchiveList);
+        // Queues
+        $("#btn-queues").addEventListener("click", () => openQueues());
+        initQueuePage();
         // Activity Log
         $("#btn-activity").addEventListener("click", () => openActivityLog());
         $("#activity-filter-apply").addEventListener("click", () => loadActivityLog());
@@ -4687,9 +5136,6 @@
         // Force resume conflict modal
         $("#btn-force-resume-cancel").addEventListener("click", () => { pendingForceResumeId = null; $("#modal-force-resume").classList.remove("open"); });
         $("#btn-force-resume-confirm").addEventListener("click", doForceResume);
-
-        // Reset download order
-        $("#btn-reset-queue-order").addEventListener("click", confirmResetOrder);
 
         // Virtual scroll for file table
         $(".file-table-wrap").addEventListener("scroll", () => {

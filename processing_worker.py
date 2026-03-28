@@ -78,6 +78,9 @@ def queue_archive_processing(archive_id, profile_id, file_ids=None, options_over
 
     job_id = db.create_processing_job(archive_id, profile_id, file_ids, options_override)
 
+    # Populate processing_queue with file-level entries
+    _populate_processing_queue(job_id, archive_id, profile_id, file_ids, options_override)
+
     # Create an activity job to track this processing run
     archive = db.get_archive(archive_id)
     group_id = archive["group_id"] if archive else None
@@ -112,6 +115,14 @@ def queue_archive_processing(archive_id, profile_id, file_ids=None, options_over
     _wake_event.set()
 
     return True, pending > 1
+
+
+def cancel_current_processing():
+    """Cancel whatever is currently being processed (if anything).
+    Used by the 'Cancel and Remove All' action."""
+    with _processing_lock:
+        for archive_id, evt in _cancel_events.items():
+            evt.set()
 
 
 def cancel_archive_processing(archive_id):
@@ -176,6 +187,47 @@ def is_processing(archive_id):
     return job is not None
 
 
+def _populate_processing_queue(job_id, archive_id, profile_id, file_ids, options_override):
+    """Pre-populate processing_queue entries for a job so they appear in the queue page."""
+    from processors import get_processor
+
+    profile = db.get_processing_profile(profile_id)
+    if not profile:
+        return
+
+    processor_cls = get_processor(profile["processor_type"])
+    if not processor_cls:
+        return
+
+    # Get eligible files (same logic as _run_processing)
+    if file_ids:
+        conn = db.get_db()
+        placeholders = ",".join("?" * len(file_ids))
+        rows = conn.execute(
+            f"SELECT * FROM archive_files WHERE id IN ({placeholders}) AND archive_id = ?",
+            file_ids + [archive_id],
+        ).fetchall()
+        conn.close()
+        files = [dict(r) for r in rows]
+    else:
+        files = db.get_processable_files(archive_id)
+
+    # Filter to compatible files
+    input_exts = set(processor_cls.input_extensions)
+    files = [f for f in files if os.path.splitext(f["name"])[1].lower() in input_exts]
+
+    if not files:
+        return
+
+    # Build entries
+    options_json = {**(json.loads(profile.get("options_json", "{}")) if profile.get("options_json") else {}),
+                    **(options_override or {})}
+    entries = [(f["id"], archive_id, profile_id, options_json) for f in files]
+    db.add_processing_queue_entries_batch(job_id, entries)
+
+    _broadcast("batch_added", {"queue_type": "processing", "count": len(entries), "archive_id": archive_id})
+
+
 def _broadcast(event, data):
     if _sse_broadcaster:
         _sse_broadcaster(event, data)
@@ -187,6 +239,12 @@ def _broadcast(event, data):
 
 def _worker_loop():
     while True:
+        # Check pause state
+        if db.get_setting("processing_paused", "0") == "1":
+            _wake_event.wait(timeout=2)
+            _wake_event.clear()
+            continue
+
         job = db.get_next_processing_job()
         if not job:
             # No work — wait for a wake signal or poll every 5s
@@ -377,29 +435,25 @@ def _run_processing(job):
     download_dir = db.get_setting("download_dir", os.path.expanduser("~/ia-downloads"))
     archive_dir = os.path.join(download_dir, archive["identifier"])
 
-    # Get eligible files
-    if file_ids:
-        conn = db.get_db()
-        placeholders = ",".join("?" * len(file_ids))
-        rows = conn.execute(
-            f"SELECT * FROM archive_files WHERE id IN ({placeholders}) AND archive_id = ?",
-            file_ids + [archive_id],
-        ).fetchall()
-        conn.close()
-        files = [dict(r) for r in rows]
-    else:
-        files = db.get_processable_files(archive_id)
+    # Get file-level queue entries for this job
+    with db._db() as conn:
+        pq_entries = [dict(r) for r in conn.execute(
+            "SELECT * FROM processing_queue WHERE job_id = ? AND status = 'pending' ORDER BY position ASC",
+            (job["id"],),
+        ).fetchall()]
 
-    # Filter to files the processor can handle
-    input_exts = set(processor_cls.input_extensions)
-    pre_filter = len(files)
-    rejected = [f for f in files if os.path.splitext(f["name"])[1].lower() not in input_exts]
-    files = [f for f in files if os.path.splitext(f["name"])[1].lower() in input_exts]
-    log.debug("worker", "File filter: %d eligible, %d matched extensions %s, %d rejected",
-              pre_filter, len(files), sorted(input_exts), len(rejected))
-    for r in rejected:
-        ext = os.path.splitext(r["name"])[1].lower()
-        log.debug("worker", "  Rejected: %s (ext: %s)", r["name"], ext)
+    # Resolve to actual file info
+    files = []
+    pq_map = {}  # file_id -> processing_queue entry
+    for pqe in pq_entries:
+        f = db.get_file(pqe["file_id"])
+        if f:
+            files.append(f)
+            pq_map[f["id"]] = pqe
+        else:
+            db.complete_processing_queue_entry(pqe["id"], error_message="File not found")
+
+    log.debug("worker", "Processing queue has %d file entries for job %d", len(files), job["id"])
 
     if not files:
         log.info("worker", "No files to process after filtering — done")
@@ -443,7 +497,10 @@ def _run_processing(job):
     for i, file_info in enumerate(files):
         if _cancelled():
             for remaining in files[i:]:
-                db.set_file_processing_status(remaining["id"], "", error="Cancelled")
+                db.set_file_processing_status(remaining["id"], "cancelled", error="Cancelled")
+                rpqe = pq_map.get(remaining["id"])
+                if rpqe:
+                    db.cancel_processing_queue_entry(rpqe["id"])
             if act_job_id:
                 activity.log(act_job_id, "warning", "Processing cancelled by user",
                              archive_id=archive_id)
@@ -470,6 +527,11 @@ def _run_processing(job):
         file_id = file_info["id"]
         filename = file_info["name"]
         file_path = os.path.join(archive_dir, filename)
+
+        # Claim the processing queue entry
+        pqe = pq_map.get(file_id)
+        if pqe:
+            db.claim_processing_queue_entry(pqe["id"])
 
         db.set_file_processing_status(file_id, "processing")
 
@@ -515,13 +577,26 @@ def _run_processing(job):
                                  detail=reason)
                 summary["skipped"] += 1
             else:
+                # === Non-cancellable deletion block ===
+                # Once we start deleting originals, we must finish to avoid
+                # an inconsistent state (processed file exists, original partially deleted).
                 delete_original = merged_options.get("delete_original", "yes") == "yes"
+                has_processed_files = bool(result.get("processed_files") or result.get("processed_filename"))
                 if delete_original:
                     for to_delete in result.get("files_to_delete", []):
                         try:
                             os.remove(to_delete)
                         except OSError:
                             pass
+                    # Update downloaded flag: set to 0 only if no processed files
+                    if not has_processed_files:
+                        with db._db() as conn:
+                            conn.execute(
+                                "UPDATE archive_files SET downloaded = 0 WHERE id = ?",
+                                (file_id,),
+                            )
+                            conn.commit()
+                # === End non-cancellable block ===
 
                 log.info("worker", "Processed %s -> %s", filename, result["processed_filename"])
                 db.set_file_processing_status(
@@ -546,10 +621,19 @@ def _run_processing(job):
                 "skipped": result.get("skipped", False),
             })
 
+            # Mark processing queue entry as completed
+            if pqe:
+                db.complete_processing_queue_entry(pqe["id"])
+
         except ProcessingCancelled:
-            db.set_file_processing_status(file_id, "", error="Cancelled")
+            db.set_file_processing_status(file_id, "cancelled", error="Cancelled")
+            if pqe:
+                db.cancel_processing_queue_entry(pqe["id"])
             for remaining in files[i + 1:]:
-                db.set_file_processing_status(remaining["id"], "", error="Cancelled")
+                db.set_file_processing_status(remaining["id"], "cancelled", error="Cancelled")
+                rpqe = pq_map.get(remaining["id"])
+                if rpqe:
+                    db.cancel_processing_queue_entry(rpqe["id"])
             if act_job_id:
                 activity.log(act_job_id, "warning",
                              f"Cancelled during: {filename}",
@@ -577,6 +661,8 @@ def _run_processing(job):
         except ProcessingError as e:
             log.error("worker", "Failed %s: %s", filename, e)
             db.set_file_processing_status(file_id, "failed", error=str(e))
+            if pqe:
+                db.complete_processing_queue_entry(pqe["id"], error_message=str(e))
             if act_job_id:
                 activity.log(act_job_id, "error", f"Failed: {filename}",
                              archive_id=archive_id, file_id=file_id,
@@ -595,6 +681,8 @@ def _run_processing(job):
 
         except Exception as e:
             db.set_file_processing_status(file_id, "failed", error=str(e))
+            if pqe:
+                db.complete_processing_queue_entry(pqe["id"], error_message=str(e))
             if act_job_id:
                 activity.log(act_job_id, "error", f"Failed: {filename}",
                              archive_id=archive_id, file_id=file_id,

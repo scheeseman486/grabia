@@ -21,8 +21,18 @@ import sqlite3
 import os
 import json
 import time
+import threading
+import logging
 from contextlib import contextmanager
 from werkzeug.security import generate_password_hash, check_password_hash
+
+log = logging.getLogger(__name__)
+
+# Per-queue locks used by compaction and get_next_*() functions to prevent
+# workers from picking a stale position mid-compaction.
+_download_queue_lock = threading.Lock()
+_processing_queue_lock = threading.Lock()
+_scan_queue_lock = threading.Lock()
 
 _DATA_DIR = os.environ.get("GRABIA_DATA_DIR") or os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(_DATA_DIR, "grabia.db")
@@ -88,7 +98,9 @@ def init_db():
             retry_count INTEGER NOT NULL DEFAULT 0,
             change_status TEXT NOT NULL DEFAULT '',
             change_detail TEXT NOT NULL DEFAULT '',
-            download_priority INTEGER NOT NULL DEFAULT 0,
+            queue_position INTEGER DEFAULT NULL,
+            downloaded INTEGER NOT NULL DEFAULT 0,
+            download_batch_id INTEGER DEFAULT NULL,
             FOREIGN KEY (archive_id) REFERENCES archives(id) ON DELETE CASCADE,
             UNIQUE(archive_id, name)
         );
@@ -216,6 +228,45 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_activity_log_job ON activity_log(job_id);
         CREATE INDEX IF NOT EXISTS idx_activity_log_archive ON activity_log(archive_id);
         CREATE INDEX IF NOT EXISTS idx_activity_log_timestamp ON activity_log(timestamp);
+
+        -- Queue overhaul: generic batch tracking for all queue types
+        CREATE TABLE IF NOT EXISTS batches (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            queue_type TEXT NOT NULL,
+            archive_id INTEGER DEFAULT NULL,
+            created_at REAL NOT NULL,
+            file_count INTEGER NOT NULL DEFAULT 0,
+            completed_count INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'pending'
+        );
+
+        -- Queue overhaul: file-level processing queue (child of processing_jobs)
+        CREATE TABLE IF NOT EXISTS processing_queue (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            job_id INTEGER NOT NULL REFERENCES processing_jobs(id) ON DELETE CASCADE,
+            file_id INTEGER NOT NULL REFERENCES archive_files(id) ON DELETE CASCADE,
+            archive_id INTEGER NOT NULL,
+            profile_id INTEGER NOT NULL,
+            options_json TEXT DEFAULT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            position INTEGER NOT NULL DEFAULT 0,
+            error_message TEXT NOT NULL DEFAULT '',
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_processing_queue_status ON processing_queue(status, position);
+
+        -- Queue overhaul: file-level scan queue (replaces Python queue.Queue)
+        CREATE TABLE IF NOT EXISTS scan_queue (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            file_id INTEGER NOT NULL REFERENCES archive_files(id) ON DELETE CASCADE,
+            archive_id INTEGER NOT NULL,
+            batch_id INTEGER DEFAULT NULL REFERENCES batches(id) ON DELETE SET NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            position INTEGER NOT NULL DEFAULT 0,
+            created_at REAL NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_scan_queue_status ON scan_queue(status, position);
     """)
 
     # Default settings
@@ -242,18 +293,9 @@ def init_db():
         conn.execute("ALTER TABLE archive_files ADD COLUMN change_status TEXT NOT NULL DEFAULT ''")
         conn.execute("ALTER TABLE archive_files ADD COLUMN change_detail TEXT NOT NULL DEFAULT ''")
 
-    try:
-        conn.execute("SELECT download_priority FROM archive_files LIMIT 1")
-    except sqlite3.OperationalError:
-        conn.execute("ALTER TABLE archive_files ADD COLUMN download_priority INTEGER NOT NULL DEFAULT 0")
-        # Initialise priorities by current name order within each archive
-        conn.execute("""
-            UPDATE archive_files SET download_priority = (
-                SELECT COUNT(*) FROM archive_files af2
-                WHERE af2.archive_id = archive_files.archive_id
-                  AND af2.name < archive_files.name
-            )
-        """)
+    # download_priority column is deprecated (replaced by queue_position).
+    # Existing databases may still have it — that's fine, it's simply unused.
+    # We no longer create it for new databases.
 
     try:
         conn.execute("SELECT group_id FROM archives LIMIT 1")
@@ -304,6 +346,67 @@ def init_db():
     except sqlite3.OperationalError:
         conn.execute("ALTER TABLE notifications ADD COLUMN job_id INTEGER DEFAULT NULL")
 
+    # --- Queue overhaul migrations ---
+
+    # Add queue_position column (replaces queued + download_priority)
+    try:
+        conn.execute("SELECT queue_position FROM archive_files LIMIT 1")
+    except sqlite3.OperationalError:
+        conn.execute("ALTER TABLE archive_files ADD COLUMN queue_position INTEGER DEFAULT NULL")
+        # Migrate from old queued + download_priority system if the columns exist
+        has_download_priority = False
+        try:
+            conn.execute("SELECT download_priority FROM archive_files LIMIT 1")
+            has_download_priority = True
+        except sqlite3.OperationalError:
+            pass
+        if has_download_priority:
+            conn.execute("""
+                UPDATE archive_files SET queue_position = (
+                    SELECT rn FROM (
+                        SELECT af.id,
+                               ROW_NUMBER() OVER (
+                                   ORDER BY a.position ASC, af.download_priority ASC
+                               ) AS rn
+                        FROM archive_files af
+                        JOIN archives a ON af.archive_id = a.id
+                        WHERE af.queued = 1
+                          AND af.download_status NOT IN ('completed', 'conflict')
+                    ) AS t
+                    WHERE t.id = archive_files.id
+                )
+                WHERE queued = 1
+                  AND download_status NOT IN ('completed', 'conflict')
+            """)
+            log.info("Migrated queued files to queue_position column")
+
+    # Add downloaded boolean column
+    try:
+        conn.execute("SELECT downloaded FROM archive_files LIMIT 1")
+    except sqlite3.OperationalError:
+        conn.execute("ALTER TABLE archive_files ADD COLUMN downloaded INTEGER NOT NULL DEFAULT 0")
+        # Migrate: set downloaded=1 for all completed files
+        conn.execute("UPDATE archive_files SET downloaded = 1 WHERE download_status = 'completed'")
+        log.info("Migrated downloaded column from download_status")
+
+    # Add download_batch_id column
+    try:
+        conn.execute("SELECT download_batch_id FROM archive_files LIMIT 1")
+    except sqlite3.OperationalError:
+        conn.execute("ALTER TABLE archive_files ADD COLUMN download_batch_id INTEGER DEFAULT NULL")
+
+    # Add manifest cache columns to archives
+    try:
+        conn.execute("SELECT manifest_json FROM archives LIMIT 1")
+    except sqlite3.OperationalError:
+        conn.execute("ALTER TABLE archives ADD COLUMN manifest_json TEXT DEFAULT NULL")
+        conn.execute("ALTER TABLE archives ADD COLUMN manifest_fetched_at REAL DEFAULT NULL")
+
+    # Queue state settings (download_state, processing_paused, scan_paused)
+    conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('download_state', 'stopped')")
+    conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('processing_paused', '0')")
+    conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('scan_paused', '0')")
+
     # Fix any scan-inserted rows incorrectly tagged as 'manifest'.
     # Real IA files always have at least one metadata field populated;
     # scan-inserted files have md5, sha1, format, source, and mtime all empty.
@@ -318,6 +421,11 @@ def init_db():
     conn.execute("""
         UPDATE archive_files SET queued = 0
         WHERE queued = 1 AND download_status IN ('completed', 'conflict')
+    """)
+    # Also clear queue_position for completed/conflict files
+    conn.execute("""
+        UPDATE archive_files SET queue_position = NULL
+        WHERE queue_position IS NOT NULL AND download_status IN ('completed', 'conflict')
     """)
 
     # Fix archives stuck on 'downloading' or 'queued' from a previous session.
@@ -335,7 +443,7 @@ def init_db():
                 SUM(CASE WHEN download_status = 'failed' THEN 1 ELSE 0 END) as failed,
                 SUM(CASE WHEN download_status = 'conflict' THEN 1 ELSE 0 END) as conflict
             FROM archive_files
-            WHERE archive_id = ? AND (queued = 1 OR download_status IN ('completed', 'conflict'))
+            WHERE archive_id = ? AND (queue_position IS NOT NULL OR download_status IN ('completed', 'conflict'))
         """, (aid,)).fetchone()
         if counts["total"] == 0:
             conn.execute("UPDATE archives SET status = 'idle' WHERE id = ?", (aid,))
@@ -345,6 +453,11 @@ def init_db():
             conn.execute("UPDATE archives SET status = 'partial' WHERE id = ?", (aid,))
         else:
             conn.execute("UPDATE archives SET status = 'idle' WHERE id = ?", (aid,))
+
+    # Reset scan queue entries stuck from a crash
+    conn.execute("UPDATE scan_queue SET status = 'pending' WHERE status = 'running'")
+    # Reset processing queue entries stuck from a crash
+    conn.execute("UPDATE processing_queue SET status = 'pending' WHERE status = 'running'")
 
     # Reset interrupted processing jobs back to pending so the worker picks them up.
     # Jobs stuck in 'running' mean the server crashed mid-processing.
@@ -419,19 +532,20 @@ def add_archive_files(archive_id, files):
     with _db() as conn:
         conn.execute("BEGIN IMMEDIATE")
         try:
-            # Start priority after existing files (atomic within transaction)
-            max_pri = conn.execute(
-                "SELECT COALESCE(MAX(download_priority), -1) FROM archive_files WHERE archive_id = ?",
-                (archive_id,),
+            # Get global max queue_position for new files that will be queued
+            max_pos = conn.execute(
+                "SELECT COALESCE(MAX(queue_position), 0) FROM archive_files WHERE queue_position IS NOT NULL"
             ).fetchone()[0]
             for i, f in enumerate(files):
+                new_pos = max_pos + 1 + i
                 conn.execute(
                     """INSERT OR IGNORE INTO archive_files
-                       (archive_id, name, size, md5, sha1, format, source, mtime, queued, download_priority)
+                       (archive_id, name, size, md5, sha1, format, source, mtime,
+                        queued, queue_position)
                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)""",
                     (archive_id, f["name"], int(f.get("size", 0) or 0),
                      f.get("md5", ""), f.get("sha1", ""), f.get("format", ""),
-                     f.get("source", ""), f.get("mtime", ""), max_pri + 1 + i),
+                     f.get("source", ""), f.get("mtime", ""), new_pos),
                 )
             conn.commit()
         except Exception:
@@ -448,9 +562,9 @@ def _enrich_archives_with_progress(archives, conn):
     rows = conn.execute(f"""
         SELECT archive_id,
                SUM(CASE WHEN download_status = 'completed' THEN 1 ELSE 0 END) AS completed_files,
-               SUM(CASE WHEN queued = 1 OR download_status = 'completed' THEN 1 ELSE 0 END) AS selected_files,
-               SUM(CASE WHEN queued = 1 OR download_status = 'completed' THEN size ELSE 0 END) AS selected_size,
-               SUM(CASE WHEN queued = 1 OR download_status = 'completed' THEN downloaded_bytes ELSE 0 END) AS downloaded_bytes
+               SUM(CASE WHEN queue_position IS NOT NULL OR download_status = 'completed' THEN 1 ELSE 0 END) AS selected_files,
+               SUM(CASE WHEN queue_position IS NOT NULL OR download_status = 'completed' THEN size ELSE 0 END) AS selected_size,
+               SUM(CASE WHEN queue_position IS NOT NULL OR download_status = 'completed' THEN downloaded_bytes ELSE 0 END) AS downloaded_bytes
         FROM archive_files WHERE archive_id IN ({placeholders})
         GROUP BY archive_id
     """, ids).fetchall()
@@ -469,9 +583,9 @@ def get_archive_progress(archive_id):
     with _db() as conn:
         row = conn.execute("""
             SELECT SUM(CASE WHEN download_status = 'completed' THEN 1 ELSE 0 END) AS completed_files,
-                   SUM(CASE WHEN queued = 1 OR download_status = 'completed' THEN 1 ELSE 0 END) AS selected_files,
-                   SUM(CASE WHEN queued = 1 OR download_status = 'completed' THEN size ELSE 0 END) AS selected_size,
-                   SUM(CASE WHEN queued = 1 OR download_status = 'completed' THEN downloaded_bytes ELSE 0 END) AS downloaded_bytes
+                   SUM(CASE WHEN queue_position IS NOT NULL OR download_status = 'completed' THEN 1 ELSE 0 END) AS selected_files,
+                   SUM(CASE WHEN queue_position IS NOT NULL OR download_status = 'completed' THEN size ELSE 0 END) AS selected_size,
+                   SUM(CASE WHEN queue_position IS NOT NULL OR download_status = 'completed' THEN downloaded_bytes ELSE 0 END) AS downloaded_bytes
             FROM archive_files WHERE archive_id = ?
         """, (archive_id,)).fetchone()
         if row:
@@ -559,7 +673,7 @@ def recompute_archive_status(archive_id, fallback=None):
                 SUM(CASE WHEN download_status = 'failed' THEN 1 ELSE 0 END) as failed,
                 SUM(CASE WHEN download_status = 'conflict' THEN 1 ELSE 0 END) as conflict
             FROM archive_files
-            WHERE archive_id = ? AND (queued = 1 OR download_status IN ('completed', 'conflict'))
+            WHERE archive_id = ? AND (queue_position IS NOT NULL OR download_status IN ('completed', 'conflict'))
         """, (archive_id,)).fetchone()
         if row["total"] == 0:
             status = "idle"
@@ -602,18 +716,18 @@ _FILE_SORT_MAP = {
     "size": ("size", "DESC"),
     "modified": ("mtime", "DESC"),
     "status": ("download_status", "ASC"),
-    "priority": ("download_priority", "ASC"),
+    "queue_position": ("queue_position", "ASC"),
 }
 
 # Effective status mirrors the JS formatFileStatus logic:
-# processing_status takes priority, then queued+download_status determines "skipped"
+# processing_status takes priority, then queue_position+download_status determines "skipped"
 _EFFECTIVE_STATUS_EXPR = """CASE
     WHEN processing_status = 'processed' THEN 'processed'
     WHEN processing_status = 'processing' THEN 'processing'
     WHEN processing_status = 'queued' THEN 'proc_queued'
     WHEN processing_status = 'failed' THEN 'proc_failed'
     WHEN processing_status = 'skipped' THEN 'proc_skipped'
-    WHEN queued = 0 AND download_status = 'pending' THEN 'skipped'
+    WHEN queue_position IS NULL AND download_status = 'pending' THEN 'skipped'
     ELSE download_status
 END"""
 
@@ -622,8 +736,9 @@ def get_archive_files(archive_id, sort="name", sort_dir=None, search=""):
     with _db() as conn:
         col, default_dir = _FILE_SORT_MAP.get(sort, _FILE_SORT_MAP["name"])
         direction = sort_dir.upper() if sort_dir in ("asc", "desc") else default_dir
-        if sort == "priority":
-            order = f"queued DESC, download_priority {direction}"
+        if sort == "queue_position":
+            # Read-only queue position sort: queued files first by position, then unqueued
+            order = f"(queue_position IS NULL) ASC, queue_position {direction}, name ASC"
         elif sort == "status":
             order = f"({_EFFECTIVE_STATUS_EXPR}) {direction}, name ASC"
         else:
@@ -643,82 +758,114 @@ def get_archive_files(archive_id, sort="name", sort_dir=None, search=""):
         return [dict(r) for r in rows], total
 
 
-def reorder_archive_files(file_ids):
-    """Reorder files so their download_priority values match the given ID order.
-
-    Reads the current priorities of the supplied files, sorts those priority
-    slots, then assigns them back in the new order.  Files NOT in the list
-    keep their priorities untouched, so pagination is safe.
-    """
-    if not file_ids:
-        return
-    with _db() as conn:
-        placeholders = ",".join("?" * len(file_ids))
-        rows = conn.execute(
-            f"SELECT id, download_priority FROM archive_files WHERE id IN ({placeholders})",
-            file_ids,
-        ).fetchall()
-        # Map id -> current priority
-        pri_map = {r["id"]: r["download_priority"] for r in rows}
-        # Collect the priority slots in their current sorted order
-        slots = sorted(pri_map[fid] for fid in file_ids if fid in pri_map)
-        # Assign slots in the new order
-        for slot, fid in zip(slots, file_ids):
-            if fid in pri_map:
-                conn.execute("UPDATE archive_files SET download_priority = ? WHERE id = ?", (slot, fid))
-        conn.commit()
-
-
-def reset_file_priorities(archive_id):
-    """Reset download_priority for all files in an archive to alphabetical name order."""
-    with _db() as conn:
-        conn.execute("""
-            UPDATE archive_files SET download_priority = (
-                SELECT COUNT(*) FROM archive_files af2
-                WHERE af2.archive_id = archive_files.archive_id
-                  AND af2.name < archive_files.name
-            ) WHERE archive_id = ?
-        """, (archive_id,))
-        conn.commit()
-
-
 def count_unqueued_files(archive_id):
     with _db() as conn:
         count = conn.execute(
-            "SELECT COUNT(*) FROM archive_files WHERE archive_id = ? AND queued = 0",
+            "SELECT COUNT(*) FROM archive_files WHERE archive_id = ? AND queue_position IS NULL",
             (archive_id,),
         ).fetchone()[0]
         return count
 
 
 def set_file_queued(file_id, queued):
+    """Legacy compat wrapper. Use set_file_queue_position / clear_file_queue_position."""
+    if queued:
+        set_file_queue_position(file_id)
+    else:
+        clear_file_queue_position(file_id)
+
+
+def set_file_queue_position(file_id, batch_id=None):
+    """Add a file to the download queue at the end (MAX + 1)."""
     with _db() as conn:
-        if queued:
-            # Only queue files that still need downloading
-            conn.execute(
-                """UPDATE archive_files SET queued = 1
-                   WHERE id = ? AND download_status NOT IN ('completed', 'conflict')
-                     AND processing_status NOT IN ('queued', 'processing', 'processed')""",
-                (file_id,),
-            )
-        else:
-            conn.execute("UPDATE archive_files SET queued = 0 WHERE id = ?", (file_id,))
+        # Only queue files that still need downloading
+        max_pos = conn.execute(
+            "SELECT COALESCE(MAX(queue_position), 0) FROM archive_files WHERE queue_position IS NOT NULL"
+        ).fetchone()[0]
+        updates = ["queue_position = ?", "queued = 1"]
+        params = [max_pos + 1]
+        if batch_id is not None:
+            updates.append("download_batch_id = ?")
+            params.append(batch_id)
+        params.append(file_id)
+        conn.execute(
+            f"""UPDATE archive_files SET {', '.join(updates)}
+               WHERE id = ? AND download_status NOT IN ('completed', 'conflict')
+                 AND processing_status NOT IN ('queued', 'processing', 'processed')""",
+            params,
+        )
         conn.commit()
 
 
-def set_all_files_queued(archive_id, queued):
+def clear_file_queue_position(file_id):
+    """Remove a file from the download queue."""
+    with _db() as conn:
+        # Get the batch_id before clearing, so we can decrement the batch
+        row = conn.execute(
+            "SELECT download_batch_id FROM archive_files WHERE id = ?", (file_id,)
+        ).fetchone()
+        conn.execute(
+            "UPDATE archive_files SET queue_position = NULL, queued = 0, download_batch_id = NULL WHERE id = ?",
+            (file_id,),
+        )
+        # Decrement the batch file_count if this file was part of a batch
+        if row and row["download_batch_id"]:
+            conn.execute(
+                "UPDATE batches SET file_count = MAX(file_count - 1, 0) WHERE id = ?",
+                (row["download_batch_id"],),
+            )
+        conn.commit()
+
+
+def set_all_files_queued(archive_id, queued, batch_id=None):
+    """Batch-add or remove all files in an archive from the download queue.
+    Returns (added_count, skipped_count) when queuing."""
     with _db() as conn:
         if queued:
-            # Only queue files that still need downloading
+            # Get current max position
+            max_pos = conn.execute(
+                "SELECT COALESCE(MAX(queue_position), 0) FROM archive_files WHERE queue_position IS NOT NULL"
+            ).fetchone()[0]
+            # Find eligible files (not already queued, not completed, not processing)
+            eligible = conn.execute(
+                """SELECT id FROM archive_files
+                   WHERE archive_id = ? AND queue_position IS NULL
+                     AND download_status NOT IN ('completed', 'conflict')
+                     AND processing_status NOT IN ('queued', 'processing', 'processed')
+                   ORDER BY name ASC""",
+                (archive_id,),
+            ).fetchall()
+            added = 0
+            for row in eligible:
+                max_pos += 1
+                updates = ["queue_position = ?", "queued = 1"]
+                params = [max_pos]
+                if batch_id is not None:
+                    updates.append("download_batch_id = ?")
+                    params.append(batch_id)
+                params.append(row["id"])
+                conn.execute(
+                    f"UPDATE archive_files SET {', '.join(updates)} WHERE id = ?",
+                    params,
+                )
+                added += 1
+            # Count how many were already queued or completed
+            already = conn.execute(
+                """SELECT COUNT(*) FROM archive_files
+                   WHERE archive_id = ? AND (queue_position IS NOT NULL
+                     OR download_status IN ('completed', 'conflict')
+                     OR processing_status IN ('queued', 'processing', 'processed'))""",
+                (archive_id,),
+            ).fetchone()[0]
+            conn.commit()
+            return added, already
+        else:
             conn.execute(
-                """UPDATE archive_files SET queued = 1
-                   WHERE archive_id = ? AND download_status NOT IN ('completed', 'conflict')
-                     AND processing_status NOT IN ('queued', 'processing', 'processed')""",
+                "UPDATE archive_files SET queue_position = NULL, queued = 0, download_batch_id = NULL WHERE archive_id = ?",
                 (archive_id,),
             )
-        else:
-            conn.execute("UPDATE archive_files SET queued = 0 WHERE archive_id = ?", (archive_id,))
-        conn.commit()
+            conn.commit()
+            return 0, 0
 
 
 def set_file_download_status(file_id, status, downloaded_bytes=None, error_message=None):
@@ -734,8 +881,32 @@ def set_file_download_status(file_id, status, downloaded_bytes=None, error_messa
         # Dequeue files that have reached a terminal state
         if status in ("completed", "conflict"):
             updates.append("queued = 0")
+            updates.append("queue_position = NULL")
+            updates.append("download_batch_id = NULL")
+        # Set downloaded flag when completed
+        if status == "completed":
+            updates.append("downloaded = 1")
         params.append(file_id)
         conn.execute(f"UPDATE archive_files SET {', '.join(updates)} WHERE id = ?", params)
+        # If completed, increment batch completed_count
+        if status == "completed":
+            row = conn.execute(
+                "SELECT download_batch_id FROM archive_files WHERE id = ?", (file_id,)
+            ).fetchone()
+            if row and row["download_batch_id"]:
+                conn.execute(
+                    "UPDATE batches SET completed_count = completed_count + 1 WHERE id = ?",
+                    (row["download_batch_id"],),
+                )
+                # Check if batch is now complete
+                batch = conn.execute(
+                    "SELECT * FROM batches WHERE id = ?", (row["download_batch_id"],)
+                ).fetchone()
+                if batch and batch["completed_count"] >= batch["file_count"]:
+                    conn.execute(
+                        "UPDATE batches SET status = 'completed' WHERE id = ?",
+                        (row["download_batch_id"],),
+                    )
         conn.commit()
 
 
@@ -746,46 +917,38 @@ def increment_file_retry(file_id):
 
 
 def get_next_download_file():
-    """Get the next file to download: from the highest-priority enabled archive, first pending file,
-    then failed files that haven't exhausted retries."""
-    with _db() as conn:
-        max_retries = int(get_setting("max_retries") or 3)
-        row = conn.execute("""
-            SELECT af.*, a.identifier, a.server, a.dir, a.id as archive_id
-            FROM archive_files af
-            JOIN archives a ON af.archive_id = a.id
-            WHERE a.download_enabled = 1
-              AND af.queued = 1
-              AND (af.download_status = 'pending'
-                   OR (af.download_status = 'failed' AND af.retry_count < ?))
-            ORDER BY a.position ASC,
-                     CASE af.download_status WHEN 'pending' THEN 0 ELSE 1 END,
-                     af.download_priority ASC
-            LIMIT 1
-        """, (max_retries,)).fetchone()
-        return dict(row) if row else None
+    """Get the next file to download, ordered by queue_position.
+    Acquires the download queue lock to prevent races with compaction."""
+    with _download_queue_lock:
+        with _db() as conn:
+            max_retries = int(get_setting("max_retries") or 3)
+            row = conn.execute("""
+                SELECT af.*, a.identifier, a.server, a.dir, a.id as archive_id
+                FROM archive_files af
+                JOIN archives a ON af.archive_id = a.id
+                WHERE a.download_enabled = 1
+                  AND af.queue_position IS NOT NULL
+                  AND (af.download_status = 'pending'
+                       OR (af.download_status = 'failed' AND af.retry_count < ?))
+                ORDER BY af.queue_position ASC
+                LIMIT 1
+            """, (max_retries,)).fetchone()
+            return dict(row) if row else None
 
 
 def get_download_queue(limit=200):
-    """Get the ordered download queue: files that are pending or retryable, in download order."""
+    """Get the ordered download queue: files in queue_position order."""
     with _db() as conn:
         max_retries = int(get_setting("max_retries") or 3)
         rows = conn.execute("""
             SELECT af.id, af.name, af.size, af.download_status, af.downloaded_bytes,
-                   af.download_priority, a.id as archive_id, a.identifier, a.title
+                   af.queue_position, af.downloaded, a.id as archive_id, a.identifier, a.title
             FROM archive_files af
             JOIN archives a ON af.archive_id = a.id
-            WHERE a.download_enabled = 1
-              AND af.queued = 1
+            WHERE af.queue_position IS NOT NULL
               AND (af.download_status IN ('pending', 'downloading')
                    OR (af.download_status = 'failed' AND af.retry_count < ?))
-            ORDER BY a.position ASC,
-                     CASE af.download_status
-                         WHEN 'downloading' THEN 0
-                         WHEN 'pending' THEN 1
-                         ELSE 2
-                     END,
-                     af.download_priority ASC
+            ORDER BY af.queue_position ASC
             LIMIT ?
         """, (max_retries, limit)).fetchall()
         return [dict(r) for r in rows]
@@ -794,7 +957,6 @@ def get_download_queue(limit=200):
 def get_download_progress():
     """Get overall download progress stats."""
     with _db() as conn:
-        stats = {}
         row = conn.execute("""
             SELECT
                 COUNT(*) as total_files,
@@ -806,7 +968,7 @@ def get_download_progress():
                 SUM(downloaded_bytes) as downloaded_bytes
             FROM archive_files af
             JOIN archives a ON af.archive_id = a.id
-            WHERE a.download_enabled = 1 AND (af.queued = 1 OR af.download_status = 'completed')
+            WHERE a.download_enabled = 1 AND (af.queue_position IS NOT NULL OR af.download_status = 'completed')
         """).fetchone()
         if row:
             return dict(row)
@@ -985,16 +1147,23 @@ def refresh_archive_metadata(archive_id, new_files_list):
                     summary["unchanged"] += 1
 
         # Check for new files not in existing
+        # Get current max queue_position for newly queued files
+        max_pos = conn.execute(
+            "SELECT COALESCE(MAX(queue_position), 0) FROM archive_files WHERE queue_position IS NOT NULL"
+        ).fetchone()[0]
+        new_pos_offset = 0
         for name, new_f in incoming.items():
             if name not in existing:
+                new_pos_offset += 1
                 conn.execute(
                     """INSERT INTO archive_files
                        (archive_id, name, size, md5, sha1, format, source, mtime,
-                        queued, change_status, change_detail)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 'new', 'Newly added to Internet Archive since last check')""",
+                        queued, queue_position, change_status, change_detail)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, 'new', 'Newly added to Internet Archive since last check')""",
                     (archive_id, name, int(new_f.get("size", 0) or 0),
                      new_f.get("md5", ""), new_f.get("sha1", ""), new_f.get("format", ""),
-                     new_f.get("source", ""), new_f.get("mtime", "")),
+                     new_f.get("source", ""), new_f.get("mtime", ""),
+                     max_pos + new_pos_offset),
                 )
                 summary["new"] += 1
 
@@ -1308,7 +1477,7 @@ def get_processable_files(archive_id, processor_types=None):
                WHERE archive_id = ? AND download_status = 'completed'
                  AND processing_status IN ('', 'failed')
                  AND origin = 'manifest'
-               ORDER BY download_priority ASC""",
+               ORDER BY name ASC""",
             (archive_id,),
         ).fetchall()
         return [dict(r) for r in rows]
@@ -1874,3 +2043,514 @@ def get_collection_layouts(collection_id):
             (collection_id,),
         ).fetchall()
         return [dict(r) for r in rows]
+
+
+# ── Queue Overhaul: Batches ──────────────────────────────────────────
+
+def create_batch(queue_type, file_count=0, archive_id=None):
+    """Create a generic batch record for notification tracking. Returns batch ID."""
+    with _db() as conn:
+        conn.execute(
+            "INSERT INTO batches (queue_type, archive_id, created_at, file_count, status) VALUES (?, ?, ?, ?, 'pending')",
+            (queue_type, archive_id, time.time(), file_count),
+        )
+        batch_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        conn.commit()
+        return batch_id
+
+
+def get_batch(batch_id):
+    """Return a single batch record."""
+    with _db() as conn:
+        row = conn.execute("SELECT * FROM batches WHERE id = ?", (batch_id,)).fetchone()
+        return dict(row) if row else None
+
+
+def update_batch(batch_id, **kwargs):
+    """Update batch fields. Accepted: file_count, completed_count, status."""
+    allowed = {"file_count", "completed_count", "status"}
+    updates = {k: v for k, v in kwargs.items() if k in allowed}
+    if not updates:
+        return
+    set_clause = ", ".join(f"{k} = ?" for k in updates)
+    values = list(updates.values()) + [batch_id]
+    with _db() as conn:
+        conn.execute(f"UPDATE batches SET {set_clause} WHERE id = ?", values)
+        conn.commit()
+
+
+# ── Queue Overhaul: Compaction ───────────────────────────────────────
+
+def compact_download_queue():
+    """Renumber all queue_positions as contiguous 1, 2, 3, ...
+    Acquires the download queue lock to prevent workers from picking stale positions."""
+    with _download_queue_lock:
+        with _db() as conn:
+            conn.execute("""
+                UPDATE archive_files SET queue_position = (
+                    SELECT rn FROM (
+                        SELECT id, ROW_NUMBER() OVER (ORDER BY queue_position) AS rn
+                        FROM archive_files WHERE queue_position IS NOT NULL
+                    ) AS t WHERE t.id = archive_files.id
+                ) WHERE queue_position IS NOT NULL
+            """)
+            conn.commit()
+
+
+def compact_processing_queue():
+    """Renumber all processing_queue positions as contiguous 1, 2, 3, ..."""
+    with _processing_queue_lock:
+        with _db() as conn:
+            conn.execute("""
+                UPDATE processing_queue SET position = (
+                    SELECT rn FROM (
+                        SELECT id, ROW_NUMBER() OVER (ORDER BY position) AS rn
+                        FROM processing_queue WHERE status = 'pending'
+                    ) AS t WHERE t.id = processing_queue.id
+                ) WHERE status = 'pending'
+            """)
+            conn.commit()
+
+
+def compact_scan_queue():
+    """Renumber all scan_queue positions as contiguous 1, 2, 3, ..."""
+    with _scan_queue_lock:
+        with _db() as conn:
+            conn.execute("""
+                UPDATE scan_queue SET position = (
+                    SELECT rn FROM (
+                        SELECT id, ROW_NUMBER() OVER (ORDER BY position) AS rn
+                        FROM scan_queue WHERE status = 'pending'
+                    ) AS t WHERE t.id = scan_queue.id
+                ) WHERE status = 'pending'
+            """)
+            conn.commit()
+
+
+# ── Queue Overhaul: Download Queue Reordering ────────────────────────
+
+def reorder_download_queue(file_id, new_position):
+    """Move a file to a new queue_position, shifting others as needed."""
+    with _download_queue_lock:
+        with _db() as conn:
+            # Get current position
+            row = conn.execute(
+                "SELECT queue_position FROM archive_files WHERE id = ? AND queue_position IS NOT NULL",
+                (file_id,),
+            ).fetchone()
+            if not row:
+                return
+            old_pos = row["queue_position"]
+            if old_pos == new_position:
+                return
+            if new_position < old_pos:
+                # Moving up: shift items in [new_pos, old_pos) down by 1
+                conn.execute(
+                    """UPDATE archive_files SET queue_position = queue_position + 1
+                       WHERE queue_position >= ? AND queue_position < ? AND queue_position IS NOT NULL""",
+                    (new_position, old_pos),
+                )
+            else:
+                # Moving down: shift items in (old_pos, new_pos] up by 1
+                conn.execute(
+                    """UPDATE archive_files SET queue_position = queue_position - 1
+                       WHERE queue_position > ? AND queue_position <= ? AND queue_position IS NOT NULL""",
+                    (old_pos, new_position),
+                )
+            conn.execute(
+                "UPDATE archive_files SET queue_position = ? WHERE id = ?",
+                (new_position, file_id),
+            )
+            conn.commit()
+
+
+# ── Queue Overhaul: Processing Queue ─────────────────────────────────
+
+def add_processing_queue_entry(job_id, file_id, archive_id, profile_id, options_json=None):
+    """Add a file-level entry to the processing queue at the end."""
+    with _db() as conn:
+        max_pos = conn.execute(
+            "SELECT COALESCE(MAX(position), 0) FROM processing_queue WHERE status = 'pending'"
+        ).fetchone()[0]
+        now = time.time()
+        conn.execute(
+            """INSERT INTO processing_queue
+               (job_id, file_id, archive_id, profile_id, options_json, status, position, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?)""",
+            (job_id, file_id, archive_id, profile_id,
+             json.dumps(options_json) if options_json else None,
+             max_pos + 1, now, now),
+        )
+        conn.commit()
+
+
+def add_processing_queue_entries_batch(job_id, entries):
+    """Batch-add multiple processing queue entries.
+    entries is a list of (file_id, archive_id, profile_id, options_json) tuples."""
+    with _db() as conn:
+        max_pos = conn.execute(
+            "SELECT COALESCE(MAX(position), 0) FROM processing_queue WHERE status = 'pending'"
+        ).fetchone()[0]
+        now = time.time()
+        for i, (file_id, archive_id, profile_id, options_json) in enumerate(entries):
+            conn.execute(
+                """INSERT INTO processing_queue
+                   (job_id, file_id, archive_id, profile_id, options_json, status, position, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?)""",
+                (job_id, file_id, archive_id, profile_id,
+                 json.dumps(options_json) if options_json else None,
+                 max_pos + 1 + i, now, now),
+            )
+        conn.commit()
+
+
+def get_next_processing_queue_entry():
+    """Get the next pending processing queue entry, ordered by position.
+    Acquires the processing queue lock."""
+    with _processing_queue_lock:
+        with _db() as conn:
+            row = conn.execute(
+                "SELECT * FROM processing_queue WHERE status = 'pending' ORDER BY position ASC LIMIT 1"
+            ).fetchone()
+            return dict(row) if row else None
+
+
+def claim_processing_queue_entry(entry_id):
+    """Atomically claim a pending processing queue entry."""
+    with _db() as conn:
+        conn.execute(
+            "UPDATE processing_queue SET status = 'running', updated_at = ? WHERE id = ? AND status = 'pending'",
+            (time.time(), entry_id),
+        )
+        changed = conn.execute("SELECT changes()").fetchone()[0]
+        conn.commit()
+        return changed > 0
+
+
+def complete_processing_queue_entry(entry_id, error_message=None):
+    """Mark a processing queue entry as completed or failed."""
+    status = "failed" if error_message else "completed"
+    with _db() as conn:
+        conn.execute(
+            "UPDATE processing_queue SET status = ?, error_message = ?, updated_at = ? WHERE id = ?",
+            (status, error_message or "", time.time(), entry_id),
+        )
+        conn.commit()
+
+
+def cancel_processing_queue_entry(entry_id):
+    """Cancel a single processing queue entry."""
+    with _db() as conn:
+        conn.execute(
+            "UPDATE processing_queue SET status = 'cancelled', updated_at = ? WHERE id = ? AND status IN ('pending', 'running')",
+            (time.time(), entry_id),
+        )
+        conn.commit()
+
+
+def cancel_all_pending_processing():
+    """Cancel all pending processing queue entries. Returns count cancelled."""
+    with _db() as conn:
+        conn.execute(
+            "UPDATE processing_queue SET status = 'cancelled', updated_at = ? WHERE status = 'pending'",
+            (time.time(),),
+        )
+        count = conn.execute("SELECT changes()").fetchone()[0]
+        conn.commit()
+        return count
+
+
+def get_processing_queue(limit=200):
+    """Get the processing queue entries in position order."""
+    with _db() as conn:
+        rows = conn.execute("""
+            SELECT pq.*, af.name as file_name, af.size as file_size, af.downloaded,
+                   a.identifier as archive_identifier, a.title as archive_title,
+                   pp.name as profile_name
+            FROM processing_queue pq
+            JOIN archive_files af ON pq.file_id = af.id
+            JOIN archives a ON pq.archive_id = a.id
+            LEFT JOIN processing_profiles pp ON pq.profile_id = pp.id
+            WHERE pq.status IN ('pending', 'running')
+            ORDER BY pq.position ASC
+            LIMIT ?
+        """, (limit,)).fetchall()
+        return [dict(r) for r in rows]
+
+
+def reorder_processing_queue(entry_id, new_position):
+    """Move a processing queue entry to a new position."""
+    with _processing_queue_lock:
+        with _db() as conn:
+            row = conn.execute(
+                "SELECT position FROM processing_queue WHERE id = ? AND status = 'pending'",
+                (entry_id,),
+            ).fetchone()
+            if not row:
+                return
+            old_pos = row["position"]
+            if old_pos == new_position:
+                return
+            if new_position < old_pos:
+                conn.execute(
+                    """UPDATE processing_queue SET position = position + 1
+                       WHERE position >= ? AND position < ? AND status = 'pending'""",
+                    (new_position, old_pos),
+                )
+            else:
+                conn.execute(
+                    """UPDATE processing_queue SET position = position - 1
+                       WHERE position > ? AND position <= ? AND status = 'pending'""",
+                    (old_pos, new_position),
+                )
+            conn.execute(
+                "UPDATE processing_queue SET position = ?, updated_at = ? WHERE id = ?",
+                (new_position, time.time(), entry_id),
+            )
+            conn.commit()
+
+
+# ── Queue Overhaul: Scan Queue ───────────────────────────────────────
+
+def add_scan_queue_entry(file_id, archive_id, batch_id=None, priority=False):
+    """Add a file to the scan queue. If priority=True, insert at position 0."""
+    with _db() as conn:
+        if priority:
+            position = 0
+            # Shift existing entries down
+            conn.execute(
+                "UPDATE scan_queue SET position = position + 1 WHERE status = 'pending'"
+            )
+        else:
+            max_pos = conn.execute(
+                "SELECT COALESCE(MAX(position), 0) FROM scan_queue WHERE status = 'pending'"
+            ).fetchone()[0]
+            position = max_pos + 1
+        conn.execute(
+            "INSERT INTO scan_queue (file_id, archive_id, batch_id, status, position, created_at) VALUES (?, ?, ?, 'pending', ?, ?)",
+            (file_id, archive_id, batch_id, position, time.time()),
+        )
+        # Set file status to scan_pending
+        conn.execute(
+            "UPDATE archive_files SET download_status = 'scan_pending' WHERE id = ? AND download_status NOT IN ('downloading',)",
+            (file_id,),
+        )
+        conn.commit()
+
+
+def add_scan_queue_entries_batch(archive_id, file_ids, batch_id=None):
+    """Batch-add files to the scan queue at the end. Returns count added."""
+    with _db() as conn:
+        max_pos = conn.execute(
+            "SELECT COALESCE(MAX(position), 0) FROM scan_queue WHERE status = 'pending'"
+        ).fetchone()[0]
+        now = time.time()
+        for i, file_id in enumerate(file_ids):
+            conn.execute(
+                "INSERT INTO scan_queue (file_id, archive_id, batch_id, status, position, created_at) VALUES (?, ?, ?, 'pending', ?, ?)",
+                (file_id, archive_id, batch_id, max_pos + 1 + i, now),
+            )
+        # Batch-update file statuses
+        if file_ids:
+            placeholders = ",".join("?" * len(file_ids))
+            conn.execute(
+                f"UPDATE archive_files SET download_status = 'scan_pending' WHERE id IN ({placeholders}) AND download_status NOT IN ('downloading',)",
+                file_ids,
+            )
+        conn.commit()
+        return len(file_ids)
+
+
+def get_next_scan_queue_entry():
+    """Get the next pending scan queue entry, respecting archive non-interleaving.
+    Priority rescans (position 0) are exempt from grouping.
+    Acquires the scan queue lock."""
+    with _scan_queue_lock:
+        with _db() as conn:
+            # First check for priority rescans (position 0)
+            row = conn.execute(
+                "SELECT * FROM scan_queue WHERE status = 'pending' AND position = 0 ORDER BY id ASC LIMIT 1"
+            ).fetchone()
+            if row:
+                return dict(row)
+
+            # Check if there's a currently running scan — prefer same archive
+            running = conn.execute(
+                "SELECT archive_id FROM scan_queue WHERE status = 'running' LIMIT 1"
+            ).fetchone()
+            if running:
+                # Continue with same archive
+                row = conn.execute(
+                    "SELECT * FROM scan_queue WHERE status = 'pending' AND archive_id = ? ORDER BY position ASC LIMIT 1",
+                    (running["archive_id"],),
+                ).fetchone()
+                if row:
+                    return dict(row)
+
+            # No running scan or no more entries for current archive — pick next archive
+            row = conn.execute(
+                "SELECT * FROM scan_queue WHERE status = 'pending' ORDER BY position ASC LIMIT 1"
+            ).fetchone()
+            return dict(row) if row else None
+
+
+def claim_scan_queue_entry(entry_id):
+    """Atomically claim a pending scan queue entry."""
+    with _db() as conn:
+        conn.execute(
+            "UPDATE scan_queue SET status = 'running' WHERE id = ? AND status = 'pending'",
+            (entry_id,),
+        )
+        changed = conn.execute("SELECT changes()").fetchone()[0]
+        conn.commit()
+        return changed > 0
+
+
+def complete_scan_queue_entry(entry_id, error_message=None):
+    """Mark a scan queue entry as completed or failed."""
+    status = "failed" if error_message else "completed"
+    with _db() as conn:
+        conn.execute(
+            "UPDATE scan_queue SET status = ? WHERE id = ?",
+            (status, entry_id),
+        )
+        conn.commit()
+
+
+def cancel_all_pending_scans():
+    """Cancel all pending scan queue entries. Returns count cancelled."""
+    with _db() as conn:
+        conn.execute("UPDATE scan_queue SET status = 'cancelled' WHERE status = 'pending'")
+        count = conn.execute("SELECT changes()").fetchone()[0]
+        conn.commit()
+        return count
+
+
+def get_scan_queue(limit=200):
+    """Get the scan queue entries in position order."""
+    with _db() as conn:
+        rows = conn.execute("""
+            SELECT sq.*, af.name as file_name, af.size as file_size, af.downloaded,
+                   a.identifier as archive_identifier, a.title as archive_title
+            FROM scan_queue sq
+            JOIN archive_files af ON sq.file_id = af.id
+            JOIN archives a ON sq.archive_id = a.id
+            WHERE sq.status IN ('pending', 'running')
+            ORDER BY sq.position ASC
+            LIMIT ?
+        """, (limit,)).fetchall()
+        return [dict(r) for r in rows]
+
+
+def reorder_scan_queue(entry_id, new_position):
+    """Move a scan queue entry to a new position."""
+    with _scan_queue_lock:
+        with _db() as conn:
+            row = conn.execute(
+                "SELECT position FROM scan_queue WHERE id = ? AND status = 'pending'",
+                (entry_id,),
+            ).fetchone()
+            if not row:
+                return
+            old_pos = row["position"]
+            if old_pos == new_position:
+                return
+            if new_position < old_pos:
+                conn.execute(
+                    """UPDATE scan_queue SET position = position + 1
+                       WHERE position >= ? AND position < ? AND status = 'pending'""",
+                    (new_position, old_pos),
+                )
+            else:
+                conn.execute(
+                    """UPDATE scan_queue SET position = position - 1
+                       WHERE position > ? AND position <= ? AND status = 'pending'""",
+                    (old_pos, new_position),
+                )
+            conn.execute(
+                "UPDATE scan_queue SET position = ? WHERE id = ?",
+                (new_position, entry_id),
+            )
+            conn.commit()
+
+
+def is_archive_scan_complete(archive_id):
+    """Check if all scan queue entries for an archive are done (none pending/running)."""
+    with _db() as conn:
+        count = conn.execute(
+            "SELECT COUNT(*) FROM scan_queue WHERE archive_id = ? AND status IN ('pending', 'running')",
+            (archive_id,),
+        ).fetchone()[0]
+        return count == 0
+
+
+def count_pending_scan_entries(archive_id):
+    """Count pending scan queue entries for an archive."""
+    with _db() as conn:
+        return conn.execute(
+            "SELECT COUNT(*) FROM scan_queue WHERE archive_id = ? AND status = 'pending'",
+            (archive_id,),
+        ).fetchone()[0]
+
+
+def clear_completed_scan_entries(archive_id=None):
+    """Remove completed/failed/cancelled scan queue entries. If archive_id given, only that archive."""
+    with _db() as conn:
+        if archive_id:
+            conn.execute(
+                "DELETE FROM scan_queue WHERE archive_id = ? AND status IN ('completed', 'failed', 'cancelled')",
+                (archive_id,),
+            )
+        else:
+            conn.execute("DELETE FROM scan_queue WHERE status IN ('completed', 'failed', 'cancelled')")
+        conn.commit()
+
+
+# ── Queue Overhaul: Queue Counts ─────────────────────────────────────
+
+def get_queue_counts():
+    """Return total queue counts across all three queue types for the topbar badge."""
+    with _db() as conn:
+        download = conn.execute(
+            "SELECT COUNT(*) FROM archive_files WHERE queue_position IS NOT NULL"
+        ).fetchone()[0]
+        processing = conn.execute(
+            "SELECT COUNT(*) FROM processing_queue WHERE status IN ('pending', 'running')"
+        ).fetchone()[0]
+        scan = conn.execute(
+            "SELECT COUNT(*) FROM scan_queue WHERE status IN ('pending', 'running')"
+        ).fetchone()[0]
+        return {"download": download, "processing": processing, "scan": scan}
+
+
+# ── Queue Overhaul: Download State Persistence ───────────────────────
+
+def get_download_state():
+    """Return the persisted download state ('stopped', 'paused', or 'running')."""
+    return get_setting("download_state", "stopped")
+
+
+def set_download_state(state):
+    """Persist the download state."""
+    assert state in ("stopped", "paused", "running"), f"Invalid download state: {state}"
+    set_setting("download_state", state)
+
+
+def is_processing_paused():
+    """Check if processing is paused."""
+    return get_setting("processing_paused", "0") == "1"
+
+
+def set_processing_paused(paused):
+    """Set the processing pause state."""
+    set_setting("processing_paused", "1" if paused else "0")
+
+
+def is_scan_paused():
+    """Check if scanning is paused."""
+    return get_setting("scan_paused", "0") == "1"
+
+
+def set_scan_paused(paused):
+    """Set the scan pause state."""
+    set_setting("scan_paused", "1" if paused else "0")

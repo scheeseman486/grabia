@@ -247,19 +247,6 @@ body {
     transition: border-color 0.15s, color 0.15s;
     overflow: hidden;
 }
-.queue-status-dot {
-    position: relative;
-    z-index: 1;
-    width: 8px;
-    height: 8px;
-    border-radius: 50%;
-    flex-shrink: 0;
-    background: var(--text-muted);
-    transition: background 0.2s, box-shadow 0.2s;
-}
-.queue-display.state-running .queue-status-dot { background: var(--success); box-shadow: 0 0 6px var(--success); }
-.queue-display.state-paused .queue-status-dot { background: var(--warning); }
-.queue-display.state-stopped .queue-status-dot { background: var(--text-muted); }
 .queue-display-fill {
     position: absolute;
     top: 0;
@@ -2829,3 +2816,166 @@ tr.processed-detail-row td { padding: 0 !important; }
 }
 
 .activity-empty { color: var(--text-dim); text-align: center; padding: 40px; }
+
+/* ── Queue Page ──────────────────────────────────────────────────── */
+
+.queue-tabs {
+    display: flex;
+    gap: 0;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 12px;
+    padding: 0 16px;
+}
+.queue-tab {
+    background: none;
+    border: none;
+    color: var(--text-dim);
+    padding: 10px 16px;
+    font-size: 13px;
+    cursor: pointer;
+    border-bottom: 2px solid transparent;
+    transition: color 0.15s, border-color 0.15s;
+}
+.queue-tab:hover { color: var(--text); }
+.queue-tab.active {
+    color: var(--accent);
+    border-bottom-color: var(--accent);
+    font-weight: 600;
+}
+.queue-tab-badge {
+    font-size: 11px;
+    color: var(--text-muted);
+    margin-left: 4px;
+}
+.queue-tab-badge:empty { display: none; }
+
+.queue-panel { display: none; padding: 0 16px; }
+.queue-panel.active { display: block; }
+
+.queue-controls {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 12px;
+    padding: 8px 0;
+}
+.queue-progress-text {
+    font-size: 12px;
+    color: var(--text-dim);
+    margin-left: 8px;
+}
+
+.queue-empty {
+    color: var(--text-dim);
+    text-align: center;
+    padding: 40px;
+    font-size: 13px;
+}
+
+/* Queue badge on topbar button */
+.queue-badge {
+    position: absolute;
+    top: 2px;
+    right: 2px;
+    background: var(--accent);
+    color: #fff;
+    border-radius: 8px;
+    font-size: 10px;
+    min-width: 16px;
+    height: 16px;
+    line-height: 16px;
+    text-align: center;
+    padding: 0 4px;
+}
+#btn-queues { position: relative; }
+
+/* Bold filename for downloaded files */
+.file-name-downloaded { font-weight: 600; }
+
+/* Activity ongoing summary (Phase 2) */
+.activity-ongoing {
+    margin-bottom: 12px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--card-bg);
+    overflow: hidden;
+}
+.activity-ongoing-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 14px;
+    cursor: pointer;
+    transition: background 0.15s;
+    border-bottom: 1px solid var(--border);
+    font-size: 13px;
+}
+.activity-ongoing-row:last-child { border-bottom: none; }
+.activity-ongoing-row:hover { background: var(--hover); }
+.activity-ongoing-label {
+    font-weight: 600;
+    min-width: 80px;
+    white-space: nowrap;
+}
+.activity-ongoing-detail {
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--text-dim);
+}
+.activity-ongoing-badge {
+    background: var(--accent);
+    color: #fff;
+    border-radius: 8px;
+    font-size: 10px;
+    min-width: 18px;
+    height: 18px;
+    line-height: 18px;
+    text-align: center;
+    padding: 0 5px;
+    font-weight: 600;
+}
+/* Queue display badge (topbar) */
+.queue-display-badge {
+    background: var(--accent);
+    color: #fff;
+    border-radius: 8px;
+    font-size: 10px;
+    min-width: 16px;
+    height: 16px;
+    line-height: 16px;
+    text-align: center;
+    padding: 0 4px;
+    margin-left: 4px;
+    font-weight: 600;
+}
+
+/* "+N active" cycling indicator */
+.queue-display-cycle {
+    position: relative;
+    z-index: 1;
+    font-size: 10px;
+    color: var(--accent);
+    margin-left: 6px;
+    cursor: pointer;
+    font-weight: 600;
+    opacity: 0.85;
+    transition: opacity 0.15s;
+    white-space: nowrap;
+}
+.queue-display-cycle:hover { opacity: 1; }
+
+.activity-ongoing-empty {
+    color: var(--text-dim);
+    text-align: center;
+    padding: 16px;
+    font-size: 13px;
+}
+
+/* Queue completing items: 3-second grey-out before removal */
+.queue-completing {
+    opacity: 0.4;
+    pointer-events: none;
+    transition: opacity 0.3s;
+}

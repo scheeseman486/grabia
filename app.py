@@ -481,388 +481,389 @@ def refresh_archive(archive_id):
     return jsonify({"ok": True, "summary": summary})
 
 
-# --- Scan Queue ---
+# --- Scan Queue (DB-backed) ---
 
-_scan_queue = queue.Queue()
 _scan_cancel = {}  # archive_id -> threading.Event
 _scan_lock = threading.Lock()
-
+_scan_wake = threading.Event()  # signalled when new entries are added
 
 _scan_conn = threading.local()  # holds the raw scan DB connection for cleanup
 
+# Track the current archive-level scan context so we know when an archive group starts/ends
+_scan_current_archive = {"id": None, "act_job_id": None, "notif_id": None, "summary": None, "total": 0, "processed": 0}
+
+
+def wake_scan_worker():
+    """Signal the scan worker that new entries are available."""
+    _scan_wake.set()
+
+
 def _scan_worker():
-    """Background worker that processes scan jobs sequentially."""
+    """Background worker that processes scan queue entries from the DB."""
     while True:
-        archive_id = _scan_queue.get()
-        _scan_conn.conn = None
+        # Check pause state
+        if db.get_setting("scan_paused", "0") == "1":
+            _scan_wake.wait(timeout=2.0)
+            _scan_wake.clear()
+            continue
+
+        entry = db.get_next_scan_queue_entry()
+        if not entry:
+            _scan_wake.wait(timeout=2.0)
+            _scan_wake.clear()
+            continue
+
+        if not db.claim_scan_queue_entry(entry["id"]):
+            continue  # someone else claimed it
+
+        archive_id = entry["archive_id"]
+        is_priority = entry["position"] == 0
+
         try:
-            _run_scan(archive_id)
+            if is_priority:
+                _run_single_file_scan(entry)
+            else:
+                _run_archive_scan_entry(entry)
         except Exception as e:
-            # Update notification with error
-            scan_notif = db.find_notification_by_scan(archive_id)
-            if scan_notif:
-                db.update_notification(scan_notif["id"], message=f'Scan failed: {e}', type="error", progress=None)
-                broadcast_sse("notification_updated", db.get_notification(scan_notif["id"]))
-            # Try to find and close the activity job for this scan
-            try:
-                with db._db() as conn:
-                    row = conn.execute(
-                        "SELECT id FROM activity_jobs WHERE category = 'scan' AND archive_id = ? AND status = 'running' ORDER BY id DESC LIMIT 1",
-                        (archive_id,),
-                    ).fetchone()
-                    if row:
-                        activity.log(row["id"], "error", f"Scan crashed: {e}",
-                                     archive_id=archive_id, detail=str(e))
-                        activity.flush()
-                        activity.finish_job(row["id"], "failed", summary=str(e))
-            except Exception:
-                pass
-            broadcast_sse("scan_progress", {
-                "archive_id": archive_id, "phase": "error",
-                "error": str(e),
-            })
-        finally:
-            # Ensure the raw scan DB connection is always closed
-            try:
-                if _scan_conn.conn is not None:
-                    _scan_conn.conn.close()
-                    _scan_conn.conn = None
-            except Exception:
-                pass
-            with _scan_lock:
-                _scan_cancel.pop(archive_id, None)
-            _scan_queue.task_done()
+            db.complete_scan_queue_entry(entry["id"], error_message=str(e))
+            log.error("scan", "Scan entry %d failed: %s", entry["id"], e)
+            # If this was part of an archive group, check if group is done
+            if not is_priority and _scan_current_archive["id"] == archive_id:
+                if db.is_archive_scan_complete(archive_id):
+                    _finish_archive_scan(archive_id)
 
 
 _scan_thread = threading.Thread(target=_scan_worker, daemon=True)
 _scan_thread.start()
 
 
-def _run_scan(archive_id):
-    """Execute the actual scan logic in a background thread."""
-    log.info("scan", "Starting scan for archive %d", archive_id)
-    cancel_evt = _scan_cancel.get(archive_id)
-    archive = db.get_archive(archive_id)
-    if not archive:
-        log.warning("scan", "Archive %d not found, aborting scan", archive_id)
+def _run_single_file_scan(entry):
+    """Process a priority single-file rescan (position 0). Runs standalone, not grouped."""
+    file_id = entry["file_id"]
+    archive_id = entry["archive_id"]
+    f = db.get_file(file_id)
+    if not f:
+        db.complete_scan_queue_entry(entry["id"], error_message="File not found")
         return
 
-    archive_name = archive["title"] or archive["identifier"]
-    group_id = archive.get("group_id")
-
-    # Create activity job for this scan
-    act_job_id = activity.start_job("scan", archive_id=archive_id, group_id=group_id)
-
-    # Create or find existing scan notification
-    scan_notif = db.find_notification_by_scan(archive_id)
-    if not scan_notif:
-        scan_notif_id = db.create_notification(
-            f'Scanning "{archive_name}": starting...',
-            type="info", progress=0, scan_archive_id=archive_id,
-            job_id=act_job_id,
-        )
-        broadcast_sse("notification_created", db.get_notification(scan_notif_id))
-    else:
-        scan_notif_id = scan_notif["id"]
-        # Link existing notification to the activity job
-        db.update_notification(scan_notif_id, job_id=act_job_id)
-
-    activity.update_job_notification(act_job_id, scan_notif_id)
-
-    # Read update rate from settings (milliseconds -> seconds)
-    update_rate = int(db.get_setting("sse_update_rate", "500")) / 1000.0
+    archive = db.get_archive(archive_id)
+    if not archive:
+        db.complete_scan_queue_entry(entry["id"], error_message="Archive not found")
+        return
 
     download_dir = db.get_setting("download_dir", os.path.expanduser("~/ia-downloads"))
     base_dir = os.path.realpath(os.path.join(download_dir, archive["identifier"]))
 
-    if not os.path.isdir(base_dir):
-        msg = f"Download folder not found: {base_dir}"
-        activity.log(act_job_id, "error", msg, archive_id=archive_id)
-        activity.flush()
-        activity.finish_job(act_job_id, "failed", summary="Folder not found")
-        db.update_notification(scan_notif_id, message=f'Scan "{archive_name}" failed: folder not found', type="error", progress=None)
-        broadcast_sse("notification_updated", db.get_notification(scan_notif_id))
-        broadcast_sse("scan_progress", {
-            "archive_id": archive_id, "phase": "error",
-            "error": msg,
-        })
-        return
+    result = _scan_single_file_on_disk(f, base_dir)
+    db.complete_scan_queue_entry(entry["id"])
+    db.recompute_archive_status(archive_id)
+    broadcast_sse("queue_update", {"queue_type": "scan", "action": "completed", "entry_id": entry["id"]})
 
-    def _cancelled():
-        return cancel_evt and cancel_evt.is_set()
 
-    def _abort():
-        activity.log(act_job_id, "warning", "Scan cancelled by user",
-                     archive_id=archive_id)
-        activity.flush()
-        activity.finish_job(act_job_id, "cancelled",
-                            summary=f"Cancelled at {processed}/{total_manifest}")
-        db.delete_notification(scan_notif_id)
-        broadcast_sse("notification_dismissed", {"id": scan_notif_id})
-        broadcast_sse("scan_progress", {"archive_id": archive_id, "phase": "cancelled", "current": processed, "total": total_manifest})
+def _scan_single_file_on_disk(f, base_dir):
+    """Check a single manifest file against disk. Updates DB. Returns result status string."""
+    file_id = f["id"]
+    name = f["name"]
+    local_path = os.path.realpath(os.path.join(base_dir, name))
+    if not local_path.startswith(base_dir + os.sep) and local_path != base_dir:
+        return "skipped"
 
-    # Time-based progress throttle
-    last_progress = [0.0]  # mutable for closure
-    last_notif_update = [0.0]
-
-    def _progress():
-        now = time.monotonic()
-        if now - last_progress[0] >= update_rate or processed == total_manifest:
-            broadcast_sse("scan_progress", {"archive_id": archive_id, "phase": "verify", "current": processed, "total": total_manifest})
-            last_progress[0] = now
-        # Update persistent notification less frequently (every 2s)
-        if now - last_notif_update[0] >= 2.0 or processed == total_manifest:
-            pct = int((processed / total_manifest) * 100) if total_manifest > 0 else 0
-            db.update_notification(scan_notif_id, message=f'Scanning "{archive_name}": {processed}/{total_manifest} ({pct}%)', progress=pct)
-            broadcast_sse("notification_updated", db.get_notification(scan_notif_id))
-            last_notif_update[0] = now
-
-    # Clean slate — use a raw connection for batched writes during the scan.
-    # Registered in _scan_conn so the worker's finally block can close it
-    # even if this function throws an unhandled exception.
-    conn = db.get_db()
-    _scan_conn.conn = conn
-    conn.execute(
-        "DELETE FROM archive_files WHERE archive_id = ? AND origin = 'scan'",
-        (archive_id,),
-    )
-    conn.execute(
-        "UPDATE archive_files SET download_status = 'pending', error_message = '' "
-        "WHERE archive_id = ? AND download_status IN ('conflict', 'unknown')",
-        (archive_id,),
-    )
-    conn.commit()
-
-    # Ground truth
-    rows = conn.execute(
-        "SELECT id, name, size, md5, download_status, processing_status, processed_filename FROM archive_files "
-        "WHERE archive_id = ? AND origin = 'manifest'",
-        (archive_id,),
-    ).fetchall()
-    manifest = {r["name"]: dict(r) for r in rows}
-    log.debug("scan", "Manifest has %d files for %s", len(manifest), archive["identifier"])
-
-    summary = {"matched": 0, "conflict": 0, "unknown": 0, "missing": 0, "partial": 0}
-
-    total_manifest = len(manifest)
-    processed = 0
-    # Batch DB writes: accumulate and commit periodically for live UI updates
-    BATCH_SIZE = 25
-    pending_writes = []
-
-    def _flush_writes():
-        """Commit accumulated DB writes and recompute archive status."""
-        if not pending_writes:
-            return
-        for sql, params in pending_writes:
-            conn.execute(sql, params)
-        conn.commit()
-        pending_writes.clear()
-        db.recompute_archive_status(archive_id)
-
-    activity.log(act_job_id, "info",
-                 f"Scan started: {total_manifest} manifest files to verify",
-                 archive_id=archive_id)
-    activity.flush()
-
-    broadcast_sse("scan_progress", {"archive_id": archive_id, "phase": "verify", "current": 0, "total": total_manifest})
-
-    for name, info in manifest.items():
-        if _cancelled():
-            _flush_writes()
-            _abort()
-            return
-
-        # Check if a previously processed file still exists on disk
-        if info.get("processing_status") == "processed":
-            pf = info.get("processed_filename", "")
-            pf_path = os.path.join(base_dir, pf) if pf else ""
-            # processed_filename can be a file or a directory (folder extraction)
-            if pf_path and (os.path.isfile(pf_path) or os.path.isdir(pf_path)):
-                log.debug("scan", "%s: processed output %s exists, matched", name, pf)
-                summary["matched"] += 1
-                processed += 1
-                _progress()
-                continue
-            # Processed output is gone — reset processing state
-            log.info("scan", "%s: processed output %s missing, resetting processing state", name, pf)
-            pending_writes.append((
+    # Check processed output first
+    if f.get("processing_status") == "processed":
+        pf = f.get("processed_filename", "")
+        pf_path = os.path.join(base_dir, pf) if pf else ""
+        if pf_path and (os.path.isfile(pf_path) or os.path.isdir(pf_path)):
+            return "matched"
+        # Processed output gone — reset
+        with db._db() as conn:
+            conn.execute(
                 "UPDATE archive_files SET processing_status = '', processed_filename = '', "
                 "processed_files_json = '', processor_type = '', processing_error = '' WHERE id = ?",
-                (info["id"],),
-            ))
+                (file_id,),
+            )
+            conn.commit()
 
-        local_path = os.path.realpath(os.path.join(base_dir, name))
-        if not local_path.startswith(base_dir + os.sep) and local_path != base_dir:
-            continue
+    if not os.path.isfile(local_path):
+        # Check for processed version (e.g., game.zip → game.chd)
+        base_no_ext = os.path.splitext(name)[0]
+        for proc_ext in (".chd", ".cso"):
+            proc_path = os.path.join(base_dir, base_no_ext + proc_ext)
+            if os.path.isfile(proc_path):
+                db.set_file_download_status(file_id, "completed", downloaded_bytes=os.path.getsize(proc_path))
+                return "matched"
+        db.set_file_download_status(file_id, "pending", downloaded_bytes=0)
+        return "missing"
 
-        if not os.path.isfile(local_path):
-            # Check if a processed version exists (e.g., game.zip → game.chd)
-            base_no_ext = os.path.splitext(name)[0]
-            found_processed = False
-            for proc_ext in (".chd", ".cso"):
-                proc_path = os.path.join(base_dir, base_no_ext + proc_ext)
-                if os.path.isfile(proc_path):
-                    proc_filename = base_no_ext + proc_ext
-                    pending_writes.append((
-                        "UPDATE archive_files SET download_status = 'completed', "
-                        "processing_status = 'processed', processed_filename = ?, "
-                        "downloaded_bytes = ? WHERE id = ?",
-                        (proc_filename, os.path.getsize(proc_path), info["id"]),
-                    ))
-                    summary["matched"] += 1
-                    found_processed = True
-                    break
-            if not found_processed:
-                pending_writes.append((
-                    "UPDATE archive_files SET download_status = 'pending', downloaded_bytes = 0 WHERE id = ?",
-                    (info["id"],),
-                ))
-                summary["missing"] += 1
-            processed += 1
-            if len(pending_writes) >= BATCH_SIZE:
-                _flush_writes()
-            _progress()
-            continue
+    local_size = os.path.getsize(local_path)
+    expected_size = f["size"]
+    expected_md5 = f["md5"]
 
-        local_size = os.path.getsize(local_path)
-        expected_size = info["size"]
-        expected_md5 = info["md5"]
+    if f["download_status"] == "completed":
+        return "matched"
 
-        if info["download_status"] == "completed":
-            summary["matched"] += 1
-            processed += 1
-            _progress()
-            continue
+    has_size = expected_size > 0
+    has_md5 = bool(expected_md5) and has_size
 
-        has_size = expected_size > 0
-        has_md5 = bool(expected_md5) and has_size
+    if not has_size and not has_md5:
+        db.set_file_download_status(file_id, "conflict",
+            error_message=f"Cannot verify: no size/hash in manifest (local file is {local_size} bytes)")
+        return "conflict"
 
-        if not has_size and not has_md5:
-            pending_writes.append((
-                "UPDATE archive_files SET download_status = 'conflict', error_message = ? WHERE id = ?",
-                (f"Cannot verify: no size/hash in manifest (local file is {local_size} bytes)", info["id"]),
-            ))
-            summary["conflict"] += 1
-            processed += 1
-            if len(pending_writes) >= BATCH_SIZE:
-                _flush_writes()
-            _progress()
-            continue
+    if has_size and local_size != expected_size:
+        if local_size < expected_size:
+            db.set_file_download_status(file_id, "pending", downloaded_bytes=local_size,
+                error_message="Partial download detected by scan")
+            if db.get_file(file_id).get("queue_position") is None:
+                db.set_file_queue_position(file_id)
+            return "partial"
+        else:
+            db.set_file_download_status(file_id, "conflict",
+                error_message=f"Size mismatch: local {local_size} vs expected {expected_size}")
+            return "conflict"
 
-        # Size check (fast)
-        if has_size and local_size != expected_size:
-            if local_size < expected_size:
-                pending_writes.append((
-                    "UPDATE archive_files SET download_status = 'pending', downloaded_bytes = ?, queued = 1, "
-                    "error_message = 'Partial download detected by scan' WHERE id = ?",
-                    (local_size, info["id"]),
-                ))
-                summary["partial"] += 1
-            else:
-                pending_writes.append((
-                    "UPDATE archive_files SET download_status = 'conflict', error_message = ? WHERE id = ?",
-                    (f"Size mismatch: local {local_size} vs expected {expected_size}", info["id"]),
-                ))
-                summary["conflict"] += 1
-            processed += 1
-            if len(pending_writes) >= BATCH_SIZE:
-                _flush_writes()
-            _progress()
-            continue
+    if has_md5:
+        md5 = hashlib.md5()
+        try:
+            with open(local_path, "rb") as fh:
+                for chunk in iter(lambda: fh.read(131072), b""):
+                    md5.update(chunk)
+            if md5.hexdigest() != expected_md5:
+                db.set_file_download_status(file_id, "conflict",
+                    error_message=f"MD5 mismatch: local {md5.hexdigest()} vs expected {expected_md5}")
+                return "conflict"
+        except OSError as e:
+            db.set_file_download_status(file_id, "conflict", error_message=f"Read error: {e}")
+            return "conflict"
 
-        # MD5 check — 128KB chunks for better HDD throughput
-        if has_md5:
-            md5 = hashlib.md5()
-            try:
-                with open(local_path, "rb") as f:
-                    for chunk in iter(lambda: f.read(131072), b""):
-                        if _cancelled():
-                            _flush_writes()
-                            _abort()
-                            return
-                        md5.update(chunk)
-                if md5.hexdigest() != expected_md5:
-                    pending_writes.append((
-                        "UPDATE archive_files SET download_status = 'conflict', error_message = ? WHERE id = ?",
-                        (f"MD5 mismatch: local {md5.hexdigest()} vs expected {expected_md5}", info["id"]),
-                    ))
-                    summary["conflict"] += 1
-                    processed += 1
-                    if len(pending_writes) >= BATCH_SIZE:
-                        _flush_writes()
-                    _progress()
-                    continue
-            except OSError as e:
-                pending_writes.append((
-                    "UPDATE archive_files SET download_status = 'conflict', error_message = ? WHERE id = ?",
-                    (f"Read error: {e}", info["id"]),
-                ))
-                summary["conflict"] += 1
-                processed += 1
-                if len(pending_writes) >= BATCH_SIZE:
-                    _flush_writes()
-                _progress()
-                continue
+    db.set_file_download_status(file_id, "completed", downloaded_bytes=local_size)
+    return "matched"
 
-        pending_writes.append((
-            "UPDATE archive_files SET download_status = 'completed', downloaded_bytes = ? WHERE id = ?",
-            (local_size, info["id"]),
-        ))
-        summary["matched"] += 1
-        processed += 1
-        if len(pending_writes) >= BATCH_SIZE:
-            _flush_writes()
-        _progress()
 
-    # Flush any remaining writes from verification phase
-    _flush_writes()
+def _start_archive_scan(archive_id):
+    """Initialize tracking for a new archive scan group."""
+    ctx = _scan_current_archive
+    archive = db.get_archive(archive_id)
+    if not archive:
+        return False
+
+    archive_name = archive["title"] or archive["identifier"]
+    group_id = archive.get("group_id")
+
+    # Create activity job
+    act_job_id = activity.start_job("scan", archive_id=archive_id, group_id=group_id)
+
+    # Create or find notification
+    scan_notif = db.find_notification_by_scan(archive_id)
+    if not scan_notif:
+        notif_id = db.create_notification(
+            f'Scanning "{archive_name}": starting...',
+            type="info", progress=0, scan_archive_id=archive_id,
+            job_id=act_job_id,
+        )
+        broadcast_sse("notification_created", db.get_notification(notif_id))
+    else:
+        notif_id = scan_notif["id"]
+        db.update_notification(notif_id, job_id=act_job_id)
+
+    activity.update_job_notification(act_job_id, notif_id)
+
+    # Clean slate for this archive — remove old scan-origin files, reset conflicts
+    with db._db() as conn:
+        conn.execute(
+            "DELETE FROM archive_files WHERE archive_id = ? AND origin = 'scan'",
+            (archive_id,),
+        )
+        conn.execute(
+            "UPDATE archive_files SET download_status = 'pending', error_message = '' "
+            "WHERE archive_id = ? AND download_status IN ('conflict', 'unknown')",
+            (archive_id,),
+        )
+        conn.commit()
+
+    # Count total entries for this archive in the queue
+    total = db.count_pending_scan_entries(archive_id) + 1  # +1 for the one already claimed
+
+    ctx["id"] = archive_id
+    ctx["act_job_id"] = act_job_id
+    ctx["notif_id"] = notif_id
+    ctx["summary"] = {"matched": 0, "conflict": 0, "unknown": 0, "missing": 0, "partial": 0}
+    ctx["total"] = total
+    ctx["processed"] = 0
+    ctx["last_progress"] = 0.0
+    ctx["last_notif"] = 0.0
+
+    activity.log(act_job_id, "info",
+                 f"Scan started: {total} manifest files to verify",
+                 archive_id=archive_id)
+    activity.flush()
+    broadcast_sse("scan_progress", {"archive_id": archive_id, "phase": "verify", "current": 0, "total": total})
+    return True
+
+
+def _run_archive_scan_entry(entry):
+    """Process one scan queue entry as part of an archive group."""
+    ctx = _scan_current_archive
+    archive_id = entry["archive_id"]
+    file_id = entry["file_id"]
+
+    # Check cancellation
+    cancel_evt = _scan_cancel.get(archive_id)
+    if cancel_evt and cancel_evt.is_set():
+        db.complete_scan_queue_entry(entry["id"], error_message="Cancelled")
+        return
+
+    # Start new archive group if needed
+    if ctx["id"] != archive_id:
+        # Finish previous archive if any
+        if ctx["id"] is not None:
+            _finish_archive_scan(ctx["id"])
+        if not _start_archive_scan(archive_id):
+            db.complete_scan_queue_entry(entry["id"], error_message="Archive not found")
+            return
+
+    archive = db.get_archive(archive_id)
+    if not archive:
+        db.complete_scan_queue_entry(entry["id"], error_message="Archive not found")
+        return
+
+    download_dir = db.get_setting("download_dir", os.path.expanduser("~/ia-downloads"))
+    base_dir = os.path.realpath(os.path.join(download_dir, archive["identifier"]))
+
+    f = db.get_file(file_id)
+    if not f:
+        db.complete_scan_queue_entry(entry["id"], error_message="File not found")
+        ctx["processed"] += 1
+        _update_scan_progress(archive_id)
+        if db.is_archive_scan_complete(archive_id):
+            _finish_archive_scan(archive_id)
+        return
+
+    result = _scan_single_file_on_disk(f, base_dir)
+
+    # Update summary
+    if result in ctx["summary"]:
+        ctx["summary"][result] += 1
+    elif result == "matched":
+        ctx["summary"]["matched"] += 1
+
+    ctx["processed"] += 1
+    db.complete_scan_queue_entry(entry["id"])
+
+    _update_scan_progress(archive_id)
+
+    # Check if this archive group is done
+    if db.is_archive_scan_complete(archive_id):
+        _finish_archive_scan(archive_id)
+
+
+def _update_scan_progress(archive_id):
+    """Send throttled progress updates for the current archive scan."""
+    ctx = _scan_current_archive
+    if ctx["id"] != archive_id:
+        return
+    update_rate = int(db.get_setting("sse_update_rate", "500")) / 1000.0
+    now = time.monotonic()
+    done = ctx["processed"] == ctx["total"]
+
+    if now - ctx["last_progress"] >= update_rate or done:
+        broadcast_sse("scan_progress", {
+            "archive_id": archive_id, "phase": "verify",
+            "current": ctx["processed"], "total": ctx["total"],
+        })
+        ctx["last_progress"] = now
+
+    if now - ctx["last_notif"] >= 2.0 or done:
+        archive = db.get_archive(archive_id)
+        archive_name = (archive["title"] or archive["identifier"]) if archive else str(archive_id)
+        pct = int((ctx["processed"] / ctx["total"]) * 100) if ctx["total"] > 0 else 0
+        db.update_notification(ctx["notif_id"],
+            message=f'Scanning "{archive_name}": {ctx["processed"]}/{ctx["total"]} ({pct}%)',
+            progress=pct)
+        broadcast_sse("notification_updated", db.get_notification(ctx["notif_id"]))
+        ctx["last_notif"] = now
+
+
+def _finish_archive_scan(archive_id):
+    """Complete an archive scan group: unknown file discovery, summary, cleanup."""
+    ctx = _scan_current_archive
+    if ctx["id"] != archive_id:
+        return
+
+    act_job_id = ctx["act_job_id"]
+    notif_id = ctx["notif_id"]
+    summary = ctx["summary"]
+
+    archive = db.get_archive(archive_id)
+    if not archive:
+        ctx["id"] = None
+        return
+
+    archive_name = archive["title"] or archive["identifier"]
+    download_dir = db.get_setting("download_dir", os.path.expanduser("~/ia-downloads"))
+    base_dir = os.path.realpath(os.path.join(download_dir, archive["identifier"]))
+
+    # Check cancellation
+    cancel_evt = _scan_cancel.get(archive_id)
+    if cancel_evt and cancel_evt.is_set():
+        activity.log(act_job_id, "warning", "Scan cancelled by user", archive_id=archive_id)
+        activity.flush()
+        activity.finish_job(act_job_id, "cancelled",
+                            summary=f"Cancelled at {ctx['processed']}/{ctx['total']}")
+        db.delete_notification(notif_id)
+        broadcast_sse("notification_dismissed", {"id": notif_id})
+        broadcast_sse("scan_progress", {"archive_id": archive_id, "phase": "cancelled",
+                                        "current": ctx["processed"], "total": ctx["total"]})
+        with _scan_lock:
+            _scan_cancel.pop(archive_id, None)
+        ctx["id"] = None
+        db.clear_completed_scan_entries(archive_id)
+        return
 
     # Scan for unknown files on disk
-    db.update_notification(scan_notif_id, message=f'Scanning "{archive_name}": checking for unknown files...', progress=-1)
-    broadcast_sse("notification_updated", db.get_notification(scan_notif_id))
-    broadcast_sse("scan_progress", {"archive_id": archive_id, "phase": "disk", "current": 0, "total": 0})
+    if os.path.isdir(base_dir):
+        db.update_notification(notif_id,
+            message=f'Scanning "{archive_name}": checking for unknown files...', progress=-1)
+        broadcast_sse("notification_updated", db.get_notification(notif_id))
+        broadcast_sse("scan_progress", {"archive_id": archive_id, "phase": "disk", "current": 0, "total": 0})
 
-    # Build a set of known processed filenames so we don't flag them as unknown
-    processed_names = db.get_all_processed_files(archive_id)
+        # Build manifest and processed name sets
+        with db._db() as conn:
+            manifest_names = {r["name"] for r in conn.execute(
+                "SELECT name FROM archive_files WHERE archive_id = ? AND origin = 'manifest'",
+                (archive_id,),
+            ).fetchall()}
 
-    unknown_files = []
-    for root, _dirs, files in os.walk(base_dir):
-        if _cancelled():
-            _abort()
-            return
-        for fname in files:
-            full = os.path.join(root, fname)
-            rel = os.path.relpath(full, base_dir)
-            if rel not in manifest and rel not in processed_names:
-                unknown_files.append(rel)
-                summary["unknown"] += 1
+        processed_names = db.get_all_processed_files(archive_id)
 
-    # Insert unknown files
-    max_pri = conn.execute(
-        "SELECT COALESCE(MAX(download_priority), -1) FROM archive_files WHERE archive_id = ?",
-        (archive_id,),
-    ).fetchone()[0]
-    for i, rel_name in enumerate(unknown_files):
-        local_path = os.path.join(base_dir, rel_name)
-        local_size = 0
-        try:
-            local_size = os.path.getsize(local_path)
-        except OSError:
-            pass
-        conn.execute(
-            """INSERT OR IGNORE INTO archive_files
-               (archive_id, name, size, md5, sha1, format, source, mtime,
-                queued, download_status, downloaded_bytes, error_message, download_priority, origin)
-               VALUES (?, ?, ?, '', '', '', '', '', 0, 'unknown', ?, 'File found on disk but not in archive manifest', ?, 'scan')""",
-            (archive_id, rel_name, local_size, local_size, max_pri + 1 + i),
-        )
+        unknown_files = []
+        for root, _dirs, files in os.walk(base_dir):
+            if cancel_evt and cancel_evt.is_set():
+                break
+            for fname in files:
+                full = os.path.join(root, fname)
+                rel = os.path.relpath(full, base_dir)
+                if rel not in manifest_names and rel not in processed_names:
+                    unknown_files.append(rel)
+                    summary["unknown"] += 1
 
-    conn.commit()
-    # conn is closed by _scan_worker's finally block via _scan_conn
-
-    if unknown_files:
-        log.debug("scan", "%d unknown files found on disk", len(unknown_files))
+        if unknown_files:
+            with db._db() as conn:
+                for rel_name in unknown_files:
+                    local_path = os.path.join(base_dir, rel_name)
+                    local_size = 0
+                    try:
+                        local_size = os.path.getsize(local_path)
+                    except OSError:
+                        pass
+                    conn.execute(
+                        """INSERT OR IGNORE INTO archive_files
+                           (archive_id, name, size, md5, sha1, format, source, mtime,
+                            queued, download_status, downloaded_bytes, error_message, origin)
+                           VALUES (?, ?, ?, '', '', '', '', '', 0, 'unknown', ?, 'File found on disk but not in archive manifest', 'scan')""",
+                        (archive_id, rel_name, local_size, local_size),
+                    )
+                conn.commit()
+            log.debug("scan", "%d unknown files found on disk", len(unknown_files))
 
     db.recompute_archive_file_count(archive_id)
     db.recompute_archive_status(archive_id)
@@ -883,25 +884,20 @@ def _run_scan(archive_id):
         parts.append(f'{summary["missing"]} not on disk')
     result_msg = ", ".join(parts) if parts else "no files found on disk"
     ntype = "success" if summary["conflict"] == 0 and summary["missing"] == 0 else "warning"
-    db.update_notification(scan_notif_id, message=f'Scan "{archive_name}": {result_msg}', type=ntype, progress=None)
-    broadcast_sse("notification_updated", db.get_notification(scan_notif_id))
+    db.update_notification(notif_id, message=f'Scan "{archive_name}": {result_msg}', type=ntype, progress=None)
+    broadcast_sse("notification_updated", db.get_notification(notif_id))
 
-    # Log scan summary to activity log
     if summary["conflict"] > 0:
-        activity.log(act_job_id, "warning",
-                     f'{summary["conflict"]} file(s) have conflicts',
+        activity.log(act_job_id, "warning", f'{summary["conflict"]} file(s) have conflicts',
                      archive_id=archive_id)
     if summary["missing"] > 0:
-        activity.log(act_job_id, "warning",
-                     f'{summary["missing"]} file(s) not found on disk',
+        activity.log(act_job_id, "warning", f'{summary["missing"]} file(s) not found on disk',
                      archive_id=archive_id)
     if summary["partial"] > 0:
-        activity.log(act_job_id, "info",
-                     f'{summary["partial"]} partial download(s) re-queued',
+        activity.log(act_job_id, "info", f'{summary["partial"]} partial download(s) re-queued',
                      archive_id=archive_id)
     if summary["unknown"] > 0:
-        activity.log(act_job_id, "info",
-                     f'{summary["unknown"]} unknown file(s) found on disk',
+        activity.log(act_job_id, "info", f'{summary["unknown"]} unknown file(s) found on disk',
                      archive_id=archive_id)
 
     activity.log(act_job_id, "success" if ntype == "success" else "warning",
@@ -911,10 +907,16 @@ def _run_scan(archive_id):
 
     broadcast_sse("scan_progress", {
         "archive_id": archive_id, "phase": "done",
-        "current": total_manifest, "total": total_manifest,
+        "current": ctx["total"], "total": ctx["total"],
         "summary": summary,
     })
     broadcast_sse("archive_updated", updated)
+
+    # Clean up
+    with _scan_lock:
+        _scan_cancel.pop(archive_id, None)
+    db.clear_completed_scan_entries(archive_id)
+    ctx["id"] = None
 
 
 @app.route("/api/archives/<int:archive_id>/scan", methods=["POST"])
@@ -936,18 +938,33 @@ def scan_existing_files(archive_id):
         evt = threading.Event()
         _scan_cancel[archive_id] = evt
 
-    pending = _scan_queue.qsize()
+    # Get all manifest files for this archive
+    with db._db() as conn:
+        file_ids = [r["id"] for r in conn.execute(
+            "SELECT id FROM archive_files WHERE archive_id = ? AND origin = 'manifest'",
+            (archive_id,),
+        ).fetchall()]
+
+    if not file_ids:
+        with _scan_lock:
+            _scan_cancel.pop(archive_id, None)
+        return jsonify({"error": "No manifest files to scan"}), 400
+
+    # Create batch and add entries to scan_queue
+    batch_id = db.create_batch("scan", archive_id=archive_id, file_count=len(file_ids))
+    db.add_scan_queue_entries_batch(archive_id, file_ids, batch_id=batch_id)
+
     archive_name = archive["title"] or archive["identifier"]
 
     # Create a persistent notification for the scan
     notif_id = db.create_notification(
-        f'Scanning "{archive_name}": queued...' if pending > 0 else f'Scanning "{archive_name}": starting...',
+        f'Scanning "{archive_name}": queued ({len(file_ids)} files)...',
         type="info", progress=-1, scan_archive_id=archive_id,
     )
     broadcast_sse("notification_created", db.get_notification(notif_id))
-
-    _scan_queue.put(archive_id)
-    return jsonify({"ok": True, "queued": pending > 0})
+    broadcast_sse("batch_added", {"queue_type": "scan", "count": len(file_ids), "archive_id": archive_id})
+    wake_scan_worker()
+    return jsonify({"ok": True, "queued": len(file_ids)})
 
 
 @app.route("/api/archives/<int:archive_id>/scan/cancel", methods=["POST"])
@@ -1081,8 +1098,22 @@ def toggle_file_select_compat(file_id):
 @login_required
 def queue_all_files(archive_id):
     data = request.json
-    db.set_all_files_queued(archive_id, data.get("queued", True))
-    return jsonify({"ok": True})
+    queued = data.get("queued", True)
+    if queued:
+        # Create a batch for notification tracking
+        batch_id = db.create_batch("download", archive_id=archive_id)
+        added, skipped = db.set_all_files_queued(archive_id, True, batch_id=batch_id)
+        # Update batch with actual file count
+        db.update_batch(batch_id, file_count=added)
+        if added > 0:
+            # Compact the queue after batch add
+            db.compact_download_queue()
+            # Broadcast batch_added SSE event
+            broadcast_sse("batch_added", {"queue_type": "download", "count": added, "batch_id": batch_id})
+        return jsonify({"ok": True, "added": added, "skipped": skipped, "batch_id": batch_id})
+    else:
+        db.set_all_files_queued(archive_id, False)
+        return jsonify({"ok": True})
 
 
 # Keep old endpoint as alias for backwards compatibility
@@ -1090,24 +1121,19 @@ def queue_all_files(archive_id):
 @login_required
 def select_all_files_compat(archive_id):
     data = request.json
-    db.set_all_files_queued(archive_id, data.get("queued", data.get("selected", True)))
-    return jsonify({"ok": True})
+    queued = data.get("queued", data.get("selected", True))
+    if queued:
+        batch_id = db.create_batch("download", archive_id=archive_id)
+        added, skipped = db.set_all_files_queued(archive_id, True, batch_id=batch_id)
+        db.update_batch(batch_id, file_count=added)
+        if added > 0:
+            db.compact_download_queue()
+            broadcast_sse("batch_added", {"queue_type": "download", "count": added, "batch_id": batch_id})
+        return jsonify({"ok": True, "added": added, "skipped": skipped})
+    else:
+        db.set_all_files_queued(archive_id, False)
+        return jsonify({"ok": True})
 
-
-@app.route("/api/archives/<int:archive_id>/files/reorder", methods=["POST"])
-@login_required
-def reorder_files(archive_id):
-    data = request.json
-    file_ids = data.get("order", [])
-    db.reorder_archive_files(file_ids)
-    return jsonify({"ok": True})
-
-
-@app.route("/api/archives/<int:archive_id>/files/reset-order", methods=["POST"])
-@login_required
-def reset_file_order(archive_id):
-    db.reset_file_priorities(archive_id)
-    return jsonify({"ok": True})
 
 
 @app.route("/api/files/<int:file_id>/rename", methods=["POST"])
@@ -1511,7 +1537,7 @@ def batch_retry_files(archive_id):
 @app.route("/api/files/<int:file_id>/scan", methods=["POST"])
 @login_required
 def scan_single_file(file_id):
-    """Re-scan a single file against what's on disk."""
+    """Queue a single file for priority rescan (position 0)."""
     f = db.get_file(file_id)
     if not f:
         return jsonify({"error": "File not found"}), 404
@@ -1520,60 +1546,10 @@ def scan_single_file(file_id):
     if not archive:
         return jsonify({"error": "Archive not found"}), 404
 
-    download_dir = db.get_setting("download_dir", os.path.expanduser("~/ia-downloads"))
-    base_dir = os.path.realpath(os.path.join(download_dir, archive["identifier"]))
-    local_path = os.path.realpath(os.path.join(base_dir, f["name"]))
-
-    if not local_path.startswith(base_dir + os.sep):
-        return jsonify({"error": "Invalid path"}), 400
-
-    result = {"status": "missing"}
-
-    if os.path.isfile(local_path):
-        local_size = os.path.getsize(local_path)
-        expected_size = f["size"]
-
-        if expected_size > 0 and local_size != expected_size:
-            if local_size < expected_size:
-                db.set_file_download_status(file_id, "pending", downloaded_bytes=local_size, error_message="Partial download detected by scan")
-                if not f["queued"]:
-                    db.set_file_queued(file_id, True)
-                result = {"status": "partial"}
-            else:
-                db.set_file_download_status(file_id, "conflict", error_message=f"Size mismatch: local {local_size} vs expected {expected_size}")
-                result = {"status": "conflict"}
-        else:
-            # MD5 check if available
-            if f["md5"]:
-                md5 = hashlib.md5()
-                with open(local_path, "rb") as fh:
-                    for chunk in iter(lambda: fh.read(8192), b""):
-                        md5.update(chunk)
-                if md5.hexdigest() != f["md5"]:
-                    db.set_file_download_status(file_id, "conflict", error_message=f"MD5 mismatch: local {md5.hexdigest()} vs expected {f['md5']}")
-                    result = {"status": "conflict"}
-                else:
-                    db.set_file_download_status(file_id, "completed", downloaded_bytes=local_size)
-                    result = {"status": "completed"}
-            else:
-                db.set_file_download_status(file_id, "completed", downloaded_bytes=local_size)
-                result = {"status": "completed"}
-    else:
-        # Check for processed version
-        base_no_ext = os.path.splitext(f["name"])[0]
-        for proc_ext in (".chd", ".cso"):
-            proc_path = os.path.join(base_dir, base_no_ext + proc_ext)
-            if os.path.isfile(proc_path):
-                db.set_file_download_status(file_id, "completed", downloaded_bytes=os.path.getsize(proc_path))
-                result = {"status": "completed"}
-                break
-        else:
-            db.set_file_download_status(file_id, "pending", downloaded_bytes=0)
-            result = {"status": "missing"}
-
-    result["name"] = f["name"]
-    db.recompute_archive_status(f["archive_id"])
-    return jsonify({"ok": True, **result})
+    db.add_scan_queue_entry(file_id, f["archive_id"], priority=True)
+    broadcast_sse("queue_update", {"queue_type": "scan", "action": "added", "file_id": file_id})
+    wake_scan_worker()
+    return jsonify({"ok": True, "queued": True, "name": f["name"]})
 
 
 @app.route("/api/archives/<int:archive_id>/retry", methods=["POST"])
@@ -1603,6 +1579,7 @@ def start_download():
     if not has_work:
         return jsonify({"state": download_manager.state, "has_work": False})
     download_manager.start()
+    db.set_download_state("running")
     return jsonify({"state": download_manager.state, "has_work": True})
 
 
@@ -1610,6 +1587,7 @@ def start_download():
 @login_required
 def pause_download():
     download_manager.pause()
+    db.set_download_state("paused")
     return jsonify({"state": download_manager.state})
 
 
@@ -1617,6 +1595,7 @@ def pause_download():
 @login_required
 def stop_download():
     download_manager.stop()
+    db.set_download_state("stopped")
     return jsonify({"state": download_manager.state})
 
 
@@ -1639,6 +1618,115 @@ def set_bandwidth():
     limit = int(data.get("limit", -1))  # -1 = unlimited, 0 = paused, >0 = throttle
     download_manager.bandwidth_limit = limit
     return jsonify({"bandwidth_limit": download_manager.bandwidth_limit})
+
+
+# --- Queue Overhaul API ---
+
+@app.route("/api/queues/counts", methods=["GET"])
+@login_required
+def queue_counts():
+    """Return total queue counts for the topbar badge (seeded on page load)."""
+    return jsonify(db.get_queue_counts())
+
+
+@app.route("/api/download/queue/reorder", methods=["POST"])
+@login_required
+def reorder_download_queue():
+    """Move a file to a new position in the download queue."""
+    data = request.json
+    file_id = data.get("file_id")
+    new_position = data.get("position")
+    if file_id is None or new_position is None:
+        return jsonify({"error": "file_id and position required"}), 400
+    db.reorder_download_queue(file_id, new_position)
+    broadcast_sse("queue_update", {"queue_type": "download", "action": "reordered", "file_ids": [file_id]})
+    return jsonify({"ok": True})
+
+
+@app.route("/api/processing/queue", methods=["GET"])
+@login_required
+def get_processing_queue_endpoint():
+    """Return the file-level processing queue."""
+    limit = request.args.get("limit", 200, type=int)
+    return jsonify(db.get_processing_queue(limit))
+
+
+@app.route("/api/processing/queue/reorder", methods=["POST"])
+@login_required
+def reorder_processing_queue():
+    data = request.json
+    entry_id = data.get("entry_id")
+    new_position = data.get("position")
+    if entry_id is None or new_position is None:
+        return jsonify({"error": "entry_id and position required"}), 400
+    db.reorder_processing_queue(entry_id, new_position)
+    broadcast_sse("queue_update", {"queue_type": "processing", "action": "reordered", "file_ids": [entry_id]})
+    return jsonify({"ok": True})
+
+
+@app.route("/api/processing/pause", methods=["POST"])
+@login_required
+def pause_processing():
+    data = request.json or {}
+    paused = data.get("paused", True)
+    db.set_processing_paused(paused)
+    broadcast_sse("queue_update", {"queue_type": "processing", "action": "status_changed",
+                                    "data": {"paused": paused}})
+    return jsonify({"ok": True, "paused": paused})
+
+
+@app.route("/api/processing/cancel", methods=["POST"])
+@login_required
+def cancel_all_processing():
+    """Cancel current processing and remove all pending entries."""
+    from processing_worker import cancel_current_processing
+    cancel_current_processing()
+    count = db.cancel_all_pending_processing()
+    broadcast_sse("queue_update", {"queue_type": "processing", "action": "removed",
+                                    "data": {"cancelled": count}})
+    return jsonify({"ok": True, "cancelled": count})
+
+
+@app.route("/api/scan/queue", methods=["GET"])
+@login_required
+def get_scan_queue_endpoint():
+    """Return the file-level scan queue."""
+    limit = request.args.get("limit", 200, type=int)
+    return jsonify(db.get_scan_queue(limit))
+
+
+@app.route("/api/scan/queue/reorder", methods=["POST"])
+@login_required
+def reorder_scan_queue():
+    data = request.json
+    entry_id = data.get("entry_id")
+    new_position = data.get("position")
+    if entry_id is None or new_position is None:
+        return jsonify({"error": "entry_id and position required"}), 400
+    db.reorder_scan_queue(entry_id, new_position)
+    broadcast_sse("queue_update", {"queue_type": "scan", "action": "reordered", "file_ids": [entry_id]})
+    return jsonify({"ok": True})
+
+
+@app.route("/api/scan/pause", methods=["POST"])
+@login_required
+def pause_scanning():
+    data = request.json or {}
+    paused = data.get("paused", True)
+    db.set_scan_paused(paused)
+    broadcast_sse("queue_update", {"queue_type": "scan", "action": "status_changed",
+                                    "data": {"paused": paused}})
+    return jsonify({"ok": True, "paused": paused})
+
+
+@app.route("/api/scan/cancel", methods=["POST"])
+@login_required
+def cancel_all_scans():
+    """Cancel all pending scan queue entries."""
+    count = db.cancel_all_pending_scans()
+    broadcast_sse("queue_update", {"queue_type": "scan", "action": "removed",
+                                    "data": {"cancelled": count}})
+    return jsonify({"ok": True, "cancelled": count})
 
 
 # --- Processing API ---
