@@ -898,9 +898,11 @@ def set_file_download_status(file_id, status, downloaded_bytes=None, error_messa
             updates.append("queued = 0")
             updates.append("queue_position = NULL")
             updates.append("download_batch_id = NULL")
-        # Set downloaded flag when completed
+        # Set downloaded flag: 1 when completed, 0 when reset to pending
         if status == "completed":
             updates.append("downloaded = 1")
+        elif status == "pending":
+            updates.append("downloaded = 0")
         params.append(file_id)
         conn.execute(f"UPDATE archive_files SET {', '.join(updates)} WHERE id = ?", params)
         # If completed, increment batch completed_count

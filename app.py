@@ -581,8 +581,18 @@ def _scan_single_file_on_disk(f, base_dir):
         pf = f.get("processed_filename", "")
         pf_path = os.path.join(base_dir, pf) if pf else ""
         if pf_path and (os.path.isfile(pf_path) or os.path.isdir(pf_path)):
+            # Processed output exists — check if original is still on disk
+            if not os.path.isfile(local_path):
+                # Original deleted but processed files remain → downloaded = 0
+                # This triggers strikethrough rendering in the UI
+                with db._db() as conn:
+                    conn.execute(
+                        "UPDATE archive_files SET downloaded = 0 WHERE id = ?",
+                        (file_id,),
+                    )
+                    conn.commit()
             return "matched"
-        # Processed output gone — reset
+        # Processed output gone — reset processing status
         with db._db() as conn:
             conn.execute(
                 "UPDATE archive_files SET processing_status = '', processed_filename = '', "
