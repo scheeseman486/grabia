@@ -2973,6 +2973,14 @@ tr.processed-detail-row td { padding: 0 !important; }
     font-size: 13px;
 }
 
+/* Pause button active state (paused — shows play icon) */
+.action-btn.active {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: #fff;
+}
+.action-btn.active:hover { background: var(--accent-hover); }
+
 /* Queue completing items: 3-second grey-out before removal */
 .queue-completing {
     opacity: 0.4;

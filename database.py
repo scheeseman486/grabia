@@ -943,8 +943,7 @@ def get_next_download_file():
                 SELECT af.*, a.identifier, a.server, a.dir, a.id as archive_id
                 FROM archive_files af
                 JOIN archives a ON af.archive_id = a.id
-                WHERE a.download_enabled = 1
-                  AND af.queue_position IS NOT NULL
+                WHERE af.queue_position IS NOT NULL
                   AND (af.download_status = 'pending'
                        OR (af.download_status = 'failed' AND af.retry_count < ?))
                 ORDER BY af.queue_position ASC
@@ -985,7 +984,7 @@ def get_download_progress():
                 SUM(downloaded_bytes) as downloaded_bytes
             FROM archive_files af
             JOIN archives a ON af.archive_id = a.id
-            WHERE a.download_enabled = 1 AND (af.queue_position IS NOT NULL OR af.download_status = 'completed')
+            WHERE af.queue_position IS NOT NULL OR af.download_status = 'completed'
         """).fetchone()
         if row:
             return dict(row)
@@ -2528,7 +2527,8 @@ def clear_completed_scan_entries(archive_id=None):
 # ── Queue Overhaul: Queue Counts ─────────────────────────────────────
 
 def get_queue_counts():
-    """Return total queue counts across all three queue types for the topbar badge."""
+    """Return total queue counts across all three queue types for the topbar badge,
+    plus pause states so the UI can seed button appearance."""
     with _db() as conn:
         download = conn.execute(
             "SELECT COUNT(*) FROM archive_files WHERE queue_position IS NOT NULL"
@@ -2539,7 +2539,13 @@ def get_queue_counts():
         scan = conn.execute(
             "SELECT COUNT(*) FROM scan_queue WHERE status IN ('pending', 'running')"
         ).fetchone()[0]
-        return {"download": download, "processing": processing, "scan": scan}
+        return {
+            "download": download,
+            "processing": processing,
+            "scan": scan,
+            "processing_paused": is_processing_paused(),
+            "scan_paused": get_setting("scan_paused", "0") == "1",
+        }
 
 
 # ── Queue Overhaul: Download State Persistence ───────────────────────

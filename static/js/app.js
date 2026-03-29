@@ -729,13 +729,23 @@
                 queueStale[queueType] = true;
                 if (isVisible) loadQueueTab(queueType);
             } else if (action === "status_changed") {
+                // Pause state change — update button appearance
+                if (data.paused !== undefined) {
+                    if (queueType === "processing") {
+                        db_processing_paused = data.paused;
+                        updatePauseButton("queue-proc-pause", data.paused);
+                    } else if (queueType === "scan") {
+                        db_scan_paused = data.paused;
+                        updatePauseButton("queue-scan-pause", data.paused);
+                    }
+                }
                 // Non-terminal status change — update in place
                 const entryId = data.entry_id || data.file_id;
                 if (entryId) {
                     const item = queueData[queueType].find(i => (i.id === entryId || i.file_id === entryId));
                     if (item && data.status) item.status = data.status;
                     if (isVisible) renderQueueTable(queueType);
-                } else {
+                } else if (data.paused === undefined) {
                     queueStale[queueType] = true;
                     if (isVisible) loadQueueTab(queueType);
                 }
@@ -3931,11 +3941,33 @@
         if (queueStale[tab]) loadQueueTab(tab);
     }
 
+    const PAUSE_ICON = '<svg viewBox="0 0 24 24" width="16" height="16"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z" fill="currentColor"/></svg>';
+    const PLAY_ICON = '<svg viewBox="0 0 24 24" width="16" height="16"><path d="M8 5v14l11-7z" fill="currentColor"/></svg>';
+
+    function updatePauseButton(btnId, paused) {
+        const btn = document.getElementById(btnId);
+        if (!btn) return;
+        btn.innerHTML = paused ? PLAY_ICON : PAUSE_ICON;
+        btn.title = paused
+            ? (btnId.includes("proc") ? "Resume processing" : "Resume scanning")
+            : (btnId.includes("proc") ? "Pause processing" : "Pause scanning");
+        btn.classList.toggle("active", paused);
+    }
+
     async function refreshQueueCounts() {
         try {
             const counts = await api("GET", "/api/queues/counts");
             queueCounts = counts;
             updateQueueBadges();
+            // Seed pause states from server
+            if (counts.processing_paused !== undefined) {
+                db_processing_paused = counts.processing_paused;
+                updatePauseButton("queue-proc-pause", db_processing_paused);
+            }
+            if (counts.scan_paused !== undefined) {
+                db_scan_paused = counts.scan_paused;
+                updatePauseButton("queue-scan-pause", db_scan_paused);
+            }
         } catch (e) { /* ignore */ }
     }
 
@@ -4099,6 +4131,7 @@
             const paused = !db_processing_paused;
             await api("POST", "/api/processing/pause", { paused });
             db_processing_paused = paused;
+            updatePauseButton("queue-proc-pause", paused);
         });
         $("#queue-proc-cancel").addEventListener("click", () => {
             confirmAction("confirm_cancel_processing", "Cancel Processing",
@@ -4127,6 +4160,7 @@
             const paused = !db_scan_paused;
             await api("POST", "/api/scan/pause", { paused });
             db_scan_paused = paused;
+            updatePauseButton("queue-scan-pause", paused);
         });
         $("#queue-scan-cancel").addEventListener("click", () => {
             confirmAction("confirm_cancel_scans", "Cancel Scans",
