@@ -5154,10 +5154,13 @@
             const aid = parseInt(btn.dataset.addArchive);
             try {
                 await api("POST", `/api/collections/${currentCollectionId}/archives`, { archive_id: aid });
+                const item = btn.closest(".add-archive-item");
                 btn.replaceWith(Object.assign(document.createElement("span"), { className: "add-archive-badge", textContent: "Added" }));
-                btn.closest(".add-archive-item").classList.add("in-collection");
+                if (item) item.classList.add("in-collection");
                 // Refresh detail in background
                 openCollectionDetail(currentCollectionId);
+                // Refresh archive sidebar collections if this archive is currently open
+                if (currentArchiveId === aid) loadArchiveTagsAndCollections(aid);
             } catch (e) {
                 alert(e.message);
             }
@@ -5174,6 +5177,7 @@
         try {
             await api("DELETE", `/api/collections/${currentCollectionId}/archives/${archiveId}`);
             openCollectionDetail(currentCollectionId);
+            if (currentArchiveId === archiveId) loadArchiveTagsAndCollections(archiveId);
         } catch (e) {
             alert(e.message);
         }
