@@ -487,6 +487,11 @@ main {
     flex-direction: column;
     height: 100%;
 }
+#page-queues.active {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+}
 
 /* ===== Empty State ===== */
 
@@ -2850,8 +2855,8 @@ tr.processed-detail-row td { padding: 0 !important; }
 }
 .queue-tab-badge:empty { display: none; }
 
-.queue-panel { display: none; padding: 0 16px; }
-.queue-panel.active { display: block; }
+.queue-panel { display: none; padding: 0 16px; flex-direction: column; flex: 1 1 0; min-height: 0; }
+.queue-panel.active { display: flex; }
 
 .queue-controls {
     display: flex;
@@ -2873,21 +2878,23 @@ tr.processed-detail-row td { padding: 0 !important; }
     font-size: 13px;
 }
 
-/* Queue badge on topbar button */
-.queue-badge {
-    position: absolute;
-    top: 2px;
-    right: 2px;
-    background: var(--accent);
-    color: #fff;
-    border-radius: 8px;
-    font-size: 10px;
-    min-width: 16px;
-    height: 16px;
-    line-height: 16px;
-    text-align: center;
-    padding: 0 4px;
+/* Queue-specific column sizing */
+.queue-file-table .col-archive-q {
+    width: 160px;
+    max-width: 160px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
 }
+.queue-file-table .col-profile-q {
+    width: 120px;
+    max-width: 120px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.queue-file-table .col-name { max-width: 1px; }
+
 #btn-queues { position: relative; }
 
 /* Bold filename for downloaded files */

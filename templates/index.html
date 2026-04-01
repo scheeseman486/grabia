@@ -72,14 +72,13 @@
                 <div class="speed-display" id="speed-display"></div>
             </div>
             <button id="btn-archives" class="action-btn" title="Archives">
-                <svg viewBox="0 0 24 24" width="18" height="18"><path d="M20 6h-8l-2-2H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2zm0 12H4V8h16v10z" fill="currentColor"/></svg>
+                <svg viewBox="0 0 24 24" width="18" height="18"><rect x="3" y="3" width="18" height="5" rx="1" fill="currentColor"/><rect x="3" y="10" width="18" height="5" rx="1" fill="currentColor"/><rect x="3" y="17" width="18" height="5" rx="1" fill="currentColor"/><rect x="10" y="5" width="4" height="1.5" rx=".5" fill="var(--bg-primary, #1a1a2e)"/><rect x="10" y="12" width="4" height="1.5" rx=".5" fill="var(--bg-primary, #1a1a2e)"/><rect x="10" y="19" width="4" height="1.5" rx=".5" fill="var(--bg-primary, #1a1a2e)"/></svg>
             </button>
             <button id="btn-collections" class="action-btn" title="Collections">
-                <svg viewBox="0 0 24 24" width="18" height="18"><path d="M3 13h2v-2H3v2zm0 4h2v-2H3v2zm0-8h2V7H3v2zm4 4h14v-2H7v2zm0 4h14v-2H7v2zM7 7v2h14V7H7z" fill="currentColor"/></svg>
+                <svg viewBox="0 0 24 24" width="18" height="18"><rect x="4" y="4" width="4.5" height="16" rx="1" fill="currentColor"/><rect x="10" y="4" width="4.5" height="16" rx="1" fill="currentColor"/><rect x="15.5" y="6" width="4.5" height="14" rx="1" fill="currentColor" transform="rotate(-12 17.75 13)"/></svg>
             </button>
             <button id="btn-queues" class="action-btn" title="Queues">
-                <svg viewBox="0 0 24 24" width="18" height="18"><path d="M4 6h16v2H4zm0 5h16v2H4zm0 5h16v2H4z" fill="currentColor"/></svg>
-                <span class="queue-badge" id="queue-badge" style="display:none">0</span>
+                <svg viewBox="0 0 24 24" width="18" height="18"><circle cx="5" cy="17" r="2" fill="currentColor"/><circle cx="5" cy="11" r="2" fill="currentColor"/><circle cx="5" cy="5" r="2" fill="currentColor"/><path d="M9 17c0-1 .5-2 2-2h2c1.5 0 2-.8 2-2M9 11c0-1 .5-2 2-2h2c1.5 0 2-.8 2-2" stroke="currentColor" stroke-width="1.8" fill="none" stroke-linecap="round"/><path d="M9 5h8" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
             </button>
             <button id="btn-activity" class="action-btn" title="Activity Log">
                 <svg viewBox="0 0 24 24" width="18" height="18"><path d="M13 3c-4.97 0-9 4.03-9 9H1l3.89 3.89.07.14L9 12H6c0-3.87 3.13-7 7-7s7 3.13 7 7-3.13 7-7 7c-1.93 0-3.68-.79-4.94-2.06l-1.42 1.42A8.954 8.954 0 0013 21c4.97 0 9-4.03 9-9s-4.03-9-9-9zm-1 5v5l4.28 2.54.72-1.21-3.5-2.08V8H12z" fill="currentColor"/></svg>
@@ -349,15 +348,16 @@
                     </button>
                     <span class="queue-progress-text" id="queue-dl-progress"></span>
                 </div>
-                <div class="file-table-wrap">
-                    <table class="file-table" id="queue-dl-table">
+                <div class="file-table-wrap" id="queue-dl-wrap">
+                    <table class="file-table queue-file-table" id="queue-dl-table">
                         <thead><tr>
                             <th class="col-grip"></th>
+                            <th class="col-queue"></th>
                             <th class="col-name">File</th>
-                            <th class="col-archive">Archive</th>
+                            <th class="col-archive-q">Archive</th>
                             <th class="col-size">Size</th>
                             <th class="col-status">Status</th>
-                            <th class="col-actions"></th>
+                            <th class="col-priority"></th>
                         </tr></thead>
                         <tbody id="queue-dl-tbody"></tbody>
                     </table>
@@ -378,15 +378,14 @@
                     </button>
                     <span class="queue-progress-text" id="queue-proc-progress"></span>
                 </div>
-                <div class="file-table-wrap">
-                    <table class="file-table" id="queue-proc-table">
+                <div class="file-table-wrap" id="queue-proc-wrap">
+                    <table class="file-table queue-file-table" id="queue-proc-table">
                         <thead><tr>
                             <th class="col-grip"></th>
                             <th class="col-name">File</th>
-                            <th class="col-archive">Archive</th>
-                            <th class="col-profile">Profile</th>
+                            <th class="col-archive-q">Archive</th>
+                            <th class="col-profile-q">Profile</th>
                             <th class="col-status">Status</th>
-                            <th class="col-actions"></th>
                         </tr></thead>
                         <tbody id="queue-proc-tbody"></tbody>
                     </table>
@@ -407,14 +406,12 @@
                     </button>
                     <span class="queue-progress-text" id="queue-scan-progress"></span>
                 </div>
-                <div class="file-table-wrap">
-                    <table class="file-table" id="queue-scan-table">
+                <div class="file-table-wrap" id="queue-scan-wrap">
+                    <table class="file-table queue-file-table" id="queue-scan-table">
                         <thead><tr>
-                            <th class="col-grip"></th>
                             <th class="col-name">File</th>
-                            <th class="col-archive">Archive</th>
+                            <th class="col-archive-q">Archive</th>
                             <th class="col-status">Status</th>
-                            <th class="col-actions"></th>
                         </tr></thead>
                         <tbody id="queue-scan-tbody"></tbody>
                     </table>

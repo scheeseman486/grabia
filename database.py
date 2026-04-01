@@ -503,7 +503,8 @@ def init_db():
         counts = conn.execute("""
             SELECT
                 COUNT(*) as total,
-                SUM(CASE WHEN download_status = 'completed' THEN 1 ELSE 0 END) as completed,
+                SUM(CASE WHEN download_status = 'completed'
+                           OR processing_status = 'processed' THEN 1 ELSE 0 END) as completed,
                 SUM(CASE WHEN download_status = 'failed' THEN 1 ELSE 0 END) as failed,
                 SUM(CASE WHEN queue_position IS NOT NULL THEN 1 ELSE 0 END) as queued
             FROM archive_files WHERE archive_id = ?
@@ -625,7 +626,8 @@ def add_archive_files(archive_id, files):
 
 def _enrich_archives_with_progress(archives, conn):
     """Add download progress stats to a list of archive dicts.
-    Uses total file counts (not just queued) as the denominator."""
+    Uses total file counts (not just queued) as the denominator.
+    Processed files (processing_status = 'processed') count toward completed."""
     if not archives:
         return archives
     ids = [a["id"] for a in archives]
@@ -633,9 +635,14 @@ def _enrich_archives_with_progress(archives, conn):
     rows = conn.execute(f"""
         SELECT archive_id,
                COUNT(*) AS total_files,
-               SUM(CASE WHEN download_status = 'completed' THEN 1 ELSE 0 END) AS completed_files,
+               SUM(CASE WHEN download_status = 'completed' THEN 1 ELSE 0 END) AS downloaded_files,
+               SUM(CASE WHEN download_status = 'completed'
+                          OR processing_status = 'processed' THEN 1 ELSE 0 END) AS completed_files,
+               SUM(CASE WHEN processing_status = 'processed' THEN 1 ELSE 0 END) AS processed_files,
                COALESCE(SUM(size), 0) AS total_size,
                COALESCE(SUM(downloaded_bytes), 0) AS downloaded_bytes,
+               COALESCE(SUM(CASE WHEN processing_status = 'processed'
+                            THEN downloaded_bytes ELSE 0 END), 0) AS processed_bytes,
                SUM(CASE WHEN queue_position IS NOT NULL THEN 1 ELSE 0 END) AS queued_files
         FROM archive_files WHERE archive_id IN ({placeholders})
         GROUP BY archive_id
@@ -643,28 +650,39 @@ def _enrich_archives_with_progress(archives, conn):
     prog = {r["archive_id"]: dict(r) for r in rows}
     for a in archives:
         p = prog.get(a["id"], {})
-        a["completed_files"] = p.get("completed_files", 0)
         a["total_files"] = p.get("total_files", 0)
+        a["downloaded_files"] = p.get("downloaded_files", 0)
+        a["completed_files"] = p.get("completed_files", 0)
+        a["processed_files"] = p.get("processed_files", 0)
         a["total_size"] = p.get("total_size", 0)
         a["downloaded_bytes"] = p.get("downloaded_bytes", 0)
+        a["processed_bytes"] = p.get("processed_bytes", 0)
         a["queued_files"] = p.get("queued_files", 0)
     return archives
 
 
 def get_archive_progress(archive_id):
-    """Return download progress stats for a single archive using total file counts."""
+    """Return download progress stats for a single archive using total file counts.
+    Processed files count toward completed_files."""
     with _db() as conn:
         row = conn.execute("""
             SELECT COUNT(*) AS total_files,
-                   SUM(CASE WHEN download_status = 'completed' THEN 1 ELSE 0 END) AS completed_files,
+                   SUM(CASE WHEN download_status = 'completed' THEN 1 ELSE 0 END) AS downloaded_files,
+                   SUM(CASE WHEN download_status = 'completed'
+                              OR processing_status = 'processed' THEN 1 ELSE 0 END) AS completed_files,
+                   SUM(CASE WHEN processing_status = 'processed' THEN 1 ELSE 0 END) AS processed_files,
                    COALESCE(SUM(size), 0) AS total_size,
                    COALESCE(SUM(downloaded_bytes), 0) AS downloaded_bytes,
+                   COALESCE(SUM(CASE WHEN processing_status = 'processed'
+                                THEN downloaded_bytes ELSE 0 END), 0) AS processed_bytes,
                    SUM(CASE WHEN queue_position IS NOT NULL THEN 1 ELSE 0 END) AS queued_files
             FROM archive_files WHERE archive_id = ?
         """, (archive_id,)).fetchone()
         if row:
             return dict(row)
-        return {"completed_files": 0, "total_files": 0, "total_size": 0, "downloaded_bytes": 0, "queued_files": 0}
+        return {"total_files": 0, "downloaded_files": 0, "completed_files": 0,
+                "processed_files": 0, "total_size": 0, "downloaded_bytes": 0,
+                "processed_bytes": 0, "queued_files": 0}
 
 
 def get_archives():
@@ -737,7 +755,9 @@ def recompute_archive_status(archive_id, fallback=None):
         row = conn.execute("""
             SELECT
                 COUNT(*) as total,
-                SUM(CASE WHEN download_status = 'completed' THEN 1 ELSE 0 END) as completed,
+                SUM(CASE WHEN download_status = 'completed' THEN 1 ELSE 0 END) as downloaded,
+                SUM(CASE WHEN download_status = 'completed'
+                           OR processing_status = 'processed' THEN 1 ELSE 0 END) as completed,
                 SUM(CASE WHEN download_status = 'failed' THEN 1 ELSE 0 END) as failed,
                 SUM(CASE WHEN queue_position IS NOT NULL THEN 1 ELSE 0 END) as queued,
                 SUM(CASE WHEN download_status = 'downloading' THEN 1 ELSE 0 END) as downloading

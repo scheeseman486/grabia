@@ -1046,9 +1046,16 @@
         const prog = $("#detail-progress-meta");
         const total = p.total_files || 0;
         const completed = p.completed_files || 0;
+        const downloaded = p.downloaded_files || completed; // fallback for enriched archives
+        const processed = p.processed_files || 0;
+        const processedBytes = p.processed_bytes || 0;
         if (total > 0) {
-            const pct = total > 0 ? ` \u2022 ${Math.round(completed * 100 / total)}%` : "";
-            prog.textContent = `${completed}/${total} files \u2022 ${formatBytes(p.downloaded_bytes || 0)} / ${formatBytes(p.total_size || 0)}${pct}`;
+            const pct = Math.round(completed * 100 / total);
+            let text = `${downloaded}/${total} files \u2022 ${formatBytes(p.downloaded_bytes || 0)} / ${formatBytes(p.total_size || 0)} \u2022 ${pct}%`;
+            if (processed > 0) {
+                text += ` (${processed} processed \u2022 ${formatBytes(processedBytes)})`;
+            }
+            prog.textContent = text;
             prog.style.display = "";
         } else {
             prog.style.display = "none";
@@ -3816,14 +3823,6 @@
     }
 
     function updateQueueBadges() {
-        const total = queueCounts.download + queueCounts.processing + queueCounts.scan;
-        const badge = $("#queue-badge");
-        if (total > 0) {
-            badge.textContent = total > 999 ? "999+" : total;
-            badge.style.display = "";
-        } else {
-            badge.style.display = "none";
-        }
         const dlBadge = $("#queue-tab-download-badge");
         const procBadge = $("#queue-tab-processing-badge");
         const scanBadge = $("#queue-tab-scan-badge");
@@ -3848,94 +3847,210 @@
         }
     }
 
+    // Queue selection state (separate from file list selection)
+    let selectedQueueIds = new Set();
+    let lastClickedQueueIdx = null;
+    let queueDragSrcId = null;
+
+    function handleQueueSelect(tab, item, idx, e) {
+        const data = queueData[tab] || [];
+        if (e.shiftKey && lastClickedQueueIdx !== null) {
+            const start = Math.min(lastClickedQueueIdx, idx);
+            const end = Math.max(lastClickedQueueIdx, idx);
+            if (!e.ctrlKey && !e.metaKey) selectedQueueIds.clear();
+            for (let i = start; i <= end; i++) {
+                const d = data[i];
+                selectedQueueIds.add(tab === "download" ? (d.file_id || d.id) : d.id);
+            }
+        } else if (e.ctrlKey || e.metaKey) {
+            const key = tab === "download" ? (item.file_id || item.id) : item.id;
+            if (selectedQueueIds.has(key)) selectedQueueIds.delete(key);
+            else selectedQueueIds.add(key);
+            lastClickedQueueIdx = idx;
+        } else {
+            selectedQueueIds.clear();
+            selectedQueueIds.add(tab === "download" ? (item.file_id || item.id) : item.id);
+            lastClickedQueueIdx = idx;
+        }
+        renderQueueTable(tab);
+    }
+
     function renderQueueTable(tab) {
         const data = queueData[tab];
-        const tbody = $(`#queue-${tab === "download" ? "dl" : tab === "processing" ? "proc" : "scan"}-tbody`);
-        const empty = $(`#queue-${tab === "download" ? "dl" : tab === "processing" ? "proc" : "scan"}-empty`);
-        const table = tbody.closest(".file-table-wrap");
+        const abbr = tab === "download" ? "dl" : tab === "processing" ? "proc" : "scan";
+        const tbody = $(`#queue-${abbr}-tbody`);
+        const empty = $(`#queue-${abbr}-empty`);
+        const wrap = $(`#queue-${abbr}-wrap`);
 
         if (!data || data.length === 0) {
-            table.style.display = "none";
+            wrap.style.display = "none";
             empty.style.display = "";
             return;
         }
-        table.style.display = "";
+        wrap.style.display = "";
         empty.style.display = "none";
 
-        let html = "";
-        for (const item of data) {
-            const fname = escapeHtml(item.file_name || item.name || "");
-            const archiveName = escapeHtml(item.archive_identifier || item.identifier || "");
-            const bold = item.downloaded ? " file-name-downloaded" : "";
+        const savedScroll = wrap.scrollTop;
+        tbody.innerHTML = "";
+        const lastIdx = data.length - 1;
+
+        for (let i = 0; i < data.length; i++) {
+            const item = data[i];
+            const fname = item.file_name || item.name || "";
+            const archiveLabel = item.title || item.archive_title || item.archive_identifier || item.identifier || "";
+            const bold = item.downloaded ? "file-name-downloaded" : "";
             const archiveId = item.archive_id;
             const fileId = item.file_id || item.id;
             const entryId = item.id || item.file_id;
             const isCompleting = completingItems.has(`${tab}:${entryId}`);
-            const rowClass = isCompleting ? " class=\"queue-completing\"" : "";
+            const selKey = tab === "download" ? fileId : item.id;
+
+            const tr = document.createElement("tr");
+            tr.dataset.archiveId = archiveId;
+            if (tab === "download") tr.dataset.fileId = fileId;
+            else tr.dataset.entryId = item.id;
+            if (isCompleting) tr.className = "queue-completing";
+            if (selectedQueueIds.has(selKey)) tr.classList.add("selected");
+
+            let html = "";
 
             if (tab === "download") {
-                const size = formatBytes(item.size || item.file_size || 0);
                 const status = item.download_status || "queued";
-                html += `<tr${rowClass} data-file-id="${fileId}" data-archive-id="${archiveId}">`;
-                html += `<td class="col-grip"><div class="grip"><div class="grip-dots"><span></span><span></span></div><div class="grip-dots"><span></span><span></span></div></div></td>`;
-                html += `<td class="col-name"><span class="file-name${bold}">${fname}</span></td>`;
-                html += `<td class="col-archive">${archiveName}</td>`;
-                html += `<td class="col-size">${size}</td>`;
-                html += `<td class="col-status"><span class="status-badge status-${status}">${status}</span></td>`;
-                html += `<td class="col-actions"><button class="icon-btn queue-remove-btn" data-file-id="${fileId}" title="Remove from queue">&times;</button></td>`;
-                html += `</tr>`;
+                // Grip (drag handle)
+                html += buildGripCell();
+                // Queue remove button (same as file list)
+                html += `<td class="col-queue"><button class="queue-toggle queue-remove" data-queue-id="${fileId}" title="Remove from queue">` +
+                    `<svg viewBox="0 0 16 16" width="14" height="14"><rect x="3" y="7" width="10" height="2" rx="1" fill="currentColor"/></svg></button></td>`;
+                // File name with truncation
+                html += `<td class="col-name"><div class="file-name-wrap">${renderFileName(fname, bold)}</div></td>`;
+                // Archive name (truncated)
+                html += `<td class="col-archive-q" title="${escapeHtml(archiveLabel)}">${escapeHtml(archiveLabel)}</td>`;
+                // Size
+                html += `<td class="col-size" style="text-align:right">${formatBytes(item.size || item.file_size || 0)}</td>`;
+                // Status
+                html += `<td class="col-status"><span class="file-status ${status}">${status}</span></td>`;
+                // Priority up/down
+                html += buildPriorityCell(fileId, i === 0, i === lastIdx);
             } else if (tab === "processing") {
-                const profile = escapeHtml(item.profile_name || "");
                 const status = item.status || "pending";
-                html += `<tr${rowClass} data-entry-id="${item.id}" data-archive-id="${archiveId}">`;
-                html += `<td class="col-grip"><div class="grip"><div class="grip-dots"><span></span><span></span></div><div class="grip-dots"><span></span><span></span></div></div></td>`;
-                html += `<td class="col-name"><span class="file-name${bold}">${fname}</span></td>`;
-                html += `<td class="col-archive">${archiveName}</td>`;
-                html += `<td class="col-profile">${profile}</td>`;
-                html += `<td class="col-status"><span class="status-badge status-${status}">${status}</span></td>`;
-                html += `<td class="col-actions"></td>`;
-                html += `</tr>`;
+                html += buildGripCell();
+                html += `<td class="col-name"><div class="file-name-wrap">${renderFileName(fname, bold)}</div></td>`;
+                html += `<td class="col-archive-q" title="${escapeHtml(archiveLabel)}">${escapeHtml(archiveLabel)}</td>`;
+                html += `<td class="col-profile-q" title="${escapeHtml(item.profile_name || "")}">${escapeHtml(item.profile_name || "")}</td>`;
+                html += `<td class="col-status"><span class="file-status ${status}">${status}</span></td>`;
             } else {
                 const status = item.status || "pending";
-                html += `<tr${rowClass} data-entry-id="${item.id}" data-archive-id="${archiveId}">`;
-                html += `<td class="col-grip"><div class="grip"><div class="grip-dots"><span></span><span></span></div><div class="grip-dots"><span></span><span></span></div></div></td>`;
-                html += `<td class="col-name"><span class="file-name${bold}">${fname}</span></td>`;
-                html += `<td class="col-archive">${archiveName}</td>`;
-                html += `<td class="col-status"><span class="status-badge status-${status}">${status}</span></td>`;
-                html += `<td class="col-actions"></td>`;
-                html += `</tr>`;
+                html += `<td class="col-name"><div class="file-name-wrap">${renderFileName(fname, bold)}</div></td>`;
+                html += `<td class="col-archive-q" title="${escapeHtml(archiveLabel)}">${escapeHtml(archiveLabel)}</td>`;
+                html += `<td class="col-status"><span class="file-status ${status}">${status}</span></td>`;
             }
-        }
-        tbody.innerHTML = html;
 
-        // Attach click handlers for navigate-to-file
-        tbody.querySelectorAll("tr").forEach((tr) => {
+            tr.innerHTML = html;
+
+            // Click: select (single, shift, ctrl) — double-click: navigate
             tr.addEventListener("click", (e) => {
-                if (e.target.closest(".queue-remove-btn")) return;
-                const archiveId = tr.dataset.archiveId;
-                const fileId = tr.dataset.fileId;
+                if (e.target.closest("button, .queue-toggle, .file-priority-btns, .file-grip")) return;
+                handleQueueSelect(tab, item, i, e);
+            });
+            tr.addEventListener("dblclick", (e) => {
+                if (e.target.closest("button, .queue-toggle")) return;
                 if (archiveId) {
                     openArchiveDetail(parseInt(archiveId));
-                    if (fileId) {
+                    if (tab === "download" && fileId) {
                         setTimeout(() => {
-                            const row = $(`#file-table-body tr[data-id="${fileId}"]`);
+                            const row = $(`#file-list tr[data-file-id="${fileId}"]`);
                             if (row) flashElement(row);
                         }, 300);
                     }
                 }
             });
-        });
 
-        // Attach remove-from-queue handlers
-        tbody.querySelectorAll(".queue-remove-btn").forEach((btn) => {
-            btn.addEventListener("click", async (e) => {
-                e.stopPropagation();
-                const fileId = btn.dataset.fileId;
-                await api("POST", `/api/files/${fileId}/queue`, { queued: false });
-                queueStale.download = true;
-                loadQueueTab("download");
-                refreshQueueCounts();
-            });
+            // Queue remove toggle (download only)
+            const queueBtn = tr.querySelector(".queue-toggle");
+            if (queueBtn) {
+                queueBtn.addEventListener("click", (e) => {
+                    e.stopPropagation();
+                    const fid = parseInt(queueBtn.dataset.queueId);
+                    api("POST", `/api/files/${fid}/queue`, { queued: false }).then(() => {
+                        queueStale.download = true;
+                        loadQueueTab("download");
+                        refreshQueueCounts();
+                    });
+                });
+            }
+
+            // Priority up/down buttons (download only)
+            if (tab === "download") {
+                const upBtn = tr.querySelector(`[data-move-up="${fileId}"]`);
+                const downBtn = tr.querySelector(`[data-move-down="${fileId}"]`);
+                if (upBtn) upBtn.addEventListener("click", (e) => { e.stopPropagation(); moveQueueItem(tab, i, -1); });
+                if (downBtn) downBtn.addEventListener("click", (e) => { e.stopPropagation(); moveQueueItem(tab, i, 1); });
+            }
+
+            // Drag-and-drop reordering (download and processing)
+            if (tab === "download" || tab === "processing") {
+                attachQueueDrag(tr, tab, i);
+            }
+
+            tbody.appendChild(tr);
+        }
+
+        wrap.scrollTop = savedScroll;
+        applyTruncationTooltips(tbody);
+    }
+
+    function moveQueueItem(tab, fromIdx, direction) {
+        const data = queueData[tab];
+        const toIdx = fromIdx + direction;
+        if (toIdx < 0 || toIdx >= data.length) return;
+        const src = data[fromIdx];
+        const dst = data[toIdx];
+        if (tab === "download") {
+            // Use queue_position from the target item
+            const newPos = dst.queue_position;
+            api("POST", "/api/download/queue/reorder", { file_id: src.id, position: newPos }).then(() => loadQueueTab(tab));
+        } else if (tab === "processing") {
+            const newPos = dst.position;
+            api("POST", "/api/processing/queue/reorder", { entry_id: src.id, position: newPos }).then(() => loadQueueTab(tab));
+        }
+    }
+
+    function attachQueueDrag(tr, tab, idx) {
+        const grip = tr.querySelector(".file-grip");
+        if (!grip) return;
+        tr.draggable = true;
+        tr.addEventListener("dragstart", (e) => {
+            if (!e.target.closest(".file-grip")) { e.preventDefault(); return; }
+            queueDragSrcId = idx;
+            tr.classList.add("file-row-dragging");
+            e.dataTransfer.effectAllowed = "move";
+        });
+        tr.addEventListener("dragend", () => {
+            queueDragSrcId = null;
+            tr.classList.remove("file-row-dragging");
+            const tbody = tr.parentElement;
+            if (tbody) tbody.querySelectorAll(".file-row-drag-over").forEach(r => r.classList.remove("file-row-drag-over"));
+        });
+        tr.addEventListener("dragover", (e) => {
+            if (queueDragSrcId === null) return;
+            e.preventDefault();
+            e.dataTransfer.dropEffect = "move";
+            tr.classList.add("file-row-drag-over");
+        });
+        tr.addEventListener("dragleave", () => tr.classList.remove("file-row-drag-over"));
+        tr.addEventListener("drop", (e) => {
+            e.preventDefault();
+            tr.classList.remove("file-row-drag-over");
+            if (queueDragSrcId === null || queueDragSrcId === idx) return;
+            const data = queueData[tab];
+            const src = data[queueDragSrcId];
+            const dst = data[idx];
+            queueDragSrcId = null;
+            if (tab === "download") {
+                api("POST", "/api/download/queue/reorder", { file_id: src.id, position: dst.queue_position }).then(() => loadQueueTab(tab));
+            } else if (tab === "processing") {
+                api("POST", "/api/processing/queue/reorder", { entry_id: src.id, position: dst.position }).then(() => loadQueueTab(tab));
+            }
         });
     }
 
