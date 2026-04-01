@@ -542,27 +542,9 @@ class DownloadManager:
         return md5.hexdigest() == expected_md5
 
     def _check_archive_completion(self, archive_id):
-        with db._db() as conn:
-            row = conn.execute("""
-                SELECT
-                    COUNT(*) as total,
-                    SUM(CASE WHEN download_status = 'completed' THEN 1 ELSE 0 END) as completed,
-                    SUM(CASE WHEN download_status = 'failed' THEN 1 ELSE 0 END) as failed,
-                    SUM(CASE WHEN download_status = 'conflict' THEN 1 ELSE 0 END) as conflict
-                FROM archive_files
-                WHERE archive_id = ? AND (queued = 1 OR download_status IN ('completed', 'conflict'))
-            """, (archive_id,)).fetchone()
-
-        if row["total"] == 0:
-            db.set_archive_status(archive_id, "idle")
-        elif row["completed"] == row["total"]:
-            db.set_archive_status(archive_id, "completed")
-        elif row["completed"] + row["failed"] + row["conflict"] == row["total"]:
-            db.set_archive_status(archive_id, "partial")
-        else:
-            # Still has pending files but nothing actively downloading —
-            # mark idle so it doesn't stay stuck on "downloading" or "queued"
-            db.set_archive_status(archive_id, "idle")
+        """Recompute archive status after a file finishes downloading.
+        Delegates to the canonical recompute_archive_status()."""
+        db.recompute_archive_status(archive_id)
 
 
 # Singleton

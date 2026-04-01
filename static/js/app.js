@@ -39,7 +39,7 @@
     let renderArchiveListPending = false;
     let archiveSearchQuery = "";
     let archiveSearchTimer = null;
-    let archiveSort = "default";
+    let archiveSort = "title";
     // Groups collapsed by default; store *expanded* group IDs in localStorage
     let expandedGroups = new Set(
         JSON.parse(localStorage.getItem("grabia_expanded_groups") || "[]")
@@ -141,61 +141,28 @@
         notifications.forEach((n) => {
             const div = document.createElement("div");
             div.className = "notif-item notif-" + n.type;
-            // Support both server (created_at as unix timestamp) and legacy (time as Date)
             const notifTime = n.created_at ? new Date(n.created_at * 1000) : (n.time || new Date());
             const ago = formatTimeAgo(notifTime);
-            const hasProgress = n.progress !== undefined && n.progress !== null;
-            let progressHtml = "";
-            if (hasProgress) {
-                if (n.progress >= 0) {
-                    progressHtml = `<div class="notif-progress-track"><div class="notif-progress-fill" style="width:${n.progress}%"></div></div>`;
-                } else {
-                    progressHtml = `<div class="notif-progress-track"><div class="notif-progress-fill indeterminate"></div></div>`;
-                }
-            }
-            // Active notifications (with progress) show cancel, not dismiss
-            const isActive = hasProgress || (n.adding_archive && n.adding_archive !== 0);
-            const cancelHtml = n.scan_archive_id
-                ? `<button class="notif-cancel" data-cancel-type="scan" data-cancel-archive="${n.scan_archive_id}">Cancel</button>`
-                : n.processing_archive_id
-                ? `<button class="notif-cancel" data-cancel-type="process" data-cancel-archive="${n.processing_archive_id}">Cancel</button>`
-                : "";
             const viewLogHtml = n.job_id
                 ? `<button class="notif-view-log" data-job-id="${n.job_id}">View Log</button>`
                 : "";
-            const dismissHtml = isActive ? "" : `
-                <button class="notif-dismiss" data-notif-id="${n.id}" title="Dismiss">
-                    <svg viewBox="0 0 24 24" width="12" height="12"><path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z" fill="currentColor"/></svg>
-                </button>`;
             div.innerHTML = `
                 <div class="notif-content">
                     <span class="notif-message">${escapeHtml(n.message)}</span>
-                    ${progressHtml}
                     <span class="notif-time-row">
                         <span class="notif-time">${ago}</span>
                         ${viewLogHtml}
-                        ${cancelHtml}
                     </span>
                 </div>
-                ${dismissHtml}
+                <button class="notif-dismiss" data-notif-id="${n.id}" title="Dismiss">
+                    <svg viewBox="0 0 24 24" width="12" height="12"><path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z" fill="currentColor"/></svg>
+                </button>
             `;
             const dismissBtn = div.querySelector(".notif-dismiss");
             if (dismissBtn) dismissBtn.addEventListener("click", (e) => {
                 e.stopPropagation();
                 removeNotification(n.id);
             });
-            const cancelBtn = div.querySelector(".notif-cancel");
-            if (cancelBtn) {
-                cancelBtn.addEventListener("click", (e) => {
-                    e.stopPropagation();
-                    const archiveId = parseInt(cancelBtn.dataset.cancelArchive);
-                    if (cancelBtn.dataset.cancelType === "process") {
-                        cancelProcessing(archiveId);
-                    } else {
-                        cancelScan(archiveId);
-                    }
-                });
-            }
             const viewLogBtn = div.querySelector(".notif-view-log");
             if (viewLogBtn) {
                 viewLogBtn.addEventListener("click", (e) => {
@@ -568,6 +535,14 @@
             addNotification(`Download failed: ${fname}${archive ? " (" + archive + ")" : ""} — retries exhausted`, "error");
         });
 
+        es.addEventListener("file_skipped", (e) => {
+            const data = JSON.parse(e.data);
+            updateFileRow(data.file_id, { download_status: "pending", queue_position: null });
+            lastProgressRefresh = 0;
+            throttledProgressRefresh();
+            refreshQueueCount();
+        });
+
         es.addEventListener("file_start", () => {
             refreshStatus();
         });
@@ -640,9 +615,7 @@
         });
 
         es.addEventListener("notifications_cleared", () => {
-            notifications = notifications.filter(n =>
-                n.scan_archive_id != null || n.processing_archive_id != null || (n.adding_archive && n.adding_archive !== 0)
-            );
+            notifications = [];
             renderNotifBadge();
             renderNotifList();
         });
@@ -650,8 +623,17 @@
         es.addEventListener("archive_added", () => { refreshArchives(); refreshQueueCount(); });
         es.addEventListener("archive_updated", () => { refreshArchives(); refreshQueueCount(); });
         es.addEventListener("archive_removed", () => { refreshArchives(); refreshQueueCount(); });
-        es.addEventListener("archives_reordered", () => refreshArchives());
+        // archives_reordered is no longer sent (archives sorted client-side)
         es.addEventListener("groups_changed", () => refreshGroups());
+        const refreshCollectionsIfVisible = async () => {
+            await refreshCollections();
+            if ($("#page-collections")?.classList.contains("active")) renderCollectionList();
+        };
+        es.addEventListener("collection_created", refreshCollectionsIfVisible);
+        es.addEventListener("collection_updated", refreshCollectionsIfVisible);
+        es.addEventListener("collection_deleted", refreshCollectionsIfVisible);
+        es.addEventListener("collection_synced", refreshCollectionsIfVisible);
+        es.addEventListener("collections_reordered", refreshCollectionsIfVisible);
         es.addEventListener("settings_updated", (e) => {
             const s = JSON.parse(e.data);
             if (s.theme) applyTheme(s.theme);
@@ -659,19 +641,16 @@
         });
 
         // ── Queue SSE events ──────────────────────────────────────
-        es.addEventListener("batch_added", (e) => {
+        es.addEventListener("queue_changed", (e) => {
             const data = JSON.parse(e.data);
-            // Mark relevant queue tab stale and refresh counts
             const queueType = data.queue_type; // "download", "processing", "scan"
             if (queueType && queueStale.hasOwnProperty(queueType)) {
                 queueStale[queueType] = true;
-                // If the queue page is visible and this tab is active, auto-reload
                 if ($("#page-queues").classList.contains("active") && activeQueueTab === queueType) {
                     loadQueueTab(queueType);
                 }
             }
             refreshQueueCounts();
-            // Also refresh archives list for download batches (affects progress)
             if (queueType === "download") {
                 lastProgressRefresh = 0;
                 throttledProgressRefresh();
@@ -1065,9 +1044,11 @@
 
     function updateDetailProgressFromData(p) {
         const prog = $("#detail-progress-meta");
-        if (p.downloaded_bytes > 0 || p.completed_files > 0 || p.selected_files > 0) {
-            const pct = p.selected_size > 0 ? ` \u2022 ${((p.downloaded_bytes / p.selected_size) * 100).toFixed(1)}%` : "";
-            prog.textContent = `${p.completed_files}/${p.selected_files} files \u2022 ${formatBytes(p.downloaded_bytes)} / ${formatBytes(p.selected_size)}${pct}`;
+        const total = p.total_files || 0;
+        const completed = p.completed_files || 0;
+        if (total > 0) {
+            const pct = total > 0 ? ` \u2022 ${Math.round(completed * 100 / total)}%` : "";
+            prog.textContent = `${completed}/${total} files \u2022 ${formatBytes(p.downloaded_bytes || 0)} / ${formatBytes(p.total_size || 0)}${pct}`;
             prog.style.display = "";
         } else {
             prog.style.display = "none";
@@ -1094,48 +1075,68 @@
         } else {
             bar.style.display = "none";
         }
+        // Update visual selection on archive items
+        $$("#archive-list .archive-item").forEach(li => {
+            li.classList.toggle("selected", selectedArchiveIds.has(parseInt(li.dataset.id)));
+        });
     }
+
+    function handleArchiveSelect(id, idx, e) {
+        const visibleArchives = getVisibleArchives();
+        if (e.shiftKey && lastClickedArchiveIdx !== null) {
+            // Shift+click: range select
+            const start = Math.min(lastClickedArchiveIdx, idx);
+            const end = Math.max(lastClickedArchiveIdx, idx);
+            if (!e.ctrlKey && !e.metaKey) selectedArchiveIds.clear();
+            for (let i = start; i <= end; i++) {
+                if (visibleArchives[i]) selectedArchiveIds.add(visibleArchives[i].id);
+            }
+        } else if (e.ctrlKey || e.metaKey) {
+            // Ctrl/Cmd+click: toggle individual
+            if (selectedArchiveIds.has(id)) selectedArchiveIds.delete(id);
+            else selectedArchiveIds.add(id);
+            lastClickedArchiveIdx = idx;
+        } else {
+            // Plain click: select only this one
+            selectedArchiveIds.clear();
+            selectedArchiveIds.add(id);
+            lastClickedArchiveIdx = idx;
+        }
+        updateArchiveBatchActions();
+    }
+
+    function getVisibleArchives() {
+        // Return the archives in display order (filtered by search if active)
+        const items = $$("#archive-list .archive-item");
+        return [...items].map(li => archives.find(a => a.id === parseInt(li.dataset.id))).filter(Boolean);
+    }
+
+    let lastClickedArchiveIdx = null; // for shift+click range selection
 
     function buildArchiveItem(a, idx, listScope) {
         const li = document.createElement("li");
-        li.className = "archive-item";
+        li.className = "archive-item" + (selectedArchiveIds.has(a.id) ? " selected" : "");
         li.dataset.id = a.id;
-        li.draggable = true;
         li.innerHTML = `
-            <div class="archive-grip" title="Drag to reorder">
-                <div class="grip-dots"><span></span><span></span></div>
-                <div class="grip-dots"><span></span><span></span></div>
-                <div class="grip-dots"><span></span><span></span></div>
-            </div>
             ${a.download_enabled
                 ? `<button class="queue-toggle queue-remove" data-action="queue-remove" title="Remove from queue"><svg viewBox="0 0 16 16" width="14" height="14"><rect x="3" y="7" width="10" height="2" rx="1" fill="currentColor"/></svg></button>`
                 : `<button class="queue-toggle queue-add" data-action="queue-add" title="Add to queue"><svg viewBox="0 0 16 16" width="14" height="14"><path d="M8 3a1 1 0 011 1v3h3a1 1 0 110 2H9v3a1 1 0 11-2 0V9H4a1 1 0 110-2h3V4a1 1 0 011-1z" fill="currentColor"/></svg></button>`
             }
-            <div class="archive-checkbox">
-                <input type="checkbox" ${selectedArchiveIds.has(a.id) ? "checked" : ""} data-action="select">
-            </div>
-            <div class="archive-info" data-action="open">
+            <div class="archive-info">
                 <div class="archive-title">${escapeHtml(a.title || a.identifier)}</div>
                 <div class="archive-meta">
                     <span>${a.files_count} files</span>
                     <span>${formatBytes(a.total_size)}</span>
                     <span>${a.identifier}</span>
                 </div>
-                ${a.selected_files > 0 ? `<div class="archive-progress-meta">${a.completed_files}/${a.selected_files} files \u2022 ${formatBytes(a.downloaded_bytes)} / ${formatBytes(a.selected_size)}${a.selected_size > 0 ? ` \u2022 ${((a.downloaded_bytes / a.selected_size) * 100).toFixed(1)}%` : ""}</div>` : ""}
             </div>
-            <span class="archive-status ${a.status}">${a.status}</span>
+            <span class="archive-status ${a.status}">${a.status === 'partial' ? (a.status_pct || 0) + '%' : a.status}</span>
             <div class="archive-actions">
-                <button data-action="retry" title="Retry failed files" class="retry" style="display:${a.status === 'partial' || a.status === 'failed' ? 'flex' : 'none'}">
+                <button data-action="retry" title="Retry failed files" class="retry" style="display:${a.status === 'error' ? 'flex' : 'none'}">
                     <svg viewBox="0 0 24 24" width="16" height="16"><path d="M17.65 6.35A7.958 7.958 0 0012 4c-4.42 0-7.99 3.58-7.99 8s3.57 8 7.99 8c3.73 0 6.84-2.55 7.73-6h-2.08A5.99 5.99 0 0112 18c-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z" fill="currentColor"/></svg>
                 </button>
                 <button data-action="move-group" title="Move to group">
                     <svg viewBox="0 0 24 24" width="16" height="16"><path d="M20 6h-8l-2-2H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2zm0 12H4V8h16v10z" fill="currentColor"/></svg>
-                </button>
-                <button data-action="move-up" title="Move up" ${idx === 0 || listScope[idx - 1].download_enabled !== a.download_enabled ? "disabled" : ""}>
-                    <svg viewBox="0 0 24 24" width="16" height="16"><path d="M7.41 15.41L12 10.83l4.59 4.58L18 14l-6-6-6 6z" fill="currentColor"/></svg>
-                </button>
-                <button data-action="move-down" title="Move down" ${idx === listScope.length - 1 || listScope[idx + 1].download_enabled !== a.download_enabled ? "disabled" : ""}>
-                    <svg viewBox="0 0 24 24" width="16" height="16"><path d="M7.41 8.59L12 13.17l4.59-4.58L18 10l-6 6-6-6z" fill="currentColor"/></svg>
                 </button>
                 <button data-action="delete" class="delete" title="Remove">
                     <svg viewBox="0 0 24 24" width="16" height="16"><path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z" fill="currentColor"/></svg>
@@ -1143,80 +1144,41 @@
             </div>
         `;
 
-        // Event delegation
+        // Double-click to open archive detail
+        li.addEventListener("dblclick", (e) => {
+            if (e.target.closest("button, .archive-actions, .archive-grip, .queue-toggle")) return;
+            openArchiveDetail(a.id);
+        });
+
+        // Single click: desktop-style selection (click, shift+click, ctrl+click)
         li.addEventListener("click", (e) => {
             const action = e.target.closest("[data-action]")?.dataset.action;
             if (action === "queue-add") {
                 toggleArchiveDownload(a.id, true);
+                return;
             } else if (action === "queue-remove") {
                 toggleArchiveDownload(a.id, false);
-            } else if (action === "select") {
-                const cb = li.querySelector("[data-action=select]");
-                if (cb.checked) selectedArchiveIds.add(a.id);
-                else selectedArchiveIds.delete(a.id);
-                updateArchiveBatchActions();
-            } else if (action === "open") {
-                openArchiveDetail(a.id);
+                return;
             } else if (action === "move-up") {
                 moveArchive(archives.indexOf(a), archives.indexOf(a) - 1);
+                return;
             } else if (action === "move-down") {
                 moveArchive(archives.indexOf(a), archives.indexOf(a) + 1);
+                return;
             } else if (action === "retry") {
                 retryArchive(a.id);
+                return;
             } else if (action === "delete") {
                 confirmDelete(a);
+                return;
             } else if (action === "move-group") {
                 openMoveToGroup(a);
+                return;
             }
-        });
 
-        // Drag and drop
-        li.addEventListener("dragstart", (e) => {
-            isDragging = true;
-            dragSrcId = a.id;
-            dragSrcGroupId = null; // not a group drag
-            li.classList.add("dragging");
-            e.dataTransfer.effectAllowed = "move";
-        });
-        li.addEventListener("dragend", () => {
-            isDragging = false;
-            li.classList.remove("dragging");
-            $$(".archive-item").forEach((el) => el.classList.remove("drag-over"));
-            $$(".group-header").forEach((el) => el.classList.remove("drag-over", "drag-over-group"));
-            $$(".ungroup-drop-zone").forEach((el) => el.classList.remove("drag-over-group"));
-            if (renderArchiveListPending) {
-                renderArchiveListPending = false;
-                renderArchiveList();
-            }
-        });
-        li.addEventListener("dragover", (e) => {
-            if (dragSrcGroupId !== null) return; // don't accept group drags on archives
-            e.preventDefault();
-            e.dataTransfer.dropEffect = "move";
-            li.classList.add("drag-over");
-        });
-        li.addEventListener("dragleave", () => li.classList.remove("drag-over"));
-        li.addEventListener("drop", (e) => {
-            e.preventDefault();
-            li.classList.remove("drag-over");
-            if (dragSrcGroupId !== null) return; // ignore group drops
-            if (dragSrcId !== null && dragSrcId !== a.id) {
-                const src = archives.find((x) => x.id === dragSrcId);
-                if (src) {
-                    // If dragged into a different group, move to that group first
-                    if (src.group_id !== a.group_id) {
-                        api("POST", `/api/archives/${dragSrcId}/group`, { group_id: a.group_id });
-                    } else if (src.download_enabled === a.download_enabled) {
-                        // Same group — reorder within it
-                        const order = archives.map((x) => x.id);
-                        const fromIdx = order.indexOf(dragSrcId);
-                        const toIdx = order.indexOf(a.id);
-                        order.splice(fromIdx, 1);
-                        order.splice(toIdx, 0, dragSrcId);
-                        api("POST", "/api/archives/reorder", { order });
-                    }
-                }
-                dragSrcId = null;
+            // Desktop-style selection on the archive-info area
+            if (!e.target.closest("button, .archive-actions, .archive-grip, .queue-toggle")) {
+                handleArchiveSelect(a.id, idx, e);
             }
         });
 
@@ -1224,11 +1186,6 @@
     }
 
     function renderArchiveList() {
-        // Suppress re-renders during drag to avoid breaking the DOM mid-drag
-        if (isDragging) {
-            renderArchiveListPending = true;
-            return;
-        }
         const archiveControls = $("#archive-controls");
         const archiveToolbar = $(".archive-toolbar");
         if (archives.length === 0 && groups.length === 0) {
@@ -1254,48 +1211,44 @@
             })
             : archives;
 
-        // Apply sort — non-default sort flattens group structure
-        const isCustomSort = archiveSort !== "default";
-        if (isCustomSort) {
-            filtered = [...filtered];
-            const statusOrder = { downloading: 0, queued: 1, partial: 2, failed: 3, completed: 4, idle: 5 };
+        // Sort within groups: apply selected sort to archives
+        const statusOrder = { downloading: 0, queued: 1, partial: 2, error: 3, complete: 4, idle: 5 };
+        function sortArchives(list) {
+            const sorted = [...list];
             switch (archiveSort) {
-                case "title":
-                    filtered.sort((a, b) => (a.title || a.identifier).localeCompare(b.title || b.identifier));
-                    break;
                 case "size":
-                    filtered.sort((a, b) => (b.total_size || 0) - (a.total_size || 0));
+                    sorted.sort((a, b) => (b.total_size || 0) - (a.total_size || 0));
                     break;
                 case "files":
-                    filtered.sort((a, b) => (b.files_count || 0) - (a.files_count || 0));
+                    sorted.sort((a, b) => (b.files_count || 0) - (a.files_count || 0));
                     break;
                 case "status":
-                    filtered.sort((a, b) => (statusOrder[a.status] ?? 99) - (statusOrder[b.status] ?? 99));
+                    sorted.sort((a, b) => (statusOrder[a.status] ?? 99) - (statusOrder[b.status] ?? 99));
                     break;
                 case "added":
-                    filtered.sort((a, b) => (b.added_at || "").localeCompare(a.added_at || ""));
+                    sorted.sort((a, b) => (b.added_at || 0) - (a.added_at || 0));
                     break;
-                case "progress":
-                    filtered.sort((a, b) => {
-                        const pa = a.selected_size > 0 ? a.downloaded_bytes / a.selected_size : 0;
-                        const pb = b.selected_size > 0 ? b.downloaded_bytes / b.selected_size : 0;
-                        return pb - pa;
-                    });
+                case "title":
+                default:
+                    sorted.sort((a, b) => (a.title || a.identifier).localeCompare(b.title || b.identifier));
                     break;
             }
-            // Flat render — no groups
-            filtered.forEach((a, idx) => {
-                archiveListEl.appendChild(buildArchiveItem(a, idx, filtered));
-            });
-            updateArchiveBatchActions();
-            return;
+            return sorted;
         }
 
         // Default queue-order render with groups
-        // Render groups first
+        // Always show groups alphabetically, with archives sorted within
+        const sortedGroups = [...groups].sort((a, b) => a.name.localeCompare(b.name));
         const filteredSet = new Set(filtered.map((a) => a.id));
-        groups.forEach((g, gIdx) => {
-            const groupArchives = archives.filter((a) => a.group_id === g.id && filteredSet.has(a.id));
+
+        // Render ungrouped archives first
+        const ungrouped = sortArchives(filtered.filter((a) => !a.group_id));
+        ungrouped.forEach((a, idx) => {
+            archiveListEl.appendChild(buildArchiveItem(a, idx, ungrouped));
+        });
+
+        sortedGroups.forEach((g, gIdx) => {
+            const groupArchives = sortArchives(archives.filter((a) => a.group_id === g.id && filteredSet.has(a.id)));
             // Hide empty groups when searching
             if (query && groupArchives.length === 0) return;
             const collapsed = !expandedGroups.has(g.id);
@@ -1303,26 +1256,14 @@
             const header = document.createElement("li");
             header.className = "group-header" + (collapsed ? " collapsed" : "");
             header.dataset.groupId = g.id;
-            header.draggable = true;
             header.innerHTML = `
                 <div class="group-header-left">
-                    <div class="group-grip" title="Drag to reorder group">
-                        <div class="grip-dots"><span></span><span></span></div>
-                        <div class="grip-dots"><span></span><span></span></div>
-                        <div class="grip-dots"><span></span><span></span></div>
-                    </div>
                     <svg class="group-chevron" viewBox="0 0 24 24" width="14" height="14"><path d="M7.41 8.59L12 13.17l4.59-4.58L18 10l-6 6-6-6z" fill="currentColor"/></svg>
                     <svg class="group-icon" viewBox="0 0 24 24" width="16" height="16"><path d="M20 6h-8l-2-2H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2zm0 12H4V8h16v10z" fill="currentColor"/></svg>
                     <span class="group-name">${escapeHtml(g.name)}</span>
                     <span class="group-count">${groupArchives.length}</span>
                 </div>
                 <div class="group-actions">
-                    <button data-group-action="move-up" title="Move group up" ${gIdx === 0 ? "disabled" : ""}>
-                        <svg viewBox="0 0 24 24" width="14" height="14"><path d="M7.41 15.41L12 10.83l4.59 4.58L18 14l-6-6-6 6z" fill="currentColor"/></svg>
-                    </button>
-                    <button data-group-action="move-down" title="Move group down" ${gIdx === groups.length - 1 ? "disabled" : ""}>
-                        <svg viewBox="0 0 24 24" width="14" height="14"><path d="M7.41 8.59L12 13.17l4.59-4.58L18 10l-6 6-6-6z" fill="currentColor"/></svg>
-                    </button>
                     <button data-group-action="rename" title="Rename group">
                         <svg viewBox="0 0 24 24" width="14" height="14"><path d="M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zM20.71 7.04c.39-.39.39-1.02 0-1.41l-2.34-2.34c-.39-.39-1.02-.39-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z" fill="currentColor"/></svg>
                     </button>
@@ -1337,9 +1278,7 @@
                 const action = e.target.closest("[data-group-action]")?.dataset.groupAction;
                 if (action === "rename") openRenameGroup(g);
                 else if (action === "delete") openDeleteGroup(g);
-                else if (action === "move-up") moveGroup(gIdx, gIdx - 1);
-                else if (action === "move-down") moveGroup(gIdx, gIdx + 1);
-                else if (!e.target.closest(".group-actions") && !e.target.closest(".group-grip")) {
+                else if (!e.target.closest(".group-actions")) {
                     // Toggle collapse
                     if (expandedGroups.has(g.id)) expandedGroups.delete(g.id);
                     else expandedGroups.add(g.id);
@@ -1348,130 +1287,16 @@
                 }
             });
 
-            // Group drag-and-drop
-            header.addEventListener("dragstart", (e) => {
-                isDragging = true;
-                dragSrcGroupId = g.id;
-                dragSrcId = null;
-                header.classList.add("dragging");
-                e.dataTransfer.effectAllowed = "move";
-            });
-            header.addEventListener("dragend", () => {
-                isDragging = false;
-                header.classList.remove("dragging");
-                $$(".group-header").forEach((el) => el.classList.remove("drag-over"));
-                if (renderArchiveListPending) {
-                    renderArchiveListPending = false;
-                    renderArchiveList();
-                }
-            });
-            header.addEventListener("dragover", (e) => {
-                if (dragSrcGroupId !== null) {
-                    // Group-to-group reorder
-                    e.preventDefault();
-                    e.dataTransfer.dropEffect = "move";
-                    header.classList.add("drag-over");
-                } else if (dragSrcId !== null) {
-                    // Archive being dragged onto a group header
-                    const src = archives.find((x) => x.id === dragSrcId);
-                    if (src && src.group_id !== g.id) {
-                        e.preventDefault();
-                        e.dataTransfer.dropEffect = "move";
-                        header.classList.add("drag-over-group");
-                    }
-                }
-            });
-            header.addEventListener("dragleave", () => {
-                header.classList.remove("drag-over");
-                header.classList.remove("drag-over-group");
-            });
-            header.addEventListener("drop", (e) => {
-                e.preventDefault();
-                header.classList.remove("drag-over");
-                header.classList.remove("drag-over-group");
-                if (dragSrcGroupId !== null && dragSrcGroupId !== g.id) {
-                    // Group reorder
-                    const order = groups.map((x) => x.id);
-                    const fromIdx = order.indexOf(dragSrcGroupId);
-                    const toIdx = order.indexOf(g.id);
-                    order.splice(fromIdx, 1);
-                    order.splice(toIdx, 0, dragSrcGroupId);
-                    api("POST", "/api/groups/reorder", { order });
-                    dragSrcGroupId = null;
-                } else if (dragSrcId !== null) {
-                    // Archive dropped onto group header — move into this group
-                    const src = archives.find((x) => x.id === dragSrcId);
-                    if (src && src.group_id !== g.id) {
-                        api("POST", `/api/archives/${dragSrcId}/group`, { group_id: g.id });
-                    }
-                    dragSrcId = null;
-                }
-            });
-
             archiveListEl.appendChild(header);
 
             // Group's archives (hidden if collapsed)
             if (!collapsed) {
-                let groupDividerInserted = false;
-                const groupQueued = groupArchives.filter((a) => a.download_enabled);
                 groupArchives.forEach((a, idx) => {
-                    if (!groupDividerInserted && groupQueued.length > 0 && !a.download_enabled) {
-                        groupDividerInserted = true;
-                        const div = document.createElement("li");
-                        div.className = "archive-queue-divider in-group";
-                        div.innerHTML = '<div class="queue-divider"><span>Not queued</span></div>';
-                        archiveListEl.appendChild(div);
-                    }
                     const li = buildArchiveItem(a, idx, groupArchives);
                     li.classList.add("in-group");
                     archiveListEl.appendChild(li);
                 });
             }
-        });
-
-        // Ungroup drop zone — always present when groups exist
-        const looseArchives = archives.filter((a) => !a.group_id && filteredSet.has(a.id));
-        if (groups.length > 0) {
-            const dropZone = document.createElement("li");
-            dropZone.className = "ungroup-drop-zone";
-            dropZone.innerHTML = '<div class="ungroup-divider"><span>Ungrouped</span></div>';
-            dropZone.addEventListener("dragover", (e) => {
-                if (dragSrcId !== null) {
-                    const src = archives.find((x) => x.id === dragSrcId);
-                    if (src && src.group_id !== null) {
-                        e.preventDefault();
-                        e.dataTransfer.dropEffect = "move";
-                        dropZone.classList.add("drag-over-group");
-                    }
-                }
-            });
-            dropZone.addEventListener("dragleave", () => dropZone.classList.remove("drag-over-group"));
-            dropZone.addEventListener("drop", (e) => {
-                e.preventDefault();
-                dropZone.classList.remove("drag-over-group");
-                if (dragSrcId !== null) {
-                    const src = archives.find((x) => x.id === dragSrcId);
-                    if (src && src.group_id !== null) {
-                        api("POST", `/api/archives/${dragSrcId}/group`, { group_id: null });
-                    }
-                    dragSrcId = null;
-                }
-            });
-            archiveListEl.appendChild(dropZone);
-        }
-
-        // Ungrouped archives
-        let looseDividerInserted = false;
-        const looseQueued = looseArchives.filter((a) => a.download_enabled);
-        looseArchives.forEach((a, idx) => {
-            if (!looseDividerInserted && looseQueued.length > 0 && !a.download_enabled) {
-                looseDividerInserted = true;
-                const div = document.createElement("li");
-                div.className = "archive-queue-divider";
-                div.innerHTML = '<div class="queue-divider"><span>Not queued</span></div>';
-                archiveListEl.appendChild(div);
-            }
-            archiveListEl.appendChild(buildArchiveItem(a, idx, looseArchives));
         });
 
         updateArchiveBatchActions();
@@ -1708,7 +1533,8 @@
         const btn = $("#btn-scan-files");
         if (!btn) return;
         // Check for active scan notification from server
-        const active = currentArchiveId && notifications.some(n => n.scan_archive_id === currentArchiveId && n.progress !== null);
+        // Scan active state is now tracked via scan queue, not notifications
+        const active = false;
         btn.disabled = !!active;
         btn.style.opacity = active ? "0.5" : "";
         btn.title = active
@@ -1867,9 +1693,16 @@
     let selectedFileIds = new Set();
 
     function syncSelectAll() {
-        const all = vsFiles.length > 0 && vsFiles.every(f => selectedFileIds.has(f.id));
-        $("#select-all-files").checked = all;
         updateBatchActions();
+        // Update visual selection on visible rows
+        updateFileSelectionClasses();
+    }
+
+    function updateFileSelectionClasses() {
+        fileListEl.querySelectorAll("tr[data-file-id]").forEach(tr => {
+            const fid = parseInt(tr.dataset.fileId);
+            tr.classList.toggle("selected", selectedFileIds.has(fid));
+        });
     }
 
     function updateBatchActions() {
@@ -1902,7 +1735,6 @@
             thead.innerHTML += '<th class="col-grip col-priority-sort" title="Download Order"></th>';
         }
         thead.innerHTML += '<th class="col-queue"></th>';
-        thead.innerHTML += '<th class="col-check"><input type="checkbox" id="select-all-files" title="Select / deselect all"></th>';
         thead.innerHTML += '<th class="col-name">Name</th>';
         thead.innerHTML += '<th class="col-size">Size</th>';
         thead.innerHTML += '<th class="col-modified">Modified</th>';
@@ -1910,8 +1742,6 @@
         if (isPriority) {
             thead.innerHTML += '<th class="col-priority"></th>';
         }
-        // Re-attach handlers
-        $("#select-all-files").addEventListener("change", (e) => toggleSelectAll(e.target.checked));
         // Priority column sort header (stack icon)
         const priTh = $(".col-priority-sort");
         if (priTh) {
@@ -1930,7 +1760,7 @@
     }
 
     function getColspan() {
-        return currentSort === "priority" ? 9 : 7;
+        return currentSort === "priority" ? 8 : 6;
     }
 
     // --- File drag-and-drop for priority mode ---
@@ -2139,7 +1969,7 @@
                 `<svg viewBox="0 0 16 16" width="14" height="14"><path d="M8 3a1 1 0 011 1v3h3a1 1 0 110 2H9v3a1 1 0 11-2 0V9H4a1 1 0 110-2h3V4a1 1 0 011-1z" fill="currentColor"/></svg></button></td>`;
         }
 
-        html += `<td class="col-check"><input type="checkbox" ${selectedFileIds.has(f.id) ? "checked" : ""} data-select-id="${f.id}"></td>`;
+        // Selection indicated by row class, no checkbox
 
         const renameBtn = isUnknown
             ? `<button class="file-action-btn" data-action="rename" data-file-id="${f.id}" data-file-name="${escapeHtml(f.name)}" title="Rename">` +
@@ -2205,15 +2035,14 @@
         tr.innerHTML = html;
 
         // --- Event listeners ---
-        const selectCb = tr.querySelector("input[type=checkbox][data-select-id]");
-        if (selectCb) {
-            selectCb.addEventListener("change", (e) => {
-                const fid = parseInt(e.target.dataset.selectId);
-                if (e.target.checked) selectedFileIds.add(fid);
-                else selectedFileIds.delete(fid);
-                syncSelectAll();
-            });
-        }
+
+        // Desktop-style selection: click, shift+click, ctrl+click
+        if (selectedFileIds.has(f.id)) tr.classList.add("selected");
+        tr.addEventListener("click", (e) => {
+            if (e.target.closest("button, .file-error-hint, .file-actions, .queue-toggle, .unknown-grip")) return;
+            handleFileSelect(f, e);
+        });
+
         const queueBtn = tr.querySelector(".queue-toggle");
         if (queueBtn) {
             queueBtn.addEventListener("click", (e) => {
@@ -2252,8 +2081,8 @@
         }
         if (procStatus === "processed") {
             tr.classList.add("processed-expandable");
-            tr.addEventListener("click", (e) => {
-                if (e.target.closest("input, button, .file-error-hint, .file-actions")) return;
+            tr.addEventListener("dblclick", (e) => {
+                if (e.target.closest("button, .file-error-hint, .file-actions, .queue-toggle")) return;
                 toggleProcessedDetail(tr, f, isPriority);
             });
         }
@@ -2345,9 +2174,6 @@
         rebuildTableHeader();
         vsLastRange = null;
 
-        // Sync the select-all header checkbox
-        const allChecked = files.length > 0 && files.every((f) => selectedFileIds.has(f.id));
-        $("#select-all-files").checked = allChecked;
         updateBatchActions();
 
         if (files.length === 0) {
@@ -2836,14 +2662,11 @@
             const nRes = await api("POST", "/api/notifications", {
                 message: `Adding "${label}": fetching metadata...`,
                 type: "info",
-                adding_archive: true,
-                progress: -1,
             });
             serverNotifId = nRes.id;
         } catch (_) {
-            // Fallback: local-only notification
             const nid = "local-" + (++notifIdCounter);
-            notifications.unshift({ id: nid, message: `Adding "${label}": fetching metadata...`, type: "info", created_at: Date.now() / 1000, progress: -1, adding_archive: true });
+            notifications.unshift({ id: nid, message: `Adding "${label}": fetching metadata...`, type: "info", created_at: Date.now() / 1000 });
             serverNotifId = nid;
             renderNotifBadge();
             renderNotifList();
@@ -2873,13 +2696,11 @@
             const nRes = await api("POST", "/api/notifications", {
                 message: `Batch add: 0/${total}`,
                 type: "info",
-                adding_archive: true,
-                progress: 0,
             });
             serverNotifId = nRes.id;
         } catch (_) {
             const nid = "local-" + (++notifIdCounter);
-            notifications.unshift({ id: nid, message: `Batch add: 0/${total}`, type: "info", created_at: Date.now() / 1000, progress: 0, adding_archive: true });
+            notifications.unshift({ id: nid, message: `Batch add: 0/${total}`, type: "info", created_at: Date.now() / 1000 });
             serverNotifId = nid;
             renderNotifBadge();
             renderNotifList();
@@ -2901,12 +2722,10 @@
             const done = i + 1;
             const pct = Math.round((done / total) * 100);
             if (typeof serverNotifId === "number") {
-                api("PATCH", "/api/notifications/" + serverNotifId, { message: `Batch add: ${done}/${total}`, progress: pct }).catch(() => {});
+                api("PATCH", "/api/notifications/" + serverNotifId, { message: `Batch add: ${done}/${total}` }).catch(() => {});
             }
-            // Also update local copy
             const active = notifications.find(n => n.id === serverNotifId);
             if (active) {
-                active.progress = pct;
                 active.message = `Batch add: ${done}/${total}`;
                 renderNotifList();
             }
@@ -3196,20 +3015,45 @@
         return rules;
     }
 
-    // --- Select All Files ---
+    // --- Desktop-style File Selection ---
 
-    function toggleSelectAll(checked) {
-        if (!currentArchiveId) return;
-        // Update all files in memory (not just visible rows)
-        if (checked) {
-            vsFiles.forEach(f => selectedFileIds.add(f.id));
+    let lastClickedFileIdx = null; // for shift+click range selection
+
+    function handleFileSelect(f, e) {
+        const idx = vsFiles.indexOf(f);
+        if (e.shiftKey && lastClickedFileIdx !== null) {
+            // Shift+click: range select
+            const start = Math.min(lastClickedFileIdx, idx);
+            const end = Math.max(lastClickedFileIdx, idx);
+            if (!e.ctrlKey && !e.metaKey) selectedFileIds.clear();
+            for (let i = start; i <= end; i++) {
+                selectedFileIds.add(vsFiles[i].id);
+            }
+        } else if (e.ctrlKey || e.metaKey) {
+            // Ctrl/Cmd+click: toggle individual
+            if (selectedFileIds.has(f.id)) selectedFileIds.delete(f.id);
+            else selectedFileIds.add(f.id);
+            lastClickedFileIdx = idx;
         } else {
+            // Plain click: select only this one
             selectedFileIds.clear();
+            selectedFileIds.add(f.id);
+            lastClickedFileIdx = idx;
         }
-        // Update visible checkboxes
-        const boxes = fileListEl.querySelectorAll("input[type=checkbox][data-select-id]");
-        boxes.forEach(cb => { cb.checked = checked; });
+        syncSelectAll();
+    }
+
+    function selectAllFiles() {
+        if (!currentArchiveId) return;
+        vsFiles.forEach(f => selectedFileIds.add(f.id));
         updateBatchActions();
+        updateFileSelectionClasses();
+    }
+
+    function deselectAllFiles() {
+        selectedFileIds.clear();
+        updateBatchActions();
+        updateFileSelectionClasses();
     }
 
     // --- Confirmation System ---
@@ -5229,7 +5073,6 @@
 
         // Detail
         $("#btn-back").addEventListener("click", closeDetail);
-        $("#select-all-files").addEventListener("change", (e) => toggleSelectAll(e.target.checked));
         $("#btn-retry-all").addEventListener("click", () => { if (currentArchiveId) retryArchive(currentArchiveId); });
         $("#btn-refresh-meta").addEventListener("click", refreshMetadata);
         $("#btn-scan-files").addEventListener("click", scanExistingFiles);
@@ -5283,9 +5126,33 @@
             });
         });
 
-        // Close modals / settings on Escape
+        // Keyboard shortcuts: Escape to deselect/close, Ctrl+A to select all
         document.addEventListener("keydown", (e) => {
+            // Ctrl+A / Cmd+A: select all (files or archives depending on active page)
+            if ((e.ctrlKey || e.metaKey) && e.key === "a" && !e.target.closest("input, textarea, select")) {
+                e.preventDefault();
+                if (pageDetail.classList.contains("active")) {
+                    selectAllFiles();
+                } else if (pageHome.classList.contains("active")) {
+                    const visible = getVisibleArchives();
+                    selectedArchiveIds.clear();
+                    visible.forEach(a => selectedArchiveIds.add(a.id));
+                    updateArchiveBatchActions();
+                }
+                return;
+            }
             if (e.key === "Escape") {
+                // First: clear selection if any
+                if (selectedFileIds.size > 0) {
+                    deselectAllFiles();
+                    return;
+                }
+                if (selectedArchiveIds.size > 0) {
+                    selectedArchiveIds.clear();
+                    updateArchiveBatchActions();
+                    return;
+                }
+                // Then: close modals / settings / detail
                 $$(".modal-overlay.open").forEach((m) => m.classList.remove("open"));
                 if ($("#page-settings").classList.contains("active")) {
                     closeSettings();

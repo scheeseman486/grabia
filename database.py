@@ -73,9 +73,9 @@ def init_db():
             total_size INTEGER NOT NULL DEFAULT 0,
             files_count INTEGER NOT NULL DEFAULT 0,
             metadata_json TEXT NOT NULL DEFAULT '{}',
-            position INTEGER NOT NULL DEFAULT 0,
             download_enabled INTEGER NOT NULL DEFAULT 0,
             status TEXT NOT NULL DEFAULT 'idle',
+            status_pct INTEGER DEFAULT NULL,
             added_at REAL NOT NULL,
             server TEXT NOT NULL DEFAULT '',
             dir TEXT NOT NULL DEFAULT ''
@@ -91,7 +91,6 @@ def init_db():
             format TEXT NOT NULL DEFAULT '',
             source TEXT NOT NULL DEFAULT '',
             mtime TEXT NOT NULL DEFAULT '',
-            queued INTEGER NOT NULL DEFAULT 1,
             download_status TEXT NOT NULL DEFAULT 'pending',
             downloaded_bytes INTEGER NOT NULL DEFAULT 0,
             error_message TEXT NOT NULL DEFAULT '',
@@ -100,7 +99,6 @@ def init_db():
             change_detail TEXT NOT NULL DEFAULT '',
             queue_position INTEGER DEFAULT NULL,
             downloaded INTEGER NOT NULL DEFAULT 0,
-            download_batch_id INTEGER DEFAULT NULL,
             FOREIGN KEY (archive_id) REFERENCES archives(id) ON DELETE CASCADE,
             UNIQUE(archive_id, name)
         );
@@ -141,10 +139,6 @@ def init_db():
             message TEXT NOT NULL,
             type TEXT NOT NULL DEFAULT 'info',
             created_at REAL NOT NULL,
-            progress REAL DEFAULT NULL,
-            scan_archive_id INTEGER DEFAULT NULL,
-            processing_archive_id INTEGER DEFAULT NULL,
-            adding_archive INTEGER NOT NULL DEFAULT 0,
             dismissed INTEGER NOT NULL DEFAULT 0
         );
 
@@ -229,17 +223,6 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_activity_log_archive ON activity_log(archive_id);
         CREATE INDEX IF NOT EXISTS idx_activity_log_timestamp ON activity_log(timestamp);
 
-        -- Queue overhaul: generic batch tracking for all queue types
-        CREATE TABLE IF NOT EXISTS batches (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            queue_type TEXT NOT NULL,
-            archive_id INTEGER DEFAULT NULL,
-            created_at REAL NOT NULL,
-            file_count INTEGER NOT NULL DEFAULT 0,
-            completed_count INTEGER NOT NULL DEFAULT 0,
-            status TEXT NOT NULL DEFAULT 'pending'
-        );
-
         -- Queue overhaul: file-level processing queue (child of processing_jobs)
         CREATE TABLE IF NOT EXISTS processing_queue (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -261,7 +244,7 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             file_id INTEGER NOT NULL REFERENCES archive_files(id) ON DELETE CASCADE,
             archive_id INTEGER NOT NULL,
-            batch_id INTEGER DEFAULT NULL REFERENCES batches(id) ON DELETE SET NULL,
+            batch_id INTEGER DEFAULT NULL,
             status TEXT NOT NULL DEFAULT 'pending',
             position INTEGER NOT NULL DEFAULT 0,
             created_at REAL NOT NULL
@@ -328,18 +311,6 @@ def init_db():
     except sqlite3.OperationalError:
         conn.execute("ALTER TABLE archives ADD COLUMN processing_profile_id INTEGER DEFAULT NULL REFERENCES processing_profiles(id) ON DELETE SET NULL")
 
-    # Rename 'selected' column to 'queued' (clearer intent, avoids confusion
-    # with UI checkbox selection).  ALTER TABLE ... RENAME COLUMN is safe and
-    # non-destructive — it keeps all data, indexes, and constraints intact.
-    try:
-        conn.execute("SELECT queued FROM archive_files LIMIT 1")
-    except sqlite3.OperationalError:
-        # Column still has the old name — rename it
-        try:
-            conn.execute("ALTER TABLE archive_files RENAME COLUMN selected TO queued")
-        except sqlite3.OperationalError:
-            pass  # Shouldn't happen, but don't break startup
-
     # Add job_id to notifications for "View Log" linkage
     try:
         conn.execute("SELECT job_id FROM notifications LIMIT 1")
@@ -389,11 +360,108 @@ def init_db():
         conn.execute("UPDATE archive_files SET downloaded = 1 WHERE download_status = 'completed'")
         log.info("Migrated downloaded column from download_status")
 
-    # Add download_batch_id column
+    # Migration: drop queued and download_batch_id columns (replaced by queue_position)
     try:
-        conn.execute("SELECT download_batch_id FROM archive_files LIMIT 1")
+        conn.execute("SELECT queued FROM archive_files LIMIT 1")
+        # Column exists — need to rebuild table to drop it
+        log.info("Dropping legacy 'queued' and 'download_batch_id' columns from archive_files")
+        conn.execute("PRAGMA foreign_keys=OFF")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS archive_files_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                archive_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                size INTEGER NOT NULL DEFAULT 0,
+                md5 TEXT NOT NULL DEFAULT '',
+                sha1 TEXT NOT NULL DEFAULT '',
+                format TEXT NOT NULL DEFAULT '',
+                source TEXT NOT NULL DEFAULT '',
+                mtime TEXT NOT NULL DEFAULT '',
+                download_status TEXT NOT NULL DEFAULT 'pending',
+                downloaded_bytes INTEGER NOT NULL DEFAULT 0,
+                error_message TEXT NOT NULL DEFAULT '',
+                retry_count INTEGER NOT NULL DEFAULT 0,
+                change_status TEXT NOT NULL DEFAULT '',
+                change_detail TEXT NOT NULL DEFAULT '',
+                queue_position INTEGER DEFAULT NULL,
+                downloaded INTEGER NOT NULL DEFAULT 0,
+                origin TEXT NOT NULL DEFAULT 'manifest',
+                processing_status TEXT NOT NULL DEFAULT '',
+                processed_filename TEXT NOT NULL DEFAULT '',
+                processor_type TEXT NOT NULL DEFAULT '',
+                processing_error TEXT NOT NULL DEFAULT '',
+                processed_files_json TEXT NOT NULL DEFAULT '',
+                FOREIGN KEY (archive_id) REFERENCES archives(id) ON DELETE CASCADE,
+                UNIQUE(archive_id, name)
+            )
+        """)
+        conn.execute("""
+            INSERT INTO archive_files_new (id, archive_id, name, size, md5, sha1, format, source, mtime,
+                download_status, downloaded_bytes, error_message, retry_count, change_status, change_detail,
+                queue_position, downloaded, origin, processing_status, processed_filename, processor_type,
+                processing_error, processed_files_json)
+            SELECT id, archive_id, name, size, md5, sha1, format, source, mtime,
+                download_status, downloaded_bytes, error_message, retry_count, change_status, change_detail,
+                queue_position, downloaded, origin, processing_status, processed_filename, processor_type,
+                processing_error, processed_files_json
+            FROM archive_files
+        """)
+        conn.execute("DROP TABLE archive_files")
+        conn.execute("ALTER TABLE archive_files_new RENAME TO archive_files")
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.commit()
+        log.info("Dropped 'queued' and 'download_batch_id' columns successfully")
     except sqlite3.OperationalError:
-        conn.execute("ALTER TABLE archive_files ADD COLUMN download_batch_id INTEGER DEFAULT NULL")
+        pass  # Column already gone
+
+    # Migration: drop batches table
+    conn.execute("DROP TABLE IF EXISTS batches")
+
+    # Migration: add status_pct column to archives
+    try:
+        conn.execute("SELECT status_pct FROM archives LIMIT 1")
+    except sqlite3.OperationalError:
+        conn.execute("ALTER TABLE archives ADD COLUMN status_pct INTEGER DEFAULT NULL")
+
+    # Migration: drop position column from archives (no longer used)
+    try:
+        conn.execute("SELECT position FROM archives LIMIT 1")
+        # Column exists — just leave it for now (harmless), avoid table rebuild
+        # The column is simply ignored; removing it would require a full table rebuild
+    except sqlite3.OperationalError:
+        pass
+
+    # Migration: rename old status values to new ones
+    conn.execute("UPDATE archives SET status = 'complete' WHERE status = 'completed'")
+    conn.execute("UPDATE archives SET status = 'error' WHERE status = 'failed'")
+
+    # Migration: drop legacy notification columns (progress, scan_archive_id,
+    # processing_archive_id, adding_archive) — replaced by flash notifications.
+    try:
+        conn.execute("SELECT progress FROM notifications LIMIT 1")
+        # Old columns exist — rebuild the table to drop them
+        log.info("Dropping legacy columns from notifications table")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS notifications_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                message TEXT NOT NULL,
+                type TEXT NOT NULL DEFAULT 'info',
+                created_at REAL NOT NULL,
+                dismissed INTEGER NOT NULL DEFAULT 0,
+                job_id INTEGER DEFAULT NULL
+            )
+        """)
+        conn.execute("""
+            INSERT INTO notifications_new (id, message, type, created_at, dismissed, job_id)
+            SELECT id, message, type, created_at, dismissed, job_id
+            FROM notifications
+        """)
+        conn.execute("DROP TABLE notifications")
+        conn.execute("ALTER TABLE notifications_new RENAME TO notifications")
+        conn.commit()
+        log.info("Dropped legacy notification columns successfully")
+    except sqlite3.OperationalError:
+        pass  # Columns already gone (fresh DB or already migrated)
 
     # Add manifest cache columns to archives
     try:
@@ -416,43 +484,48 @@ def init_db():
           AND md5 = '' AND sha1 = '' AND format = '' AND source = '' AND mtime = ''
     """)
 
-    # Dequeue files that have already completed or hit a conflict — they should
-    # not remain queued since they don't need downloading.
-    conn.execute("""
-        UPDATE archive_files SET queued = 0
-        WHERE queued = 1 AND download_status IN ('completed', 'conflict')
-    """)
-    # Also clear queue_position for completed/conflict files
+    # Dequeue files that have already completed or hit a conflict
     conn.execute("""
         UPDATE archive_files SET queue_position = NULL
         WHERE queue_position IS NOT NULL AND download_status IN ('completed', 'conflict')
     """)
 
     # Fix archives stuck on 'downloading' or 'queued' from a previous session.
-    # On startup the downloader is not running, so no files can be in-flight.
-    # Recalculate status for any archive marked 'downloading' or 'queued'.
-    stuck = conn.execute(
-        "SELECT id FROM archives WHERE status IN ('downloading', 'queued')"
-    ).fetchall()
-    for row in stuck:
+    # Reset any files stuck in 'downloading' state back to pending.
+    conn.execute("""
+        UPDATE archive_files SET download_status = 'pending'
+        WHERE download_status = 'downloading'
+    """)
+    # Recalculate status for all archives (ensures status_pct is populated)
+    all_archives = conn.execute("SELECT id FROM archives").fetchall()
+    for row in all_archives:
         aid = row["id"]
         counts = conn.execute("""
             SELECT
                 COUNT(*) as total,
                 SUM(CASE WHEN download_status = 'completed' THEN 1 ELSE 0 END) as completed,
                 SUM(CASE WHEN download_status = 'failed' THEN 1 ELSE 0 END) as failed,
-                SUM(CASE WHEN download_status = 'conflict' THEN 1 ELSE 0 END) as conflict
-            FROM archive_files
-            WHERE archive_id = ? AND (queue_position IS NOT NULL OR download_status IN ('completed', 'conflict'))
+                SUM(CASE WHEN queue_position IS NOT NULL THEN 1 ELSE 0 END) as queued
+            FROM archive_files WHERE archive_id = ?
         """, (aid,)).fetchone()
-        if counts["total"] == 0:
-            conn.execute("UPDATE archives SET status = 'idle' WHERE id = ?", (aid,))
-        elif counts["completed"] == counts["total"]:
-            conn.execute("UPDATE archives SET status = 'completed' WHERE id = ?", (aid,))
-        elif counts["completed"] + counts["failed"] + counts["conflict"] == counts["total"]:
-            conn.execute("UPDATE archives SET status = 'partial' WHERE id = ?", (aid,))
+        total = counts["total"] or 0
+        completed = counts["completed"] or 0
+        failed = counts["failed"] or 0
+        queued = counts["queued"] or 0
+        pct = round(completed * 100 / total) if total > 0 else 0
+
+        if queued > 0:
+            status = "queued"
+        elif completed == total and total > 0:
+            status = "complete"
+        elif completed > 0:
+            status = "error" if failed > 0 else "partial"
+        elif failed > 0:
+            status = "error"
         else:
-            conn.execute("UPDATE archives SET status = 'idle' WHERE id = ?", (aid,))
+            status = "idle"
+        conn.execute("UPDATE archives SET status = ?, status_pct = ? WHERE id = ?",
+                      (status, pct, aid))
 
     # Reset scan queue entries stuck from a crash
     conn.execute("UPDATE scan_queue SET status = 'pending' WHERE status = 'running'")
@@ -477,13 +550,10 @@ def init_db():
         WHERE processing_status IN ('completed', 'extracted')
     """)
 
-    # Clean up stale in-progress notifications (scan/processing that were mid-flight)
-    conn.execute("""
-        DELETE FROM notifications
-        WHERE dismissed = 0
-          AND (scan_archive_id IS NOT NULL OR processing_archive_id IS NOT NULL OR adding_archive = 1)
-          AND progress IS NOT NULL
-    """)
+    # Migration: drop legacy notification columns
+    # For existing databases, remove columns that are no longer used.
+    # SQLite doesn't support DROP COLUMN before 3.35, so we just leave them if present.
+    # They're harmless — the code no longer reads or writes them.
 
     conn.commit()
     conn.close()
@@ -518,8 +588,8 @@ def add_archive(identifier, url, title, description, total_size, files_count, me
     with _db() as conn:
         conn.execute(
             """INSERT INTO archives (identifier, url, title, description, total_size, files_count,
-               metadata_json, position, download_enabled, status, added_at, server, dir)
-               VALUES (?, ?, ?, ?, ?, ?, ?, (SELECT COALESCE(MAX(position), -1) + 1 FROM archives), 0, 'idle', ?, ?, ?)""",
+               metadata_json, download_enabled, status, added_at, server, dir)
+               VALUES (?, ?, ?, ?, ?, ?, ?, 0, 'idle', ?, ?, ?)""",
             (identifier, url, title, description, total_size, files_count,
              json.dumps(metadata_json), time.time(), server, dir_path),
         )
@@ -541,8 +611,8 @@ def add_archive_files(archive_id, files):
                 conn.execute(
                     """INSERT OR IGNORE INTO archive_files
                        (archive_id, name, size, md5, sha1, format, source, mtime,
-                        queued, queue_position)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)""",
+                        queue_position)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (archive_id, f["name"], int(f.get("size", 0) or 0),
                      f.get("md5", ""), f.get("sha1", ""), f.get("format", ""),
                      f.get("source", ""), f.get("mtime", ""), new_pos),
@@ -554,17 +624,19 @@ def add_archive_files(archive_id, files):
 
 
 def _enrich_archives_with_progress(archives, conn):
-    """Add download progress stats to a list of archive dicts."""
+    """Add download progress stats to a list of archive dicts.
+    Uses total file counts (not just queued) as the denominator."""
     if not archives:
         return archives
     ids = [a["id"] for a in archives]
     placeholders = ",".join("?" * len(ids))
     rows = conn.execute(f"""
         SELECT archive_id,
+               COUNT(*) AS total_files,
                SUM(CASE WHEN download_status = 'completed' THEN 1 ELSE 0 END) AS completed_files,
-               SUM(CASE WHEN queue_position IS NOT NULL OR download_status = 'completed' THEN 1 ELSE 0 END) AS selected_files,
-               SUM(CASE WHEN queue_position IS NOT NULL OR download_status = 'completed' THEN size ELSE 0 END) AS selected_size,
-               SUM(CASE WHEN queue_position IS NOT NULL OR download_status = 'completed' THEN downloaded_bytes ELSE 0 END) AS downloaded_bytes
+               COALESCE(SUM(size), 0) AS total_size,
+               COALESCE(SUM(downloaded_bytes), 0) AS downloaded_bytes,
+               SUM(CASE WHEN queue_position IS NOT NULL THEN 1 ELSE 0 END) AS queued_files
         FROM archive_files WHERE archive_id IN ({placeholders})
         GROUP BY archive_id
     """, ids).fetchall()
@@ -572,33 +644,34 @@ def _enrich_archives_with_progress(archives, conn):
     for a in archives:
         p = prog.get(a["id"], {})
         a["completed_files"] = p.get("completed_files", 0)
-        a["selected_files"] = p.get("selected_files", 0)
-        a["selected_size"] = p.get("selected_size", 0)
+        a["total_files"] = p.get("total_files", 0)
+        a["total_size"] = p.get("total_size", 0)
         a["downloaded_bytes"] = p.get("downloaded_bytes", 0)
+        a["queued_files"] = p.get("queued_files", 0)
     return archives
 
 
 def get_archive_progress(archive_id):
-    """Return download progress stats for a single archive."""
+    """Return download progress stats for a single archive using total file counts."""
     with _db() as conn:
         row = conn.execute("""
-            SELECT SUM(CASE WHEN download_status = 'completed' THEN 1 ELSE 0 END) AS completed_files,
-                   SUM(CASE WHEN queue_position IS NOT NULL OR download_status = 'completed' THEN 1 ELSE 0 END) AS selected_files,
-                   SUM(CASE WHEN queue_position IS NOT NULL OR download_status = 'completed' THEN size ELSE 0 END) AS selected_size,
-                   SUM(CASE WHEN queue_position IS NOT NULL OR download_status = 'completed' THEN downloaded_bytes ELSE 0 END) AS downloaded_bytes
+            SELECT COUNT(*) AS total_files,
+                   SUM(CASE WHEN download_status = 'completed' THEN 1 ELSE 0 END) AS completed_files,
+                   COALESCE(SUM(size), 0) AS total_size,
+                   COALESCE(SUM(downloaded_bytes), 0) AS downloaded_bytes,
+                   SUM(CASE WHEN queue_position IS NOT NULL THEN 1 ELSE 0 END) AS queued_files
             FROM archive_files WHERE archive_id = ?
         """, (archive_id,)).fetchone()
         if row:
             return dict(row)
-        return {"completed_files": 0, "selected_files": 0, "selected_size": 0, "downloaded_bytes": 0}
+        return {"completed_files": 0, "total_files": 0, "total_size": 0, "downloaded_bytes": 0, "queued_files": 0}
 
 
 def get_archives():
     with _db() as conn:
-        rows = conn.execute("SELECT * FROM archives ORDER BY download_enabled DESC, position ASC").fetchall()
+        rows = conn.execute("SELECT * FROM archives ORDER BY title ASC").fetchall()
         archives = [dict(r) for r in rows]
         _enrich_archives_with_progress(archives, conn)
-        # Ensure group_id is always present (for older DBs before migration runs mid-session)
         for a in archives:
             a.setdefault("group_id", None)
         return archives
@@ -626,20 +699,6 @@ def delete_archive(archive_id):
         conn.commit()
 
 
-def update_archive_position(archive_id, new_position):
-    with _db() as conn:
-        conn.execute("UPDATE archives SET position = ? WHERE id = ?", (new_position, archive_id))
-        conn.commit()
-
-
-def reorder_archives(id_order):
-    """id_order is a list of archive IDs in desired order."""
-    with _db() as conn:
-        for pos, aid in enumerate(id_order):
-            conn.execute("UPDATE archives SET position = ? WHERE id = ?", (pos, aid))
-        conn.commit()
-
-
 def recompute_archive_file_count(archive_id):
     """Recompute files_count and total_size for an archive from the archive_files table."""
     conn = get_db()
@@ -662,7 +721,16 @@ def recompute_archive_file_count(archive_id):
 
 
 def recompute_archive_status(archive_id, fallback=None):
-    """Recalculate archive status from its file statuses (used after scan)."""
+    """Recalculate archive status from ALL files in the archive.
+
+    Status meanings:
+        idle       - no files downloaded or queued
+        queued     - some files in the download queue
+        downloading - a file from this archive is actively downloading
+        partial    - some (but not all) files downloaded; frontend shows status_pct%
+        complete   - every file in the archive is downloaded
+        error      - some files failed and nothing is queued to retry
+    """
     conn = get_db()
     try:
         conn.execute("BEGIN IMMEDIATE")
@@ -671,24 +739,39 @@ def recompute_archive_status(archive_id, fallback=None):
                 COUNT(*) as total,
                 SUM(CASE WHEN download_status = 'completed' THEN 1 ELSE 0 END) as completed,
                 SUM(CASE WHEN download_status = 'failed' THEN 1 ELSE 0 END) as failed,
-                SUM(CASE WHEN download_status = 'conflict' THEN 1 ELSE 0 END) as conflict
+                SUM(CASE WHEN queue_position IS NOT NULL THEN 1 ELSE 0 END) as queued,
+                SUM(CASE WHEN download_status = 'downloading' THEN 1 ELSE 0 END) as downloading
             FROM archive_files
-            WHERE archive_id = ? AND (queue_position IS NOT NULL OR download_status IN ('completed', 'conflict'))
+            WHERE archive_id = ?
         """, (archive_id,)).fetchone()
-        if row["total"] == 0:
-            status = "idle"
-        elif row["completed"] == row["total"]:
-            status = "completed"
-        elif row["completed"] + row["failed"] + row["conflict"] == row["total"]:
-            status = "partial"
-        elif row["completed"] > 0 or row["conflict"] > 0:
-            status = "idle"
+
+        total = row["total"] or 0
+        completed = row["completed"] or 0
+        failed = row["failed"] or 0
+        queued = row["queued"] or 0
+        downloading = row["downloading"] or 0
+        pct = round(completed * 100 / total) if total > 0 else 0
+
+        if downloading > 0:
+            status = "downloading"
+        elif queued > 0:
+            status = "queued"
+        elif completed == total and total > 0:
+            status = "complete"
+        elif completed > 0:
+            if failed > 0:
+                status = "error"
+            else:
+                status = "partial"
+        elif failed > 0:
+            status = "error"
         elif fallback:
             status = fallback
         else:
-            status = None
-        if status:
-            conn.execute("UPDATE archives SET status = ? WHERE id = ?", (status, archive_id))
+            status = "idle"
+
+        conn.execute("UPDATE archives SET status = ?, status_pct = ? WHERE id = ?",
+                      (status, pct, archive_id))
         conn.commit()
     except Exception:
         conn.rollback()
@@ -775,24 +858,17 @@ def set_file_queued(file_id, queued):
         clear_file_queue_position(file_id)
 
 
-def set_file_queue_position(file_id, batch_id=None):
+def set_file_queue_position(file_id):
     """Add a file to the download queue at the end (MAX + 1)."""
     with _db() as conn:
-        # Only queue files that still need downloading
         max_pos = conn.execute(
             "SELECT COALESCE(MAX(queue_position), 0) FROM archive_files WHERE queue_position IS NOT NULL"
         ).fetchone()[0]
-        updates = ["queue_position = ?", "queued = 1"]
-        params = [max_pos + 1]
-        if batch_id is not None:
-            updates.append("download_batch_id = ?")
-            params.append(batch_id)
-        params.append(file_id)
         conn.execute(
-            f"""UPDATE archive_files SET {', '.join(updates)}
+            """UPDATE archive_files SET queue_position = ?
                WHERE id = ? AND download_status NOT IN ('completed', 'conflict')
                  AND processing_status NOT IN ('queued', 'processing', 'processed')""",
-            params,
+            (max_pos + 1, file_id),
         )
         conn.commit()
 
@@ -800,20 +876,10 @@ def set_file_queue_position(file_id, batch_id=None):
 def clear_file_queue_position(file_id):
     """Remove a file from the download queue."""
     with _db() as conn:
-        # Get the batch_id before clearing, so we can decrement the batch
-        row = conn.execute(
-            "SELECT download_batch_id FROM archive_files WHERE id = ?", (file_id,)
-        ).fetchone()
         conn.execute(
-            "UPDATE archive_files SET queue_position = NULL, queued = 0, download_batch_id = NULL WHERE id = ?",
+            "UPDATE archive_files SET queue_position = NULL WHERE id = ?",
             (file_id,),
         )
-        # Decrement the batch file_count if this file was part of a batch
-        if row and row["download_batch_id"]:
-            conn.execute(
-                "UPDATE batches SET file_count = MAX(file_count - 1, 0) WHERE id = ?",
-                (row["download_batch_id"],),
-            )
         conn.commit()
 
 
@@ -823,7 +889,7 @@ def clear_download_queue():
     with _db() as conn:
         conn.execute(
             """UPDATE archive_files
-               SET queue_position = NULL, queued = 0, download_batch_id = NULL
+               SET queue_position = NULL
                WHERE queue_position IS NOT NULL
                  AND download_status NOT IN ('downloading')""",
         )
@@ -832,16 +898,14 @@ def clear_download_queue():
         return count
 
 
-def set_all_files_queued(archive_id, queued, batch_id=None):
+def set_all_files_queued(archive_id, queued):
     """Batch-add or remove all files in an archive from the download queue.
     Returns (added_count, skipped_count) when queuing."""
     with _db() as conn:
         if queued:
-            # Get current max position
             max_pos = conn.execute(
                 "SELECT COALESCE(MAX(queue_position), 0) FROM archive_files WHERE queue_position IS NOT NULL"
             ).fetchone()[0]
-            # Find eligible files (not already queued, not completed, not processing)
             eligible = conn.execute(
                 """SELECT id FROM archive_files
                    WHERE archive_id = ? AND queue_position IS NULL
@@ -853,18 +917,11 @@ def set_all_files_queued(archive_id, queued, batch_id=None):
             added = 0
             for row in eligible:
                 max_pos += 1
-                updates = ["queue_position = ?", "queued = 1"]
-                params = [max_pos]
-                if batch_id is not None:
-                    updates.append("download_batch_id = ?")
-                    params.append(batch_id)
-                params.append(row["id"])
                 conn.execute(
-                    f"UPDATE archive_files SET {', '.join(updates)} WHERE id = ?",
-                    params,
+                    "UPDATE archive_files SET queue_position = ? WHERE id = ?",
+                    (max_pos, row["id"]),
                 )
                 added += 1
-            # Count how many were already queued or completed
             already = conn.execute(
                 """SELECT COUNT(*) FROM archive_files
                    WHERE archive_id = ? AND (queue_position IS NOT NULL
@@ -876,7 +933,7 @@ def set_all_files_queued(archive_id, queued, batch_id=None):
             return added, already
         else:
             conn.execute(
-                "UPDATE archive_files SET queue_position = NULL, queued = 0, download_batch_id = NULL WHERE archive_id = ?",
+                "UPDATE archive_files SET queue_position = NULL WHERE archive_id = ?",
                 (archive_id,),
             )
             conn.commit()
@@ -895,9 +952,7 @@ def set_file_download_status(file_id, status, downloaded_bytes=None, error_messa
             params.append(error_message)
         # Dequeue files that have reached a terminal state
         if status in ("completed", "conflict"):
-            updates.append("queued = 0")
             updates.append("queue_position = NULL")
-            updates.append("download_batch_id = NULL")
         # Set downloaded flag: 1 when completed, 0 when reset to pending
         if status == "completed":
             updates.append("downloaded = 1")
@@ -905,25 +960,6 @@ def set_file_download_status(file_id, status, downloaded_bytes=None, error_messa
             updates.append("downloaded = 0")
         params.append(file_id)
         conn.execute(f"UPDATE archive_files SET {', '.join(updates)} WHERE id = ?", params)
-        # If completed, increment batch completed_count
-        if status == "completed":
-            row = conn.execute(
-                "SELECT download_batch_id FROM archive_files WHERE id = ?", (file_id,)
-            ).fetchone()
-            if row and row["download_batch_id"]:
-                conn.execute(
-                    "UPDATE batches SET completed_count = completed_count + 1 WHERE id = ?",
-                    (row["download_batch_id"],),
-                )
-                # Check if batch is now complete
-                batch = conn.execute(
-                    "SELECT * FROM batches WHERE id = ?", (row["download_batch_id"],)
-                ).fetchone()
-                if batch and batch["completed_count"] >= batch["file_count"]:
-                    conn.execute(
-                        "UPDATE batches SET status = 'completed' WHERE id = ?",
-                        (row["download_batch_id"],),
-                    )
         conn.commit()
 
 
@@ -971,7 +1007,7 @@ def get_download_queue(limit=200):
 
 
 def get_download_progress():
-    """Get overall download progress stats."""
+    """Get overall download progress stats for the queue (files with queue_position)."""
     with _db() as conn:
         row = conn.execute("""
             SELECT
@@ -979,18 +1015,16 @@ def get_download_progress():
                 SUM(CASE WHEN download_status = 'completed' THEN 1 ELSE 0 END) as completed_files,
                 SUM(CASE WHEN download_status = 'downloading' THEN 1 ELSE 0 END) as active_files,
                 SUM(CASE WHEN download_status = 'failed' THEN 1 ELSE 0 END) as failed_files,
-                SUM(CASE WHEN download_status IN ('pending', 'failed') THEN 1 ELSE 0 END) as queued_files,
-                SUM(size) as total_size,
-                SUM(downloaded_bytes) as downloaded_bytes
-            FROM archive_files af
-            JOIN archives a ON af.archive_id = a.id
-            WHERE af.queue_position IS NOT NULL OR af.download_status = 'completed'
+                COALESCE(SUM(size), 0) as total_size,
+                COALESCE(SUM(downloaded_bytes), 0) as downloaded_bytes
+            FROM archive_files
+            WHERE queue_position IS NOT NULL
         """).fetchone()
         if row:
             return dict(row)
         return {
             "total_files": 0, "completed_files": 0, "active_files": 0,
-            "failed_files": 0, "queued_files": 0, "total_size": 0, "downloaded_bytes": 0,
+            "failed_files": 0, "total_size": 0, "downloaded_bytes": 0,
         }
 
 
@@ -1028,31 +1062,8 @@ def reset_stale_processing():
         )
         stuck_jobs = conn.execute("SELECT changes()").fetchone()[0]
 
-        # Dismiss ALL stale processing notifications — any notification with
-        # processing_archive_id set where the job is no longer running.
-        # This catches both jobs stuck in 'running' (just failed above) and
-        # jobs that were already marked failed/completed but whose notification
-        # was never cleaned up.  Clear the processing_archive_id so that
-        # clear_notifications() and the dismiss endpoint can handle them
-        # normally going forward.
-        conn.execute("""
-            UPDATE notifications
-            SET dismissed = 1, processing_archive_id = NULL
-            WHERE processing_archive_id IS NOT NULL
-              AND dismissed = 0
-              AND processing_archive_id NOT IN (
-                  SELECT archive_id FROM processing_jobs WHERE status IN ('pending', 'running')
-              )
-        """)
-        stale_notifs = conn.execute("SELECT changes()").fetchone()[0]
-
-        # Same for scan notifications
-        conn.execute("""
-            UPDATE notifications
-            SET dismissed = 1, scan_archive_id = NULL
-            WHERE scan_archive_id IS NOT NULL
-              AND dismissed = 0
-        """)
+        # Dismiss any undismissed notifications left over from a previous session
+        conn.execute("UPDATE notifications SET dismissed = 1 WHERE dismissed = 0")
 
         # Fail stuck activity jobs for processing and scan
         conn.execute(
@@ -1064,9 +1075,9 @@ def reset_stale_processing():
 
         conn.commit()
 
-        if stuck_files or stuck_jobs or stale_notifs:
-            log.info("Startup cleanup: %d stuck files, %d stuck jobs, %d stale notifications",
-                     stuck_files, stuck_jobs, stale_notifs)
+        if stuck_files or stuck_jobs:
+            log.info("Startup cleanup: %d stuck files, %d stuck jobs",
+                     stuck_files, stuck_jobs)
 
 
 def reset_failed_files(archive_id):
@@ -1511,16 +1522,12 @@ def get_processing_queue_files(archive_id):
 
 # --- Notifications ---
 
-def create_notification(message, type="info", progress=None, scan_archive_id=None,
-                        processing_archive_id=None, adding_archive=False, job_id=None):
-    """Create a persistent notification and return its ID."""
+def create_notification(message, type="info", job_id=None):
+    """Create a flash notification and return its ID."""
     with _db() as conn:
         conn.execute(
-            """INSERT INTO notifications (message, type, created_at, progress, scan_archive_id,
-               processing_archive_id, adding_archive, job_id)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (message, type, time.time(), progress, scan_archive_id,
-             processing_archive_id, 1 if adding_archive else 0, job_id),
+            "INSERT INTO notifications (message, type, created_at, dismissed, job_id) VALUES (?, ?, ?, 0, ?)",
+            (message, type, time.time(), job_id),
         )
         nid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
         conn.commit()
@@ -1528,8 +1535,8 @@ def create_notification(message, type="info", progress=None, scan_archive_id=Non
 
 
 def update_notification(notif_id, **kwargs):
-    """Update fields on a notification. Supported: message, type, progress, dismissed, job_id."""
-    allowed = {"message", "type", "progress", "dismissed", "job_id"}
+    """Update fields on a notification. Supported: message, type, dismissed, job_id."""
+    allowed = {"message", "type", "dismissed", "job_id"}
     updates = {k: v for k, v in kwargs.items() if k in allowed}
     if not updates:
         return
@@ -1572,38 +1579,9 @@ def get_notification(notif_id):
 
 
 def clear_notifications():
-    """Dismiss all non-active notifications.
-
-    Clears notifications that have no ongoing operation, plus stale
-    processing/scan notifications whose jobs are no longer running.
-    """
+    """Dismiss all undismissed notifications."""
     with _db() as conn:
-        # Clear simple notifications (no linked operation)
-        conn.execute("""
-            UPDATE notifications SET dismissed = 1
-            WHERE dismissed = 0
-              AND scan_archive_id IS NULL
-              AND processing_archive_id IS NULL
-              AND adding_archive = 0
-        """)
-        # Clear stale processing notifications (job finished/failed/cancelled)
-        conn.execute("""
-            UPDATE notifications SET dismissed = 1, processing_archive_id = NULL
-            WHERE dismissed = 0
-              AND processing_archive_id IS NOT NULL
-              AND processing_archive_id NOT IN (
-                  SELECT archive_id FROM processing_jobs WHERE status IN ('pending', 'running')
-              )
-        """)
-        # Clear stale scan notifications (no pending/running scan queue entries remain)
-        conn.execute("""
-            UPDATE notifications SET dismissed = 1, scan_archive_id = NULL
-            WHERE dismissed = 0
-              AND scan_archive_id IS NOT NULL
-              AND scan_archive_id NOT IN (
-                  SELECT DISTINCT archive_id FROM scan_queue WHERE status IN ('pending', 'running')
-              )
-        """)
+        conn.execute("UPDATE notifications SET dismissed = 1 WHERE dismissed = 0")
         conn.commit()
 
 
@@ -1629,26 +1607,6 @@ def prune_notifications(max_age_days=7, max_dismissed=200):
             )
         """, (max_dismissed,))
         conn.commit()
-
-
-def find_notification_by_scan(archive_id):
-    """Find the active (non-dismissed) scan notification for an archive."""
-    with _db() as conn:
-        row = conn.execute(
-            "SELECT * FROM notifications WHERE scan_archive_id = ? AND dismissed = 0",
-            (archive_id,),
-        ).fetchone()
-        return dict(row) if row else None
-
-
-def find_notification_by_processing(archive_id):
-    """Find the active (non-dismissed) processing notification for an archive."""
-    with _db() as conn:
-        row = conn.execute(
-            "SELECT * FROM notifications WHERE processing_archive_id = ? AND dismissed = 0",
-            (archive_id,),
-        ).fetchone()
-        return dict(row) if row else None
 
 
 # --- Processing Jobs ---
@@ -2065,38 +2023,6 @@ def get_collection_layouts(collection_id):
 
 # ── Queue Overhaul: Batches ──────────────────────────────────────────
 
-def create_batch(queue_type, file_count=0, archive_id=None):
-    """Create a generic batch record for notification tracking. Returns batch ID."""
-    with _db() as conn:
-        conn.execute(
-            "INSERT INTO batches (queue_type, archive_id, created_at, file_count, status) VALUES (?, ?, ?, ?, 'pending')",
-            (queue_type, archive_id, time.time(), file_count),
-        )
-        batch_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
-        conn.commit()
-        return batch_id
-
-
-def get_batch(batch_id):
-    """Return a single batch record."""
-    with _db() as conn:
-        row = conn.execute("SELECT * FROM batches WHERE id = ?", (batch_id,)).fetchone()
-        return dict(row) if row else None
-
-
-def update_batch(batch_id, **kwargs):
-    """Update batch fields. Accepted: file_count, completed_count, status."""
-    allowed = {"file_count", "completed_count", "status"}
-    updates = {k: v for k, v in kwargs.items() if k in allowed}
-    if not updates:
-        return
-    set_clause = ", ".join(f"{k} = ?" for k in updates)
-    values = list(updates.values()) + [batch_id]
-    with _db() as conn:
-        conn.execute(f"UPDATE batches SET {set_clause} WHERE id = ?", values)
-        conn.commit()
-
-
 # ── Queue Overhaul: Compaction ───────────────────────────────────────
 
 def compact_download_queue():
@@ -2330,12 +2256,11 @@ def reorder_processing_queue(entry_id, new_position):
 
 # ── Queue Overhaul: Scan Queue ───────────────────────────────────────
 
-def add_scan_queue_entry(file_id, archive_id, batch_id=None, priority=False):
+def add_scan_queue_entry(file_id, archive_id, priority=False):
     """Add a file to the scan queue. If priority=True, insert at position 0."""
     with _db() as conn:
         if priority:
             position = 0
-            # Shift existing entries down
             conn.execute(
                 "UPDATE scan_queue SET position = position + 1 WHERE status = 'pending'"
             )
@@ -2345,8 +2270,8 @@ def add_scan_queue_entry(file_id, archive_id, batch_id=None, priority=False):
             ).fetchone()[0]
             position = max_pos + 1
         conn.execute(
-            "INSERT INTO scan_queue (file_id, archive_id, batch_id, status, position, created_at) VALUES (?, ?, ?, 'pending', ?, ?)",
-            (file_id, archive_id, batch_id, position, time.time()),
+            "INSERT INTO scan_queue (file_id, archive_id, batch_id, status, position, created_at) VALUES (?, ?, NULL, 'pending', ?, ?)",
+            (file_id, archive_id, position, time.time()),
         )
         # Set file status to scan_pending
         conn.execute(
@@ -2356,7 +2281,7 @@ def add_scan_queue_entry(file_id, archive_id, batch_id=None, priority=False):
         conn.commit()
 
 
-def add_scan_queue_entries_batch(archive_id, file_ids, batch_id=None):
+def add_scan_queue_entries_batch(archive_id, file_ids):
     """Batch-add files to the scan queue at the end. Returns count added."""
     with _db() as conn:
         max_pos = conn.execute(
@@ -2365,8 +2290,8 @@ def add_scan_queue_entries_batch(archive_id, file_ids, batch_id=None):
         now = time.time()
         for i, file_id in enumerate(file_ids):
             conn.execute(
-                "INSERT INTO scan_queue (file_id, archive_id, batch_id, status, position, created_at) VALUES (?, ?, ?, 'pending', ?, ?)",
-                (file_id, archive_id, batch_id, max_pos + 1 + i, now),
+                "INSERT INTO scan_queue (file_id, archive_id, batch_id, status, position, created_at) VALUES (?, ?, NULL, 'pending', ?, ?)",
+                (file_id, archive_id, max_pos + 1 + i, now),
             )
         # Batch-update file statuses
         if file_ids:

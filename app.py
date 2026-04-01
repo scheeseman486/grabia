@@ -671,19 +671,12 @@ def _start_archive_scan(archive_id):
     # Create activity job
     act_job_id = activity.start_job("scan", archive_id=archive_id, group_id=group_id)
 
-    # Create or find notification
-    scan_notif = db.find_notification_by_scan(archive_id)
-    if not scan_notif:
-        notif_id = db.create_notification(
-            f'Scanning "{archive_name}": starting...',
-            type="info", progress=0, scan_archive_id=archive_id,
-            job_id=act_job_id,
-        )
-        broadcast_sse("notification_created", db.get_notification(notif_id))
-    else:
-        notif_id = scan_notif["id"]
-        db.update_notification(notif_id, job_id=act_job_id)
-
+    # Flash notification for scan start
+    notif_id = db.create_notification(
+        f'Scanning "{archive_name}"...',
+        type="info", job_id=act_job_id,
+    )
+    broadcast_sse("notification_created", db.get_notification(notif_id))
     activity.update_job_notification(act_job_id, notif_id)
 
     # Clean slate for this archive — remove old scan-origin files, reset conflicts
@@ -798,15 +791,7 @@ def _update_scan_progress(archive_id):
         })
         ctx["last_progress"] = now
 
-    if now - ctx["last_notif"] >= 2.0 or done:
-        archive = ctx.get("archive") or db.get_archive(archive_id)
-        archive_name = (archive["title"] or archive["identifier"]) if archive else str(archive_id)
-        pct = int((ctx["processed"] / ctx["total"]) * 100) if ctx["total"] > 0 else 0
-        db.update_notification(ctx["notif_id"],
-            message=f'Scanning "{archive_name}": {ctx["processed"]}/{ctx["total"]} ({pct}%)',
-            progress=pct)
-        broadcast_sse("notification_updated", db.get_notification(ctx["notif_id"]))
-        ctx["last_notif"] = now
+    # Progress is reported via SSE scan_progress events only (no notification updates)
 
 
 def _finish_archive_scan(archive_id):
@@ -835,8 +820,8 @@ def _finish_archive_scan(archive_id):
         activity.flush()
         activity.finish_job(act_job_id, "cancelled",
                             summary=f"Cancelled at {ctx['processed']}/{ctx['total']}")
-        db.delete_notification(notif_id)
-        broadcast_sse("notification_dismissed", {"id": notif_id})
+        db.update_notification(notif_id, message=f'Scan cancelled at {ctx["processed"]}/{ctx["total"]}', type="warning")
+        broadcast_sse("notification_updated", db.get_notification(notif_id))
         broadcast_sse("scan_progress", {"archive_id": archive_id, "phase": "cancelled",
                                         "current": ctx["processed"], "total": ctx["total"]})
         with _scan_lock:
@@ -847,9 +832,6 @@ def _finish_archive_scan(archive_id):
 
     # Scan for unknown files on disk
     if os.path.isdir(base_dir):
-        db.update_notification(notif_id,
-            message=f'Scanning "{archive_name}": checking for unknown files...', progress=-1)
-        broadcast_sse("notification_updated", db.get_notification(notif_id))
         broadcast_sse("scan_progress", {"archive_id": archive_id, "phase": "disk", "current": 0, "total": 0})
 
         # Build manifest and processed name sets
@@ -884,8 +866,8 @@ def _finish_archive_scan(archive_id):
                     conn.execute(
                         """INSERT OR IGNORE INTO archive_files
                            (archive_id, name, size, md5, sha1, format, source, mtime,
-                            queued, download_status, downloaded_bytes, error_message, origin)
-                           VALUES (?, ?, ?, '', '', '', '', '', 0, 'unknown', ?, 'File found on disk but not in archive manifest', 'scan')""",
+                            download_status, downloaded_bytes, error_message, origin)
+                           VALUES (?, ?, ?, '', '', '', '', '', 'unknown', ?, 'File found on disk but not in archive manifest', 'scan')""",
                         (archive_id, rel_name, local_size, local_size),
                     )
                 conn.commit()
@@ -910,7 +892,7 @@ def _finish_archive_scan(archive_id):
         parts.append(f'{summary["missing"]} not on disk')
     result_msg = ", ".join(parts) if parts else "no files found on disk"
     ntype = "success" if summary["conflict"] == 0 and summary["missing"] == 0 else "warning"
-    db.update_notification(notif_id, message=f'Scan "{archive_name}": {result_msg}', type=ntype, progress=None)
+    db.update_notification(notif_id, message=f'Scan "{archive_name}": {result_msg}', type=ntype)
     broadcast_sse("notification_updated", db.get_notification(notif_id))
 
     if summary["conflict"] > 0:
@@ -976,19 +958,18 @@ def scan_existing_files(archive_id):
             _scan_cancel.pop(archive_id, None)
         return jsonify({"error": "No manifest files to scan"}), 400
 
-    # Create batch and add entries to scan_queue
-    batch_id = db.create_batch("scan", archive_id=archive_id, file_count=len(file_ids))
-    db.add_scan_queue_entries_batch(archive_id, file_ids, batch_id=batch_id)
+    # Add entries to scan_queue
+    db.add_scan_queue_entries_batch(archive_id, file_ids)
 
     archive_name = archive["title"] or archive["identifier"]
 
-    # Create a persistent notification for the scan
+    # Flash notification for scan queued
     notif_id = db.create_notification(
-        f'Scanning "{archive_name}": queued ({len(file_ids)} files)...',
-        type="info", progress=-1, scan_archive_id=archive_id,
+        f'Scanning "{archive_name}" ({len(file_ids)} files)',
+        type="info",
     )
     broadcast_sse("notification_created", db.get_notification(notif_id))
-    broadcast_sse("batch_added", {"queue_type": "scan", "count": len(file_ids), "archive_id": archive_id})
+    broadcast_sse("queue_changed", {"queue_type": "scan", "count": len(file_ids), "archive_id": archive_id})
     wake_scan_worker()
     return jsonify({"ok": True, "queued": len(file_ids)})
 
@@ -1029,7 +1010,7 @@ def force_resume_file(file_id):
 
     conn.execute(
         "UPDATE archive_files SET download_status = 'pending', downloaded_bytes = ?, "
-        "queued = 1, error_message = '' WHERE id = ?",
+        "error_message = '' WHERE id = ?",
         (local_size, file_id),
     )
     conn.commit()
@@ -1059,16 +1040,6 @@ def toggle_download(archive_id):
     archive = db.get_archive(archive_id)
     broadcast_sse("archive_updated", archive)
     return jsonify(archive)
-
-
-@app.route("/api/archives/reorder", methods=["POST"])
-@login_required
-def reorder_archives():
-    data = request.json
-    id_order = data.get("order", [])
-    db.reorder_archives(id_order)
-    broadcast_sse("archives_reordered", {"order": id_order})
-    return jsonify({"ok": True})
 
 
 # --- Archive Files API ---
@@ -1126,17 +1097,11 @@ def queue_all_files(archive_id):
     data = request.json
     queued = data.get("queued", True)
     if queued:
-        # Create a batch for notification tracking
-        batch_id = db.create_batch("download", archive_id=archive_id)
-        added, skipped = db.set_all_files_queued(archive_id, True, batch_id=batch_id)
-        # Update batch with actual file count
-        db.update_batch(batch_id, file_count=added)
+        added, skipped = db.set_all_files_queued(archive_id, True)
         if added > 0:
-            # Compact the queue after batch add
             db.compact_download_queue()
-            # Broadcast batch_added SSE event
-            broadcast_sse("batch_added", {"queue_type": "download", "count": added, "batch_id": batch_id})
-        return jsonify({"ok": True, "added": added, "skipped": skipped, "batch_id": batch_id})
+            broadcast_sse("queue_changed", {"queue_type": "download", "count": added})
+        return jsonify({"ok": True, "added": added, "skipped": skipped})
     else:
         db.set_all_files_queued(archive_id, False)
         return jsonify({"ok": True})
@@ -1149,12 +1114,10 @@ def select_all_files_compat(archive_id):
     data = request.json
     queued = data.get("queued", data.get("selected", True))
     if queued:
-        batch_id = db.create_batch("download", archive_id=archive_id)
-        added, skipped = db.set_all_files_queued(archive_id, True, batch_id=batch_id)
-        db.update_batch(batch_id, file_count=added)
+        added, skipped = db.set_all_files_queued(archive_id, True)
         if added > 0:
             db.compact_download_queue()
-            broadcast_sse("batch_added", {"queue_type": "download", "count": added, "batch_id": batch_id})
+            broadcast_sse("queue_changed", {"queue_type": "download", "count": added})
         return jsonify({"ok": True, "added": added, "skipped": skipped})
     else:
         db.set_all_files_queued(archive_id, False)
@@ -1928,10 +1891,7 @@ def create_notification():
     ntype = data.get("type", "info")
     if not message:
         return jsonify({"error": "message is required"}), 400
-    progress = data.get("progress")
-    adding_archive = data.get("adding_archive", False)
-    notif_id = db.create_notification(message, type=ntype, progress=progress,
-                                       adding_archive=adding_archive)
+    notif_id = db.create_notification(message, type=ntype)
     notif = db.get_notification(notif_id)
     broadcast_sse("notification_created", notif)
     return jsonify(notif), 201
@@ -1947,8 +1907,6 @@ def update_notification_endpoint(notif_id):
         kwargs["message"] = data["message"]
     if "type" in data:
         kwargs["type"] = data["type"]
-    if "progress" in data:
-        kwargs["progress"] = data["progress"]
     if "dismissed" in data:
         kwargs["dismissed"] = data["dismissed"]
     if kwargs:
@@ -1963,9 +1921,6 @@ def update_notification_endpoint(notif_id):
 @login_required
 def dismiss_notification(notif_id):
     """Dismiss (delete) a single notification. Refuses to delete active notifications."""
-    notif = db.get_notification(notif_id)
-    if notif and notif["progress"] is not None:
-        return jsonify({"error": "Cannot dismiss an active notification"}), 409
     db.delete_notification(notif_id)
     broadcast_sse("notification_dismissed", {"id": notif_id})
     return jsonify({"ok": True})
@@ -2202,18 +2157,18 @@ def sync_collection(collection_id):
     notif_id = db.create_notification(
         f"Syncing collection '{coll['name']}'...", type="info"
     )
-    broadcast_sse("notification", db.get_notification(notif_id))
+    broadcast_sse("notification_created", db.get_notification(notif_id))
 
     try:
         stats = collection_sync.sync_collection(collection_id)
     except Exception as e:
         db.update_notification(notif_id, message=f"Sync failed: {e}", type="error")
-        broadcast_sse("notification", db.get_notification(notif_id))
+        broadcast_sse("notification_updated", db.get_notification(notif_id))
         return jsonify({"error": str(e)}), 500
 
     if stats.get("error"):
         db.update_notification(notif_id, message=f"Sync failed: {stats['error']}", type="error")
-        broadcast_sse("notification", db.get_notification(notif_id))
+        broadcast_sse("notification_updated", db.get_notification(notif_id))
         return jsonify(stats), 400
 
     # Build summary message
@@ -2226,7 +2181,7 @@ def sync_collection(collection_id):
         db.update_notification(notif_id, message=msg, type="warning")
     else:
         db.update_notification(notif_id, message=msg, type="success")
-    broadcast_sse("notification", db.get_notification(notif_id))
+    broadcast_sse("notification_updated", db.get_notification(notif_id))
     broadcast_sse("collection_synced", stats)
     return jsonify(stats)
 
