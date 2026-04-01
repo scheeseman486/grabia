@@ -576,11 +576,14 @@ def _scan_single_file_on_disk(f, base_dir):
     if not local_path.startswith(base_dir + os.sep) and local_path != base_dir:
         return "skipped"
 
-    # Check processed output first
-    if f.get("processing_status") == "processed":
+    # Check processed/failed files — verify processed output still exists
+    proc_status = f.get("processing_status") or ""
+    if proc_status in ("processed", "failed"):
         pf = f.get("processed_filename", "")
         pf_path = os.path.join(base_dir, pf) if pf else ""
-        if pf_path and (os.path.isfile(pf_path) or os.path.isdir(pf_path)):
+        has_output = pf_path and (os.path.isfile(pf_path) or os.path.isdir(pf_path))
+
+        if proc_status == "processed" and has_output:
             # Processed output exists — check if original is still on disk
             if not os.path.isfile(local_path):
                 # Original deleted but processed files remain → downloaded = 0
@@ -598,7 +601,8 @@ def _scan_single_file_on_disk(f, base_dir):
                 db.set_file_download_status(file_id, "completed",
                     downloaded_bytes=f.get("downloaded_bytes") or f.get("size", 0))
             return "matched"
-        # Processed output gone — reset processing status
+
+        # No valid processed output — clear stale processing state
         with db._db() as conn:
             conn.execute(
                 "UPDATE archive_files SET processing_status = '', processed_filename = '', "

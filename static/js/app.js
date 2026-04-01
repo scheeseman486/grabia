@@ -5336,6 +5336,12 @@
             }
         });
 
+        // Archive batch deselect
+        $("#archive-batch-deselect").addEventListener("click", () => {
+            selectedArchiveIds.clear();
+            updateArchiveBatchActions();
+        });
+
         // Archive batch actions
         $("#archive-batch-scan").addEventListener("click", archiveBatchScan);
         $("#archive-batch-process").addEventListener("click", archiveBatchProcess);
@@ -5405,6 +5411,14 @@
         $("#btn-scan-files").addEventListener("click", scanExistingFiles);
         $("#btn-process-all-files").addEventListener("click", openProcessArchiveModal);
         $("#btn-clear-changes").addEventListener("click", clearChanges);
+
+        // File batch deselect
+        $("#batch-deselect").addEventListener("click", () => {
+            selectedFileIds.clear();
+            updateBatchActions();
+            vsLastRange = null;
+            vsRenderVisible();
+        });
 
         // Batch actions
         $("#batch-queue").addEventListener("click", batchQueueFiles);

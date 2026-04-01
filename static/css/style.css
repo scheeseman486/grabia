@@ -1306,6 +1306,24 @@ main {
     border-radius: 6px;
     font-size: 13px;
 }
+.batch-deselect {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 20px;
+    height: 20px;
+    padding: 0;
+    border: none;
+    border-radius: 4px;
+    background: transparent;
+    color: var(--text-muted);
+    cursor: pointer;
+    flex-shrink: 0;
+}
+.batch-deselect:hover {
+    background: rgba(255, 107, 107, 0.15);
+    color: var(--danger);
+}
 .batch-count {
     font-weight: 600;
     color: var(--text-primary);
