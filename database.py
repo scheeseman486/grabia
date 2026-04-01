@@ -572,6 +572,16 @@ def init_db():
     # Jobs stuck in 'running' mean the server crashed mid-processing.
     conn.execute("UPDATE processing_jobs SET status = 'pending', started_at = NULL WHERE status = 'running'")
 
+    # Fail out orphaned processing jobs — pending/running jobs whose processing_queue
+    # entries are all gone (e.g. lost during a DB migration or table rebuild).
+    conn.execute("""
+        UPDATE processing_jobs SET status = 'failed',
+            error_message = 'Orphaned job: no queue entries remain (likely lost during migration)',
+            completed_at = ?
+        WHERE status IN ('pending', 'running')
+          AND id NOT IN (SELECT DISTINCT job_id FROM processing_queue WHERE status IN ('pending', 'running'))
+    """, (time.time(),))
+
     # Reset archive_files stuck in processing states from a crash.
     # Files marked 'queued' or 'processing' need to be reset so they can be
     # re-queued when the recovered job runs.

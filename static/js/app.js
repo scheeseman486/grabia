@@ -3632,7 +3632,7 @@
                 const resp = await api("POST", `/api/archives/${aid}/process`, body);
                 if (resp.queued) queued++;
             } catch (e) {
-                addNotification(`Processing failed for archive ${aid}: ${e.message}`, "error");
+                addNotification(`Processing failed for "${getArchiveName(aid)}": ${e.message}`, "error");
             }
         }
         // Notifications for queued processing jobs are now created server-side
