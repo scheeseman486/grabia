@@ -1336,6 +1336,32 @@ main {
 .batch-btn-danger { color: var(--danger); }
 .batch-btn-danger:hover { background: rgba(255, 107, 107, 0.15); border-color: var(--danger); }
 
+.scan-hash-progress {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    min-width: 80px;
+}
+.scan-hash-bar {
+    flex: 1;
+    height: 6px;
+    background: var(--bg-tertiary);
+    border-radius: 3px;
+    overflow: hidden;
+}
+.scan-hash-fill {
+    height: 100%;
+    background: #9b59b6;
+    border-radius: 3px;
+    transition: width 0.3s ease;
+}
+.scan-hash-pct {
+    font-size: 11px;
+    color: var(--text-muted);
+    min-width: 28px;
+    text-align: right;
+}
+
 .file-status {
     font-size: 12px;
     padding: 2px 8px;

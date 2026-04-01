@@ -250,6 +250,36 @@
         }
     }
 
+    // Track active scan file hash progress for queue display
+    let scanFileProgress = {}; // entry_id -> { bytes_done, bytes_total, phase }
+
+    function updateScanFileProgress(data) {
+        const { entry_id, bytes_done, bytes_total, phase } = data;
+        scanFileProgress[entry_id] = { bytes_done, bytes_total, phase };
+
+        // Find the row in the scan queue table and update/add progress bar
+        const row = $(`#queue-scan-tbody tr[data-entry-id="${entry_id}"]`);
+        if (!row) return;
+
+        let bar = row.querySelector(".scan-hash-progress");
+        if (!bar) {
+            // Insert progress bar into the status cell
+            const statusCell = row.querySelector(".col-status");
+            if (!statusCell) return;
+            bar = document.createElement("div");
+            bar.className = "scan-hash-progress";
+            bar.innerHTML = `<div class="scan-hash-bar"><div class="scan-hash-fill"></div></div><span class="scan-hash-pct"></span>`;
+            statusCell.innerHTML = "";
+            statusCell.appendChild(bar);
+        }
+
+        const pct = bytes_total > 0 ? Math.min(100, (bytes_done / bytes_total) * 100) : 0;
+        const fill = bar.querySelector(".scan-hash-fill");
+        const label = bar.querySelector(".scan-hash-pct");
+        if (fill) fill.style.width = pct.toFixed(1) + "%";
+        if (label) label.textContent = pct < 100 ? `${pct.toFixed(0)}%` : "verifying";
+    }
+
     function toggleNotifPopup() {
         const popup = document.querySelector("#notif-popup");
         popup.classList.toggle("open");
@@ -563,6 +593,11 @@
                 };
             }
             refreshOngoingActivity();
+        });
+
+        es.addEventListener("scan_file_progress", (e) => {
+            const data = JSON.parse(e.data);
+            updateScanFileProgress(data);
         });
 
         es.addEventListener("processing_progress", (e) => {

@@ -562,14 +562,15 @@ def _run_single_file_scan(entry):
     download_dir = db.get_setting("download_dir", os.path.expanduser("~/ia-downloads"))
     base_dir = os.path.realpath(os.path.join(download_dir, archive["identifier"]))
 
-    result = _scan_single_file_on_disk(f, base_dir)
+    result = _scan_single_file_on_disk(f, base_dir, entry_id=entry["id"])
     db.complete_scan_queue_entry(entry["id"])
     db.recompute_archive_status(archive_id)
     broadcast_sse("queue_update", {"queue_type": "scan", "action": "completed", "entry_id": entry["id"]})
 
 
-def _scan_single_file_on_disk(f, base_dir):
-    """Check a single manifest file against disk. Updates DB. Returns result status string."""
+def _scan_single_file_on_disk(f, base_dir, entry_id=None):
+    """Check a single manifest file against disk. Updates DB. Returns result status string.
+    If entry_id is provided, broadcasts file-level progress SSE for the hash phase."""
     file_id = f["id"]
     name = f["name"]
     local_path = os.path.realpath(os.path.join(base_dir, name))
@@ -651,10 +652,24 @@ def _scan_single_file_on_disk(f, base_dir):
 
     if has_md5:
         md5 = hashlib.md5()
+        hashed_bytes = 0
+        last_progress = 0.0
         try:
             with open(local_path, "rb") as fh:
                 for chunk in iter(lambda: fh.read(131072), b""):
                     md5.update(chunk)
+                    hashed_bytes += len(chunk)
+                    if entry_id is not None:
+                        now = time.monotonic()
+                        if now - last_progress >= 0.5 or hashed_bytes >= local_size:
+                            last_progress = now
+                            broadcast_sse("scan_file_progress", {
+                                "entry_id": entry_id,
+                                "file_id": file_id,
+                                "phase": "hashing",
+                                "bytes_done": hashed_bytes,
+                                "bytes_total": local_size,
+                            })
             if md5.hexdigest() != expected_md5:
                 db.set_file_download_status(file_id, "conflict",
                     error_message=f"MD5 mismatch: local {md5.hexdigest()} vs expected {expected_md5}")
@@ -763,7 +778,7 @@ def _run_archive_scan_entry(entry):
             _finish_archive_scan(archive_id)
         return
 
-    result = _scan_single_file_on_disk(f, base_dir)
+    result = _scan_single_file_on_disk(f, base_dir, entry_id=entry["id"])
 
     # Update summary
     if result in ctx["summary"]:
