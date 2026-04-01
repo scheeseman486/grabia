@@ -946,32 +946,38 @@ def scan_existing_files(archive_id):
         evt = threading.Event()
         _scan_cancel[archive_id] = evt
 
-    # Get all manifest files for this archive
-    with db._db() as conn:
-        file_ids = [r["id"] for r in conn.execute(
-            "SELECT id FROM archive_files WHERE archive_id = ? AND origin = 'manifest'",
-            (archive_id,),
-        ).fetchall()]
+    try:
+        # Get all manifest files for this archive
+        with db._db() as conn:
+            file_ids = [r["id"] for r in conn.execute(
+                "SELECT id FROM archive_files WHERE archive_id = ? AND origin = 'manifest'",
+                (archive_id,),
+            ).fetchall()]
 
-    if not file_ids:
+        if not file_ids:
+            with _scan_lock:
+                _scan_cancel.pop(archive_id, None)
+            return jsonify({"error": "No manifest files to scan"}), 400
+
+        # Add entries to scan_queue
+        db.add_scan_queue_entries_batch(archive_id, file_ids)
+
+        archive_name = archive["title"] or archive["identifier"]
+
+        # Flash notification for scan queued
+        notif_id = db.create_notification(
+            f'Scanning "{archive_name}" ({len(file_ids)} files)',
+            type="info",
+        )
+        broadcast_sse("notification_created", db.get_notification(notif_id))
+        broadcast_sse("queue_changed", {"queue_type": "scan", "count": len(file_ids), "archive_id": archive_id})
+        wake_scan_worker()
+        return jsonify({"ok": True, "queued": len(file_ids)})
+    except Exception:
+        # Clean up _scan_cancel so this archive isn't permanently blocked
         with _scan_lock:
             _scan_cancel.pop(archive_id, None)
-        return jsonify({"error": "No manifest files to scan"}), 400
-
-    # Add entries to scan_queue
-    db.add_scan_queue_entries_batch(archive_id, file_ids)
-
-    archive_name = archive["title"] or archive["identifier"]
-
-    # Flash notification for scan queued
-    notif_id = db.create_notification(
-        f'Scanning "{archive_name}" ({len(file_ids)} files)',
-        type="info",
-    )
-    broadcast_sse("notification_created", db.get_notification(notif_id))
-    broadcast_sse("queue_changed", {"queue_type": "scan", "count": len(file_ids), "archive_id": archive_id})
-    wake_scan_worker()
-    return jsonify({"ok": True, "queued": len(file_ids)})
+        raise
 
 
 @app.route("/api/archives/<int:archive_id>/scan/cancel", methods=["POST"])

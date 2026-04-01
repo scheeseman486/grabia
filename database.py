@@ -139,7 +139,8 @@ def init_db():
             message TEXT NOT NULL,
             type TEXT NOT NULL DEFAULT 'info',
             created_at REAL NOT NULL,
-            dismissed INTEGER NOT NULL DEFAULT 0
+            dismissed INTEGER NOT NULL DEFAULT 0,
+            job_id INTEGER DEFAULT NULL
         );
 
         CREATE TABLE IF NOT EXISTS processing_jobs (
@@ -462,6 +463,13 @@ def init_db():
         log.info("Dropped legacy notification columns successfully")
     except sqlite3.OperationalError:
         pass  # Columns already gone (fresh DB or already migrated)
+
+    # Migration: add job_id to notifications if missing (fresh DBs created before it was in schema)
+    try:
+        conn.execute("SELECT job_id FROM notifications LIMIT 1")
+    except sqlite3.OperationalError:
+        conn.execute("ALTER TABLE notifications ADD COLUMN job_id INTEGER DEFAULT NULL")
+        conn.commit()
 
     # Add manifest cache columns to archives
     try:
