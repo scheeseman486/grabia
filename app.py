@@ -584,7 +584,8 @@ def _scan_single_file_on_disk(f, base_dir):
             # Processed output exists — check if original is still on disk
             if not os.path.isfile(local_path):
                 # Original deleted but processed files remain → downloaded = 0
-                # Only write if the flag actually needs changing
+                db.set_file_download_status(file_id, "completed",
+                    downloaded_bytes=f.get("downloaded_bytes", 0))
                 if f.get("downloaded") != 0:
                     with db._db() as conn:
                         conn.execute(
@@ -592,6 +593,10 @@ def _scan_single_file_on_disk(f, base_dir):
                             (file_id,),
                         )
                         conn.commit()
+            else:
+                # Original still on disk — ensure status is completed
+                db.set_file_download_status(file_id, "completed",
+                    downloaded_bytes=f.get("downloaded_bytes") or f.get("size", 0))
             return "matched"
         # Processed output gone — reset processing status
         with db._db() as conn:

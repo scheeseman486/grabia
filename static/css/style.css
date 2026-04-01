@@ -1334,6 +1334,7 @@ main {
 .file-status.processed { background: rgba(52, 152, 219, 0.15); color: #3498db; }
 .file-status.proc-failed { background: rgba(255, 107, 107, 0.15); color: var(--danger); }
 .file-status.proc-active { background: rgba(52, 152, 219, 0.15); color: #3498db; }
+.file-status.scan_pending { background: rgba(155, 89, 182, 0.15); color: #9b59b6; }
 
 /* Processed file expandable rows */
 tr.processed-expandable { cursor: pointer; }

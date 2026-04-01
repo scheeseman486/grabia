@@ -2216,6 +2216,7 @@
             }
             return "skipped";
         }
+        if (f.download_status === "scan_pending") return "scanning…";
         if (f.download_status === "downloading" && f.size > 0) {
             const pct = ((f.downloaded_bytes / f.size) * 100).toFixed(1);
             return `${pct}%`;
