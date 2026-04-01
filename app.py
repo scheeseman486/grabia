@@ -1597,7 +1597,8 @@ def download_status():
 @app.route("/api/download/queue", methods=["GET"])
 @login_required
 def download_queue():
-    return jsonify(db.get_download_queue())
+    limit = request.args.get("limit", 5000, type=int)
+    return jsonify(db.get_download_queue(limit))
 
 
 @app.route("/api/download/queue/clear", methods=["POST"])
@@ -1651,14 +1652,24 @@ def queue_counts():
 @app.route("/api/download/queue/reorder", methods=["POST"])
 @login_required
 def reorder_download_queue():
-    """Move a file to a new position in the download queue."""
+    """Move file(s) to a new position in the download queue.
+
+    Accepts either single-item ``{file_id, position}`` or multi-item
+    ``{file_ids: [...], position}`` to move several items at once.
+    """
     data = request.json
-    file_id = data.get("file_id")
+    file_ids = data.get("file_ids")
+    if not file_ids:
+        fid = data.get("file_id")
+        if fid is not None:
+            file_ids = [fid]
     new_position = data.get("position")
-    if file_id is None or new_position is None:
-        return jsonify({"error": "file_id and position required"}), 400
-    db.reorder_download_queue(file_id, new_position)
-    broadcast_sse("queue_update", {"queue_type": "download", "action": "reordered", "file_ids": [file_id]})
+    if not file_ids or new_position is None:
+        return jsonify({"error": "file_id(s) and position required"}), 400
+    for fid in file_ids:
+        db.reorder_download_queue(fid, new_position)
+        new_position += 1  # stack consecutively after the target
+    broadcast_sse("queue_update", {"queue_type": "download", "action": "reordered", "file_ids": file_ids})
     return jsonify({"ok": True})
 
 
@@ -1666,20 +1677,27 @@ def reorder_download_queue():
 @login_required
 def get_processing_queue_endpoint():
     """Return the file-level processing queue."""
-    limit = request.args.get("limit", 200, type=int)
+    limit = request.args.get("limit", 5000, type=int)
     return jsonify(db.get_processing_queue(limit))
 
 
 @app.route("/api/processing/queue/reorder", methods=["POST"])
 @login_required
 def reorder_processing_queue():
+    """Move processing queue entry/entries to a new position."""
     data = request.json
-    entry_id = data.get("entry_id")
+    entry_ids = data.get("entry_ids")
+    if not entry_ids:
+        eid = data.get("entry_id")
+        if eid is not None:
+            entry_ids = [eid]
     new_position = data.get("position")
-    if entry_id is None or new_position is None:
-        return jsonify({"error": "entry_id and position required"}), 400
-    db.reorder_processing_queue(entry_id, new_position)
-    broadcast_sse("queue_update", {"queue_type": "processing", "action": "reordered", "file_ids": [entry_id]})
+    if not entry_ids or new_position is None:
+        return jsonify({"error": "entry_id(s) and position required"}), 400
+    for eid in entry_ids:
+        db.reorder_processing_queue(eid, new_position)
+        new_position += 1
+    broadcast_sse("queue_update", {"queue_type": "processing", "action": "reordered", "file_ids": entry_ids})
     return jsonify({"ok": True})
 
 
@@ -1710,7 +1728,7 @@ def cancel_all_processing():
 @login_required
 def get_scan_queue_endpoint():
     """Return the file-level scan queue."""
-    limit = request.args.get("limit", 200, type=int)
+    limit = request.args.get("limit", 5000, type=int)
     return jsonify(db.get_scan_queue(limit))
 
 

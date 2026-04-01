@@ -1046,6 +1046,13 @@ main {
     color: var(--text-muted);
 }
 .file-grip:active { cursor: grabbing; }
+.queue-pos-num {
+    display: inline-block;
+    font-size: 0.75rem;
+    color: var(--text-muted);
+    min-width: 20px;
+    text-align: center;
+}
 .unknown-grip {
     display: flex;
     flex-direction: column;

@@ -348,6 +348,22 @@
                     </button>
                     <span class="queue-progress-text" id="queue-dl-progress"></span>
                 </div>
+                <div class="file-toolbar">
+                    <div class="file-search">
+                        <svg viewBox="0 0 24 24" width="14" height="14"><path d="M15.5 14h-.79l-.28-.27A6.471 6.471 0 0016 9.5 6.5 6.5 0 109.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z" fill="currentColor"/></svg>
+                        <input type="text" class="queue-filter" data-queue="download" placeholder="Filter files…">
+                    </div>
+                    <div class="sort-control">
+                        <label>Sort by</label>
+                        <select class="queue-sort" data-queue="download">
+                            <option value="position">Queue Position</option>
+                            <option value="name">Name</option>
+                            <option value="size">Size</option>
+                            <option value="status">Status</option>
+                            <option value="archive">Archive</option>
+                        </select>
+                    </div>
+                </div>
                 <div class="file-table-wrap" id="queue-dl-wrap">
                     <table class="file-table queue-file-table" id="queue-dl-table">
                         <thead><tr>
@@ -378,6 +394,21 @@
                     </button>
                     <span class="queue-progress-text" id="queue-proc-progress"></span>
                 </div>
+                <div class="file-toolbar">
+                    <div class="file-search">
+                        <svg viewBox="0 0 24 24" width="14" height="14"><path d="M15.5 14h-.79l-.28-.27A6.471 6.471 0 0016 9.5 6.5 6.5 0 109.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z" fill="currentColor"/></svg>
+                        <input type="text" class="queue-filter" data-queue="processing" placeholder="Filter files…">
+                    </div>
+                    <div class="sort-control">
+                        <label>Sort by</label>
+                        <select class="queue-sort" data-queue="processing">
+                            <option value="position">Queue Position</option>
+                            <option value="name">Name</option>
+                            <option value="status">Status</option>
+                            <option value="archive">Archive</option>
+                        </select>
+                    </div>
+                </div>
                 <div class="file-table-wrap" id="queue-proc-wrap">
                     <table class="file-table queue-file-table" id="queue-proc-table">
                         <thead><tr>
@@ -405,6 +436,21 @@
                         <svg viewBox="0 0 24 24" width="16" height="16"><path d="M5 13h14v-2H5v2zm-2 4h14v-2H3v2zM7 7v2h14V7H7z" fill="currentColor"/></svg> Clear
                     </button>
                     <span class="queue-progress-text" id="queue-scan-progress"></span>
+                </div>
+                <div class="file-toolbar">
+                    <div class="file-search">
+                        <svg viewBox="0 0 24 24" width="14" height="14"><path d="M15.5 14h-.79l-.28-.27A6.471 6.471 0 0016 9.5 6.5 6.5 0 109.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z" fill="currentColor"/></svg>
+                        <input type="text" class="queue-filter" data-queue="scan" placeholder="Filter files…">
+                    </div>
+                    <div class="sort-control">
+                        <label>Sort by</label>
+                        <select class="queue-sort" data-queue="scan">
+                            <option value="position">Queue Position</option>
+                            <option value="name">Name</option>
+                            <option value="status">Status</option>
+                            <option value="archive">Archive</option>
+                        </select>
+                    </div>
                 </div>
                 <div class="file-table-wrap" id="queue-scan-wrap">
                     <table class="file-table queue-file-table" id="queue-scan-table">

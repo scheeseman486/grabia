@@ -3850,41 +3850,103 @@
     // Queue selection state (separate from file list selection)
     let selectedQueueIds = new Set();
     let lastClickedQueueIdx = null;
-    let queueDragSrcId = null;
+    let queueDragSrcIdx = null;
+    let queueFilterTimers = {};
+    let queueFilterText = { download: "", processing: "", scan: "" };
+    let queueSortBy = { download: "position", processing: "position", scan: "position" };
+    // Filtered+sorted view of queueData, rebuilt on each render
+    let queueView = { download: [], processing: [], scan: [] };
 
-    function handleQueueSelect(tab, item, idx, e) {
-        const data = queueData[tab] || [];
+    function getQueueItemId(tab, item) {
+        return tab === "download" ? (item.file_id || item.id) : item.id;
+    }
+
+    function getQueueItemPos(tab, item) {
+        return tab === "download" ? item.queue_position : (item.position ?? item.queue_position ?? 0);
+    }
+
+    function handleQueueSelect(tab, idx, e) {
+        const view = queueView[tab] || [];
+        const item = view[idx];
+        if (!item) return;
+        const key = getQueueItemId(tab, item);
         if (e.shiftKey && lastClickedQueueIdx !== null) {
             const start = Math.min(lastClickedQueueIdx, idx);
             const end = Math.max(lastClickedQueueIdx, idx);
             if (!e.ctrlKey && !e.metaKey) selectedQueueIds.clear();
             for (let i = start; i <= end; i++) {
-                const d = data[i];
-                selectedQueueIds.add(tab === "download" ? (d.file_id || d.id) : d.id);
+                selectedQueueIds.add(getQueueItemId(tab, view[i]));
             }
         } else if (e.ctrlKey || e.metaKey) {
-            const key = tab === "download" ? (item.file_id || item.id) : item.id;
             if (selectedQueueIds.has(key)) selectedQueueIds.delete(key);
             else selectedQueueIds.add(key);
             lastClickedQueueIdx = idx;
         } else {
             selectedQueueIds.clear();
-            selectedQueueIds.add(tab === "download" ? (item.file_id || item.id) : item.id);
+            selectedQueueIds.add(key);
             lastClickedQueueIdx = idx;
         }
         renderQueueTable(tab);
     }
 
+    function filterAndSortQueue(tab) {
+        const raw = queueData[tab] || [];
+        const filterStr = queueFilterText[tab].toLowerCase();
+        const sortKey = queueSortBy[tab];
+
+        // Filter
+        let filtered = raw;
+        if (filterStr) {
+            filtered = raw.filter(item => {
+                const fname = (item.file_name || item.name || "").toLowerCase();
+                const archive = (item.title || item.archive_title || item.archive_identifier || item.identifier || "").toLowerCase();
+                return fname.includes(filterStr) || archive.includes(filterStr);
+            });
+        }
+
+        // Sort
+        const sorted = [...filtered];
+        if (sortKey === "position") {
+            sorted.sort((a, b) => getQueueItemPos(tab, a) - getQueueItemPos(tab, b));
+        } else if (sortKey === "name") {
+            sorted.sort((a, b) => (a.file_name || a.name || "").localeCompare(b.file_name || b.name || ""));
+        } else if (sortKey === "size") {
+            sorted.sort((a, b) => (b.size || b.file_size || 0) - (a.size || a.file_size || 0));
+        } else if (sortKey === "status") {
+            sorted.sort((a, b) => {
+                const sa = tab === "download" ? (a.download_status || "") : (a.status || "");
+                const sb = tab === "download" ? (b.download_status || "") : (b.status || "");
+                return sa.localeCompare(sb);
+            });
+        } else if (sortKey === "archive") {
+            sorted.sort((a, b) => {
+                const la = (a.title || a.archive_title || a.archive_identifier || a.identifier || "").toLowerCase();
+                const lb = (b.title || b.archive_title || b.archive_identifier || b.identifier || "").toLowerCase();
+                return la.localeCompare(lb);
+            });
+        }
+        queueView[tab] = sorted;
+        return sorted;
+    }
+
+    function isQueueSortedByPosition(tab) {
+        return queueSortBy[tab] === "position";
+    }
+
     function renderQueueTable(tab) {
-        const data = queueData[tab];
         const abbr = tab === "download" ? "dl" : tab === "processing" ? "proc" : "scan";
         const tbody = $(`#queue-${abbr}-tbody`);
         const empty = $(`#queue-${abbr}-empty`);
         const wrap = $(`#queue-${abbr}-wrap`);
 
-        if (!data || data.length === 0) {
+        const view = filterAndSortQueue(tab);
+
+        if (!view || view.length === 0) {
             wrap.style.display = "none";
             empty.style.display = "";
+            empty.textContent = queueFilterText[tab]
+                ? `No files matching "${queueFilterText[tab]}"`
+                : `No files in ${tab} queue`;
             return;
         }
         wrap.style.display = "";
@@ -3892,10 +3954,11 @@
 
         const savedScroll = wrap.scrollTop;
         tbody.innerHTML = "";
-        const lastIdx = data.length - 1;
+        const lastIdx = view.length - 1;
+        const byPosition = isQueueSortedByPosition(tab);
 
-        for (let i = 0; i < data.length; i++) {
-            const item = data[i];
+        for (let i = 0; i < view.length; i++) {
+            const item = view[i];
             const fname = item.file_name || item.name || "";
             const archiveLabel = item.title || item.archive_title || item.archive_identifier || item.identifier || "";
             const bold = item.downloaded ? "file-name-downloaded" : "";
@@ -3903,7 +3966,7 @@
             const fileId = item.file_id || item.id;
             const entryId = item.id || item.file_id;
             const isCompleting = completingItems.has(`${tab}:${entryId}`);
-            const selKey = tab === "download" ? fileId : item.id;
+            const selKey = getQueueItemId(tab, item);
 
             const tr = document.createElement("tr");
             tr.dataset.archiveId = archiveId;
@@ -3916,24 +3979,32 @@
 
             if (tab === "download") {
                 const status = item.download_status || "queued";
-                // Grip (drag handle)
-                html += buildGripCell();
-                // Queue remove button (same as file list)
+                // Grip or position number
+                if (byPosition) {
+                    html += buildGripCell();
+                } else {
+                    html += `<td class="col-grip"><span class="queue-pos-num">${getQueueItemPos(tab, item)}</span></td>`;
+                }
+                // Queue remove button
                 html += `<td class="col-queue"><button class="queue-toggle queue-remove" data-queue-id="${fileId}" title="Remove from queue">` +
                     `<svg viewBox="0 0 16 16" width="14" height="14"><rect x="3" y="7" width="10" height="2" rx="1" fill="currentColor"/></svg></button></td>`;
-                // File name with truncation
                 html += `<td class="col-name"><div class="file-name-wrap">${renderFileName(fname, bold)}</div></td>`;
-                // Archive name (truncated)
                 html += `<td class="col-archive-q" title="${escapeHtml(archiveLabel)}">${escapeHtml(archiveLabel)}</td>`;
-                // Size
                 html += `<td class="col-size" style="text-align:right">${formatBytes(item.size || item.file_size || 0)}</td>`;
-                // Status
                 html += `<td class="col-status"><span class="file-status ${status}">${status}</span></td>`;
-                // Priority up/down
-                html += buildPriorityCell(fileId, i === 0, i === lastIdx);
+                // Priority buttons only when sorted by position
+                if (byPosition) {
+                    html += buildPriorityCell(fileId, i === 0, i === lastIdx);
+                } else {
+                    html += `<td class="col-priority"></td>`;
+                }
             } else if (tab === "processing") {
                 const status = item.status || "pending";
-                html += buildGripCell();
+                if (byPosition) {
+                    html += buildGripCell();
+                } else {
+                    html += `<td class="col-grip"><span class="queue-pos-num">${getQueueItemPos(tab, item)}</span></td>`;
+                }
                 html += `<td class="col-name"><div class="file-name-wrap">${renderFileName(fname, bold)}</div></td>`;
                 html += `<td class="col-archive-q" title="${escapeHtml(archiveLabel)}">${escapeHtml(archiveLabel)}</td>`;
                 html += `<td class="col-profile-q" title="${escapeHtml(item.profile_name || "")}">${escapeHtml(item.profile_name || "")}</td>`;
@@ -3950,7 +4021,7 @@
             // Click: select (single, shift, ctrl) — double-click: navigate
             tr.addEventListener("click", (e) => {
                 if (e.target.closest("button, .queue-toggle, .file-priority-btns, .file-grip")) return;
-                handleQueueSelect(tab, item, i, e);
+                handleQueueSelect(tab, i, e);
             });
             tr.addEventListener("dblclick", (e) => {
                 if (e.target.closest("button, .queue-toggle")) return;
@@ -3979,16 +4050,16 @@
                 });
             }
 
-            // Priority up/down buttons (download only)
-            if (tab === "download") {
+            // Priority up/down buttons (download only, position sort only)
+            if (tab === "download" && byPosition) {
                 const upBtn = tr.querySelector(`[data-move-up="${fileId}"]`);
                 const downBtn = tr.querySelector(`[data-move-down="${fileId}"]`);
                 if (upBtn) upBtn.addEventListener("click", (e) => { e.stopPropagation(); moveQueueItem(tab, i, -1); });
                 if (downBtn) downBtn.addEventListener("click", (e) => { e.stopPropagation(); moveQueueItem(tab, i, 1); });
             }
 
-            // Drag-and-drop reordering (download and processing)
-            if (tab === "download" || tab === "processing") {
+            // Drag-and-drop reordering (only when sorted by position)
+            if (byPosition && (tab === "download" || tab === "processing")) {
                 attachQueueDrag(tr, tab, i);
             }
 
@@ -4000,15 +4071,14 @@
     }
 
     function moveQueueItem(tab, fromIdx, direction) {
-        const data = queueData[tab];
+        const view = queueView[tab];
         const toIdx = fromIdx + direction;
-        if (toIdx < 0 || toIdx >= data.length) return;
-        const src = data[fromIdx];
-        const dst = data[toIdx];
+        if (toIdx < 0 || toIdx >= view.length) return;
+        const src = view[fromIdx];
+        const dst = view[toIdx];
         if (tab === "download") {
-            // Use queue_position from the target item
             const newPos = dst.queue_position;
-            api("POST", "/api/download/queue/reorder", { file_id: src.id, position: newPos }).then(() => loadQueueTab(tab));
+            api("POST", "/api/download/queue/reorder", { file_id: src.id || src.file_id, position: newPos }).then(() => loadQueueTab(tab));
         } else if (tab === "processing") {
             const newPos = dst.position;
             api("POST", "/api/processing/queue/reorder", { entry_id: src.id, position: newPos }).then(() => loadQueueTab(tab));
@@ -4018,38 +4088,84 @@
     function attachQueueDrag(tr, tab, idx) {
         const grip = tr.querySelector(".file-grip");
         if (!grip) return;
-        tr.draggable = true;
+
+        // Only the grip initiates drag — set draggable on mousedown/mouseup
+        grip.addEventListener("mousedown", () => { tr.draggable = true; });
+        tr.addEventListener("mouseup", () => { tr.draggable = false; });
+        tr.addEventListener("mouseleave", () => { if (queueDragSrcIdx === null) tr.draggable = false; });
+
         tr.addEventListener("dragstart", (e) => {
-            if (!e.target.closest(".file-grip")) { e.preventDefault(); return; }
-            queueDragSrcId = idx;
+            const view = queueView[tab];
+            const item = view[idx];
+            const dragId = getQueueItemId(tab, item);
+
+            // If dragged item is in selection, drag all selected; otherwise drag only this one
+            if (selectedQueueIds.size > 0 && selectedQueueIds.has(dragId)) {
+                // Dragging the selection
+            } else {
+                // Single-item drag: replace selection with just this item
+                // Don't re-render here — it would destroy the DOM node mid-drag
+                selectedQueueIds.clear();
+                selectedQueueIds.add(dragId);
+            }
+
+            queueDragSrcIdx = idx;
             tr.classList.add("file-row-dragging");
             e.dataTransfer.effectAllowed = "move";
+            // Set drag data (required for Firefox)
+            e.dataTransfer.setData("text/plain", String(idx));
         });
+
         tr.addEventListener("dragend", () => {
-            queueDragSrcId = null;
+            queueDragSrcIdx = null;
+            tr.draggable = false;
             tr.classList.remove("file-row-dragging");
             const tbody = tr.parentElement;
             if (tbody) tbody.querySelectorAll(".file-row-drag-over").forEach(r => r.classList.remove("file-row-drag-over"));
         });
+
         tr.addEventListener("dragover", (e) => {
-            if (queueDragSrcId === null) return;
+            if (queueDragSrcIdx === null) return;
             e.preventDefault();
             e.dataTransfer.dropEffect = "move";
+            // Clear other drag-over highlights in tbody
+            const tbody = tr.parentElement;
+            if (tbody) tbody.querySelectorAll(".file-row-drag-over").forEach(r => { if (r !== tr) r.classList.remove("file-row-drag-over"); });
             tr.classList.add("file-row-drag-over");
         });
-        tr.addEventListener("dragleave", () => tr.classList.remove("file-row-drag-over"));
+
+        tr.addEventListener("dragleave", (e) => {
+            // Only remove if actually leaving this row (not entering a child)
+            if (!tr.contains(e.relatedTarget)) tr.classList.remove("file-row-drag-over");
+        });
+
         tr.addEventListener("drop", (e) => {
             e.preventDefault();
             tr.classList.remove("file-row-drag-over");
-            if (queueDragSrcId === null || queueDragSrcId === idx) return;
-            const data = queueData[tab];
-            const src = data[queueDragSrcId];
-            const dst = data[idx];
-            queueDragSrcId = null;
+            if (queueDragSrcIdx === null) return;
+
+            const view = queueView[tab];
+            const dropTarget = view[idx];
+            queueDragSrcIdx = null;
+
+            // Collect items to move: all selected items, in their current queue-position order
+            const idsToMove = selectedQueueIds.size > 0 ? [...selectedQueueIds] : [];
+            if (idsToMove.length === 0) return;
+
+            // Sort selected items by their current position so they maintain relative order
+            const itemsToMove = view.filter(it => idsToMove.includes(getQueueItemId(tab, it)));
+            itemsToMove.sort((a, b) => getQueueItemPos(tab, a) - getQueueItemPos(tab, b));
+
+            const targetPos = getQueueItemPos(tab, dropTarget);
+
             if (tab === "download") {
-                api("POST", "/api/download/queue/reorder", { file_id: src.id, position: dst.queue_position }).then(() => loadQueueTab(tab));
+                const fileIds = itemsToMove.map(it => it.id || it.file_id);
+                api("POST", "/api/download/queue/reorder", { file_ids: fileIds, position: targetPos })
+                    .then(() => loadQueueTab(tab));
             } else if (tab === "processing") {
-                api("POST", "/api/processing/queue/reorder", { entry_id: src.id, position: dst.position }).then(() => loadQueueTab(tab));
+                const entryIds = itemsToMove.map(it => it.id);
+                api("POST", "/api/processing/queue/reorder", { entry_ids: entryIds, position: targetPos })
+                    .then(() => loadQueueTab(tab));
             }
         });
     }
@@ -4141,6 +4257,27 @@
                     loadQueueTab("scan");
                     refreshQueueCounts();
                 });
+        });
+
+        // Filter inputs (debounced)
+        $$(".queue-filter").forEach(input => {
+            const qTab = input.dataset.queue;
+            input.addEventListener("input", () => {
+                clearTimeout(queueFilterTimers[qTab]);
+                queueFilterTimers[qTab] = setTimeout(() => {
+                    queueFilterText[qTab] = input.value.trim();
+                    renderQueueTable(qTab);
+                }, 250);
+            });
+        });
+
+        // Sort dropdowns
+        $$(".queue-sort").forEach(sel => {
+            const qTab = sel.dataset.queue;
+            sel.addEventListener("change", () => {
+                queueSortBy[qTab] = sel.value;
+                renderQueueTable(qTab);
+            });
         });
 
         // Seed badge on page load
