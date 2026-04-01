@@ -1050,8 +1050,11 @@ main {
     display: inline-block;
     font-size: 0.75rem;
     color: var(--text-muted);
-    min-width: 20px;
+    width: 3.2em;
     text-align: center;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
 }
 .unknown-grip {
     display: flex;

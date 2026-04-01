@@ -533,14 +533,13 @@ def _run_processing(job):
                             os.remove(to_delete)
                         except OSError:
                             pass
-                    # Update downloaded flag: set to 0 only if no processed files
-                    if not has_processed_files:
-                        with db._db() as conn:
-                            conn.execute(
-                                "UPDATE archive_files SET downloaded = 0 WHERE id = ?",
-                                (file_id,),
-                            )
-                            conn.commit()
+                    # Original deleted: mark downloaded=0 so UI shows strikethrough
+                    with db._db() as conn:
+                        conn.execute(
+                            "UPDATE archive_files SET downloaded = 0 WHERE id = ?",
+                            (file_id,),
+                        )
+                        conn.commit()
                 # === End non-cancellable block ===
 
                 log.info("worker", "Processed %s -> %s", filename, result["processed_filename"])
