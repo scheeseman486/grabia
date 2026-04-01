@@ -973,11 +973,14 @@ def scan_existing_files(archive_id):
         broadcast_sse("queue_changed", {"queue_type": "scan", "count": len(file_ids), "archive_id": archive_id})
         wake_scan_worker()
         return jsonify({"ok": True, "queued": len(file_ids)})
-    except Exception:
+    except Exception as e:
         # Clean up _scan_cancel so this archive isn't permanently blocked
         with _scan_lock:
             _scan_cancel.pop(archive_id, None)
-        raise
+        import traceback
+        tb = traceback.format_exc()
+        log.error("scan", "Scan endpoint failed for archive %d: %s\n%s", archive_id, e, tb)
+        return jsonify({"error": f"Scan failed: {e}"}), 500
 
 
 @app.route("/api/archives/<int:archive_id>/scan/cancel", methods=["POST"])
