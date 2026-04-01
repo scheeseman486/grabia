@@ -3856,6 +3856,11 @@
     let queueSortBy = { download: "position", processing: "position", scan: "position" };
     // Filtered+sorted view of queueData, rebuilt on each render
     let queueView = { download: [], processing: [], scan: [] };
+    // Queue virtual scroll state
+    const QS_ROW_HEIGHT = 37;
+    const QS_OVERSCAN = 15;
+    let qsLastRange = { download: null, processing: null, scan: null };
+    let qsScrollRAF = { download: null, processing: null, scan: null };
 
     function getQueueItemId(tab, item) {
         return tab === "download" ? (item.file_id || item.id) : item.id;
@@ -3933,9 +3938,118 @@
         return queueSortBy[tab] === "position";
     }
 
+    function getQueueColspan(tab) {
+        return tab === "download" ? 7 : tab === "processing" ? 5 : 3;
+    }
+
+    function buildQueueRow(tab, item, i, lastIdx, byPosition) {
+        const fname = item.file_name || item.name || "";
+        const archiveLabel = item.title || item.archive_title || item.archive_identifier || item.identifier || "";
+        const bold = item.downloaded ? "file-name-downloaded" : "";
+        const archiveId = item.archive_id;
+        const fileId = item.file_id || item.id;
+        const entryId = item.id || item.file_id;
+        const isCompleting = completingItems.has(`${tab}:${entryId}`);
+        const selKey = getQueueItemId(tab, item);
+
+        const tr = document.createElement("tr");
+        tr.dataset.archiveId = archiveId;
+        if (tab === "download") tr.dataset.fileId = fileId;
+        else tr.dataset.entryId = item.id;
+        if (isCompleting) tr.className = "queue-completing";
+        if (selectedQueueIds.has(selKey)) tr.classList.add("selected");
+
+        let html = "";
+
+        if (tab === "download") {
+            const status = item.download_status || "queued";
+            if (byPosition) {
+                html += buildGripCell();
+            } else {
+                html += `<td class="col-grip"><span class="queue-pos-num">${getQueueItemPos(tab, item)}</span></td>`;
+            }
+            html += `<td class="col-queue"><button class="queue-toggle queue-remove" data-queue-id="${fileId}" title="Remove from queue">` +
+                `<svg viewBox="0 0 16 16" width="14" height="14"><rect x="3" y="7" width="10" height="2" rx="1" fill="currentColor"/></svg></button></td>`;
+            html += `<td class="col-name"><div class="file-name-wrap">${renderFileName(fname, bold)}</div></td>`;
+            html += `<td class="col-archive-q" title="${escapeHtml(archiveLabel)}">${escapeHtml(archiveLabel)}</td>`;
+            html += `<td class="col-size" style="text-align:right">${formatBytes(item.size || item.file_size || 0)}</td>`;
+            html += `<td class="col-status"><span class="file-status ${status}">${status}</span></td>`;
+            if (byPosition) {
+                html += buildPriorityCell(fileId, i === 0, i === lastIdx);
+            } else {
+                html += `<td class="col-priority"></td>`;
+            }
+        } else if (tab === "processing") {
+            const status = item.status || "pending";
+            if (byPosition) {
+                html += buildGripCell();
+            } else {
+                html += `<td class="col-grip"><span class="queue-pos-num">${getQueueItemPos(tab, item)}</span></td>`;
+            }
+            html += `<td class="col-name"><div class="file-name-wrap">${renderFileName(fname, bold)}</div></td>`;
+            html += `<td class="col-archive-q" title="${escapeHtml(archiveLabel)}">${escapeHtml(archiveLabel)}</td>`;
+            html += `<td class="col-profile-q" title="${escapeHtml(item.profile_name || "")}">${escapeHtml(item.profile_name || "")}</td>`;
+            html += `<td class="col-status"><span class="file-status ${status}">${status}</span></td>`;
+        } else {
+            const status = item.status || "pending";
+            html += `<td class="col-name"><div class="file-name-wrap">${renderFileName(fname, bold)}</div></td>`;
+            html += `<td class="col-archive-q" title="${escapeHtml(archiveLabel)}">${escapeHtml(archiveLabel)}</td>`;
+            html += `<td class="col-status"><span class="file-status ${status}">${status}</span></td>`;
+        }
+
+        tr.innerHTML = html;
+
+        // Click: select — double-click: navigate
+        tr.addEventListener("click", (e) => {
+            if (e.target.closest("button, .queue-toggle, .file-priority-btns, .file-grip")) return;
+            handleQueueSelect(tab, i, e);
+        });
+        tr.addEventListener("dblclick", (e) => {
+            if (e.target.closest("button, .queue-toggle")) return;
+            if (archiveId) {
+                openArchiveDetail(parseInt(archiveId));
+                if (tab === "download" && fileId) {
+                    setTimeout(() => {
+                        const row = $(`#file-list tr[data-file-id="${fileId}"]`);
+                        if (row) flashElement(row);
+                    }, 300);
+                }
+            }
+        });
+
+        // Queue remove toggle (download only)
+        const queueBtn = tr.querySelector(".queue-toggle");
+        if (queueBtn) {
+            queueBtn.addEventListener("click", (e) => {
+                e.stopPropagation();
+                const fid = parseInt(queueBtn.dataset.queueId);
+                api("POST", `/api/files/${fid}/queue`, { queued: false }).then(() => {
+                    queueStale.download = true;
+                    loadQueueTab("download");
+                    refreshQueueCounts();
+                });
+            });
+        }
+
+        // Priority up/down buttons (download only, position sort only)
+        if (tab === "download" && byPosition) {
+            const upBtn = tr.querySelector(`[data-move-up="${fileId}"]`);
+            const downBtn = tr.querySelector(`[data-move-down="${fileId}"]`);
+            if (upBtn) upBtn.addEventListener("click", (e) => { e.stopPropagation(); moveQueueItem(tab, i, -1); });
+            if (downBtn) downBtn.addEventListener("click", (e) => { e.stopPropagation(); moveQueueItem(tab, i, 1); });
+        }
+
+        // Drag-and-drop reordering (only when sorted by position)
+        if (byPosition && (tab === "download" || tab === "processing")) {
+            attachQueueDrag(tr, tab, i);
+        }
+
+        return tr;
+    }
+
+    // Called when data or filter/sort changes — recomputes view and triggers virtual render
     function renderQueueTable(tab) {
         const abbr = tab === "download" ? "dl" : tab === "processing" ? "proc" : "scan";
-        const tbody = $(`#queue-${abbr}-tbody`);
         const empty = $(`#queue-${abbr}-empty`);
         const wrap = $(`#queue-${abbr}-wrap`);
 
@@ -3952,118 +4066,63 @@
         wrap.style.display = "";
         empty.style.display = "none";
 
+        // Reset virtual scroll range so it fully re-renders
+        qsLastRange[tab] = null;
+        qsVsRenderVisible(tab);
+    }
+
+    // Render only the visible slice of rows in a queue table (virtual scroll)
+    function qsVsRenderVisible(tab) {
+        // Don't rebuild rows during drag
+        if (queueDragSrcIdx !== null) return;
+
+        const abbr = tab === "download" ? "dl" : tab === "processing" ? "proc" : "scan";
+        const tbody = $(`#queue-${abbr}-tbody`);
+        const wrap = $(`#queue-${abbr}-wrap`);
+        const view = queueView[tab];
+        if (!wrap || !view || view.length === 0) return;
+
+        const totalRows = view.length;
+        const byPosition = isQueueSortedByPosition(tab);
+        const lastIdx = totalRows - 1;
+        const colspan = getQueueColspan(tab);
+
+        const scrollTop = wrap.scrollTop;
+        const viewHeight = wrap.clientHeight;
+
+        let startRow = Math.floor(scrollTop / QS_ROW_HEIGHT) - QS_OVERSCAN;
+        let endRow = Math.ceil((scrollTop + viewHeight) / QS_ROW_HEIGHT) + QS_OVERSCAN;
+        startRow = Math.max(0, startRow);
+        endRow = Math.min(totalRows - 1, endRow);
+
+        // Skip re-render if the range hasn't changed
+        if (qsLastRange[tab] && qsLastRange[tab].start === startRow && qsLastRange[tab].end === endRow) return;
+        qsLastRange[tab] = { start: startRow, end: endRow };
+
         const savedScroll = wrap.scrollTop;
         tbody.innerHTML = "";
-        const lastIdx = view.length - 1;
-        const byPosition = isQueueSortedByPosition(tab);
 
-        for (let i = 0; i < view.length; i++) {
-            const item = view[i];
-            const fname = item.file_name || item.name || "";
-            const archiveLabel = item.title || item.archive_title || item.archive_identifier || item.identifier || "";
-            const bold = item.downloaded ? "file-name-downloaded" : "";
-            const archiveId = item.archive_id;
-            const fileId = item.file_id || item.id;
-            const entryId = item.id || item.file_id;
-            const isCompleting = completingItems.has(`${tab}:${entryId}`);
-            const selKey = getQueueItemId(tab, item);
+        // Top spacer
+        if (startRow > 0) {
+            const spacer = document.createElement("tr");
+            spacer.className = "vs-spacer";
+            spacer.innerHTML = `<td colspan="${colspan}" style="height:${startRow * QS_ROW_HEIGHT}px;padding:0;border:none"></td>`;
+            tbody.appendChild(spacer);
+        }
 
-            const tr = document.createElement("tr");
-            tr.dataset.archiveId = archiveId;
-            if (tab === "download") tr.dataset.fileId = fileId;
-            else tr.dataset.entryId = item.id;
-            if (isCompleting) tr.className = "queue-completing";
-            if (selectedQueueIds.has(selKey)) tr.classList.add("selected");
-
-            let html = "";
-
-            if (tab === "download") {
-                const status = item.download_status || "queued";
-                // Grip or position number
-                if (byPosition) {
-                    html += buildGripCell();
-                } else {
-                    html += `<td class="col-grip"><span class="queue-pos-num">${getQueueItemPos(tab, item)}</span></td>`;
-                }
-                // Queue remove button
-                html += `<td class="col-queue"><button class="queue-toggle queue-remove" data-queue-id="${fileId}" title="Remove from queue">` +
-                    `<svg viewBox="0 0 16 16" width="14" height="14"><rect x="3" y="7" width="10" height="2" rx="1" fill="currentColor"/></svg></button></td>`;
-                html += `<td class="col-name"><div class="file-name-wrap">${renderFileName(fname, bold)}</div></td>`;
-                html += `<td class="col-archive-q" title="${escapeHtml(archiveLabel)}">${escapeHtml(archiveLabel)}</td>`;
-                html += `<td class="col-size" style="text-align:right">${formatBytes(item.size || item.file_size || 0)}</td>`;
-                html += `<td class="col-status"><span class="file-status ${status}">${status}</span></td>`;
-                // Priority buttons only when sorted by position
-                if (byPosition) {
-                    html += buildPriorityCell(fileId, i === 0, i === lastIdx);
-                } else {
-                    html += `<td class="col-priority"></td>`;
-                }
-            } else if (tab === "processing") {
-                const status = item.status || "pending";
-                if (byPosition) {
-                    html += buildGripCell();
-                } else {
-                    html += `<td class="col-grip"><span class="queue-pos-num">${getQueueItemPos(tab, item)}</span></td>`;
-                }
-                html += `<td class="col-name"><div class="file-name-wrap">${renderFileName(fname, bold)}</div></td>`;
-                html += `<td class="col-archive-q" title="${escapeHtml(archiveLabel)}">${escapeHtml(archiveLabel)}</td>`;
-                html += `<td class="col-profile-q" title="${escapeHtml(item.profile_name || "")}">${escapeHtml(item.profile_name || "")}</td>`;
-                html += `<td class="col-status"><span class="file-status ${status}">${status}</span></td>`;
-            } else {
-                const status = item.status || "pending";
-                html += `<td class="col-name"><div class="file-name-wrap">${renderFileName(fname, bold)}</div></td>`;
-                html += `<td class="col-archive-q" title="${escapeHtml(archiveLabel)}">${escapeHtml(archiveLabel)}</td>`;
-                html += `<td class="col-status"><span class="file-status ${status}">${status}</span></td>`;
-            }
-
-            tr.innerHTML = html;
-
-            // Click: select (single, shift, ctrl) — double-click: navigate
-            tr.addEventListener("click", (e) => {
-                if (e.target.closest("button, .queue-toggle, .file-priority-btns, .file-grip")) return;
-                handleQueueSelect(tab, i, e);
-            });
-            tr.addEventListener("dblclick", (e) => {
-                if (e.target.closest("button, .queue-toggle")) return;
-                if (archiveId) {
-                    openArchiveDetail(parseInt(archiveId));
-                    if (tab === "download" && fileId) {
-                        setTimeout(() => {
-                            const row = $(`#file-list tr[data-file-id="${fileId}"]`);
-                            if (row) flashElement(row);
-                        }, 300);
-                    }
-                }
-            });
-
-            // Queue remove toggle (download only)
-            const queueBtn = tr.querySelector(".queue-toggle");
-            if (queueBtn) {
-                queueBtn.addEventListener("click", (e) => {
-                    e.stopPropagation();
-                    const fid = parseInt(queueBtn.dataset.queueId);
-                    api("POST", `/api/files/${fid}/queue`, { queued: false }).then(() => {
-                        queueStale.download = true;
-                        loadQueueTab("download");
-                        refreshQueueCounts();
-                    });
-                });
-            }
-
-            // Priority up/down buttons (download only, position sort only)
-            if (tab === "download" && byPosition) {
-                const upBtn = tr.querySelector(`[data-move-up="${fileId}"]`);
-                const downBtn = tr.querySelector(`[data-move-down="${fileId}"]`);
-                if (upBtn) upBtn.addEventListener("click", (e) => { e.stopPropagation(); moveQueueItem(tab, i, -1); });
-                if (downBtn) downBtn.addEventListener("click", (e) => { e.stopPropagation(); moveQueueItem(tab, i, 1); });
-            }
-
-            // Drag-and-drop reordering (only when sorted by position)
-            if (byPosition && (tab === "download" || tab === "processing")) {
-                attachQueueDrag(tr, tab, i);
-            }
-
+        // Visible rows
+        for (let i = startRow; i <= endRow; i++) {
+            const tr = buildQueueRow(tab, view[i], i, lastIdx, byPosition);
             tbody.appendChild(tr);
+        }
+
+        // Bottom spacer
+        const bottomSpace = (totalRows - endRow - 1) * QS_ROW_HEIGHT;
+        if (bottomSpace > 0) {
+            const spacer = document.createElement("tr");
+            spacer.className = "vs-spacer";
+            spacer.innerHTML = `<td colspan="${colspan}" style="height:${bottomSpace}px;padding:0;border:none"></td>`;
+            tbody.appendChild(spacer);
         }
 
         wrap.scrollTop = savedScroll;
@@ -4278,6 +4337,21 @@
                 queueSortBy[qTab] = sel.value;
                 renderQueueTable(qTab);
             });
+        });
+
+        // Virtual scroll for queue table wraps
+        ["dl", "proc", "scan"].forEach((abbr, idx) => {
+            const qTab = ["download", "processing", "scan"][idx];
+            const wrap = $(`#queue-${abbr}-wrap`);
+            if (wrap) {
+                wrap.addEventListener("scroll", () => {
+                    if (qsScrollRAF[qTab]) return;
+                    qsScrollRAF[qTab] = requestAnimationFrame(() => {
+                        qsScrollRAF[qTab] = null;
+                        qsVsRenderVisible(qTab);
+                    });
+                });
+            }
         });
 
         // Seed badge on page load
