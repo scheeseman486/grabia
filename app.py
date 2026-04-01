@@ -586,18 +586,18 @@ def _scan_single_file_on_disk(f, base_dir):
         if proc_status == "processed" and has_output:
             # Processed output exists — check if original is still on disk
             if not os.path.isfile(local_path):
-                # Original deleted but processed files remain → downloaded = 0
-                db.set_file_download_status(file_id, "completed",
-                    downloaded_bytes=f.get("downloaded_bytes", 0))
-                if f.get("downloaded") != 0:
-                    with db._db() as conn:
-                        conn.execute(
-                            "UPDATE archive_files SET downloaded = 0 WHERE id = ?",
-                            (file_id,),
-                        )
-                        conn.commit()
+                # Original deleted but processed files remain
+                # Set status=completed, downloaded=0 in one atomic update
+                # (can't use set_file_download_status which forces downloaded=1)
+                with db._db() as conn:
+                    conn.execute(
+                        "UPDATE archive_files SET download_status = 'completed', "
+                        "downloaded = 0, queue_position = NULL WHERE id = ?",
+                        (file_id,),
+                    )
+                    conn.commit()
             else:
-                # Original still on disk — ensure status is completed
+                # Original still on disk — ensure status is completed, downloaded=1
                 db.set_file_download_status(file_id, "completed",
                     downloaded_bytes=f.get("downloaded_bytes") or f.get("size", 0))
             return "matched"
