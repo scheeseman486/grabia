@@ -415,8 +415,35 @@ def init_db():
     except sqlite3.OperationalError:
         pass  # Column already gone
 
-    # Migration: drop batches table
+    # Migration: drop batches table and rebuild scan_queue if it still references it
     conn.execute("DROP TABLE IF EXISTS batches")
+    # scan_queue may have been created with FK to batches — rebuild without it
+    try:
+        schema = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='scan_queue'"
+        ).fetchone()
+        if schema and "batches" in (schema[0] or ""):
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS scan_queue_new (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    file_id INTEGER NOT NULL REFERENCES archive_files(id) ON DELETE CASCADE,
+                    archive_id INTEGER NOT NULL,
+                    batch_id INTEGER DEFAULT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    position INTEGER NOT NULL DEFAULT 0,
+                    created_at REAL NOT NULL
+                )
+            """)
+            conn.execute("""
+                INSERT INTO scan_queue_new (id, file_id, archive_id, batch_id, status, position, created_at)
+                SELECT id, file_id, archive_id, batch_id, status, position, created_at FROM scan_queue
+            """)
+            conn.execute("DROP TABLE scan_queue")
+            conn.execute("ALTER TABLE scan_queue_new RENAME TO scan_queue")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_scan_queue_status ON scan_queue(status, position)")
+            conn.commit()
+    except sqlite3.OperationalError:
+        pass
 
     # Migration: add status_pct column to archives
     try:
