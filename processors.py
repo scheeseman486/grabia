@@ -21,6 +21,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import zipfile
 
@@ -333,6 +334,15 @@ def detect_tools():
         if path:
             version = _get_binary_version(path, version_flag)
         tools[name] = {"path": path, "version": version, "available": path is not None}
+
+    # shitman: check multiple binary names (compiled binary, Python script, generic)
+    shitman_path = _find_shitman()
+    tools["shitman"] = {
+        "path": shitman_path,
+        "version": _get_binary_version(shitman_path, "--help") if shitman_path else None,
+        "available": shitman_path is not None,
+    }
+
     return tools
 
 
@@ -1562,3 +1572,176 @@ class ExtractProcessor(BaseProcessor):
             }
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# BigPImage (Jaguar) Processor — uses shitman
+# ---------------------------------------------------------------------------
+
+def _find_shitman():
+    """Locate the shitman binary or script.
+
+    Checks for the compiled binary (shitman-linux-x64) first, then the
+    Python script (shitman.py) which is used in Docker where Python is
+    already available.
+    """
+    for name in ("shitman-linux-x64", "shitman-linux-arm64", "shitman.py", "shitman"):
+        path = _find_binary(name)
+        if path:
+            return path
+    return None
+
+
+@register_processor
+class BigPImageProcessor(BaseProcessor):
+    type_id = "bigpimg"
+    label = "BigPImage (Jaguar)"
+    description = "Convert Jaguar CD images (BIN/CUE) to BigPEmu's .bigpimg format using shitman"
+    input_extensions = [".zip", ".7z", ".rar", ".cue"]
+    options_schema = [
+        {
+            "key": "subchannel",
+            "label": "Subchannel data",
+            "type": "select",
+            "default": "no",
+            "choices": [
+                {"value": "no", "label": "No"},
+                {"value": "yes", "label": "Yes — preserve subchannel data"},
+            ],
+        },
+        {
+            "key": "prepass",
+            "label": "Deduplication pre-pass",
+            "type": "select",
+            "default": "no",
+            "choices": [
+                {"value": "no", "label": "No"},
+                {"value": "yes", "label": "Yes — build sector dictionary"},
+            ],
+        },
+    ]
+
+    def process(self, file_path, download_dir):
+        fname = os.path.basename(file_path)
+        log.info("proc", "BigPImage: processing %s", fname)
+        shitman = _find_shitman()
+        if not shitman:
+            raise ProcessingError(
+                "shitman not found. Place shitman-linux-x64 or shitman.py on PATH."
+            )
+
+        ext = os.path.splitext(file_path)[1].lower()
+
+        # Direct CUE file — convert without extraction
+        if ext == ".cue":
+            return self._convert_cue(shitman, file_path, download_dir)
+
+        # Archive — peek, extract, find CUE files inside
+        has_cues = _archive_has_extensions(file_path, {".cue", ".bin"})
+        if has_cues is False:
+            return {"skipped": True, "reason": "No CUE/BIN disc images found in archive"}
+
+        temp_dir = self.get_temp_dir(file_path)
+        try:
+            self._progress(phase="extracting", filename=fname)
+            self._check_cancel()
+            extracted = _extract_archive(file_path, temp_dir, self._cancel_check)
+            self._check_cancel()
+
+            # Find CUE sheets in extracted contents
+            disc_images = find_disc_images(extracted, temp_dir)
+            cue_discs = [d for d in disc_images if d["type"] == "cue"]
+            if not cue_discs:
+                return {"skipped": True, "reason": "No CUE/BIN disc images found in archive"}
+
+            results = []
+            for i, disc in enumerate(cue_discs):
+                self._check_cancel()
+                self._progress(
+                    phase="converting",
+                    filename=disc["name"],
+                    current=i + 1,
+                    total=len(cue_discs),
+                )
+                bigp_name = disc["name"] + ".bigpimg"
+                bigp_path = os.path.join(download_dir, bigp_name)
+                self._run_shitman(shitman, disc["cue_path"], bigp_path)
+                results.append(bigp_path)
+
+            processed_filename = os.path.relpath(results[0], download_dir)
+            return {
+                "processed_filename": processed_filename,
+                "files_created": results,
+                "files_to_delete": [file_path],
+                "skipped": False,
+            }
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def _convert_cue(self, shitman, cue_path, download_dir):
+        """Convert a standalone CUE file to BigPImage."""
+        base_name = os.path.splitext(os.path.basename(cue_path))[0]
+        bigp_path = os.path.join(download_dir, base_name + ".bigpimg")
+        self._progress(phase="converting", filename=os.path.basename(cue_path), current=1, total=1)
+        self._run_shitman(shitman, cue_path, bigp_path)
+        # Collect all BIN files referenced by the CUE for deletion
+        cue_dir = os.path.dirname(cue_path) or "."
+        bins = _parse_cue_bins(cue_path, cue_dir)
+        files_to_delete = [cue_path] + bins
+        return {
+            "processed_filename": os.path.relpath(bigp_path, download_dir),
+            "files_created": [bigp_path],
+            "files_to_delete": files_to_delete,
+            "skipped": False,
+        }
+
+    def _run_shitman(self, shitman, cue_path, output_path):
+        """Run shitman to convert a CUE to BigPImage."""
+        # Build command — if it's a .py script, run via Python interpreter
+        if shitman.endswith(".py"):
+            cmd = [sys.executable, shitman]
+        else:
+            cmd = [shitman]
+
+        cmd.extend([cue_path, "-o", output_path, "--level", "9", "-v"])
+
+        if self.options.get("subchannel") == "yes":
+            cmd.append("--subchannel")
+        if self.options.get("prepass") == "yes":
+            cmd.append("--prepass")
+
+        self._check_cancel()
+        log.debug("proc", "Running: %s", " ".join(cmd))
+
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        )
+        output_lines = []
+        try:
+            for line in proc.stdout:
+                output_lines.append(line)
+                # Parse progress from verbose output: "Processed 10000/50000 sectors..."
+                if "Processed " in line and "/" in line:
+                    try:
+                        parts = line.strip().split("Processed ")[1].split("/")
+                        current = int(parts[0])
+                        total = int(parts[1].split()[0])
+                        if total > 0:
+                            pct = min(100, (current / total) * 100)
+                            self._progress(phase="converting", pct=pct)
+                    except (IndexError, ValueError):
+                        pass
+                self._check_cancel()
+            proc.wait(timeout=7200)
+        except ProcessingCancelled:
+            proc.kill()
+            proc.wait(timeout=5)
+            raise
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
+            raise ProcessingError("shitman timed out after 7200s")
+
+        if proc.returncode != 0:
+            err = "".join(output_lines[-10:]).strip()
+            raise ProcessingError(f"shitman failed (rc={proc.returncode}): {err[:500]}")

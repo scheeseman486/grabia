@@ -40,6 +40,10 @@ COPY *.py ./
 COPY static/ ./static/
 COPY templates/ ./templates/
 
+# shitman: Atari Jaguar CD → BigPImage converter (pure Python, no deps)
+ADD https://raw.githubusercontent.com/scheeseman486/shitman/main/shitman.py /usr/local/bin/shitman.py
+RUN chmod +x /usr/local/bin/shitman.py
+
 RUN mkdir -p /app/data /app/downloads /tempstorage
 
 ENV GRABIA_HOST=0.0.0.0
