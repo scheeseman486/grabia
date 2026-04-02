@@ -4430,6 +4430,19 @@
 
     // ── Activity Log ──────────────────────────────────────────────
     let activityJobFilter = null;  // set when navigating from a notification
+    let activeActivityTab = "ongoing";
+
+    function switchActivityTab(tab) {
+        activeActivityTab = tab;
+        $$("[data-activity-tab]").forEach(btn => btn.classList.toggle("active", btn.dataset.activityTab === tab));
+        $("#activity-panel-ongoing").classList.toggle("active", tab === "ongoing");
+        $("#activity-panel-log").classList.toggle("active", tab === "log");
+        if (tab === "ongoing") refreshOngoingActivity();
+        if (tab === "log") {
+            loadActivityJobs(activityJobFilter);
+            loadActivityLog();
+        }
+    }
 
     async function openActivityLog(opts) {
         opts = opts || {};
@@ -4446,10 +4459,16 @@
         if (opts.category) $("#activity-filter-category").value = opts.category;
         if (opts.archive_id) $("#activity-filter-archive").value = String(opts.archive_id);
 
+        // If navigating with a job_id or filters, go straight to the Log tab
+        const targetTab = (opts.job_id || opts.category || opts.archive_id) ? "log" : "ongoing";
+
         await populateActivityArchiveFilter();
-        await loadActivityJobs(opts.job_id || null);
-        await loadActivityLog();
+        if (targetTab === "log") {
+            await loadActivityJobs(opts.job_id || null);
+            await loadActivityLog();
+        }
         refreshOngoingActivity();
+        switchActivityTab(targetTab);
         showPage("page-activity");
     }
 
@@ -4882,8 +4901,12 @@
 
     function _refreshActivityIfVisible() {
         if ($("#page-activity").classList.contains("active")) {
-            loadActivityJobs(activityJobFilter);
-            loadActivityLog();
+            if (activeActivityTab === "log") {
+                loadActivityJobs(activityJobFilter);
+                loadActivityLog();
+            } else {
+                refreshOngoingActivity();
+            }
         }
     }
 
@@ -5371,8 +5394,11 @@
         // Queues
         $("#btn-queues").addEventListener("click", () => openQueues());
         initQueuePage();
-        // Activity Log
+        // Activities
         $("#btn-activity").addEventListener("click", () => openActivityLog());
+        $$("#activity-tabs [data-activity-tab]").forEach(btn => {
+            btn.addEventListener("click", () => switchActivityTab(btn.dataset.activityTab));
+        });
         $("#activity-filter-apply").addEventListener("click", () => loadActivityLog());
         $("#activity-filter-clear").addEventListener("click", clearActivityFilters);
         $("#activity-filter-search").addEventListener("keydown", (e) => { if (e.key === "Enter") loadActivityLog(); });

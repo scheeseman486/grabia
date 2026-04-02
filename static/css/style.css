@@ -2939,13 +2939,19 @@ tr.processed-detail-row td { padding: 0 !important; }
 /* Bold filename for downloaded files */
 .file-name-downloaded { font-weight: 600; }
 
-/* Activity ongoing summary (Phase 2) */
+/* Activity ongoing summary */
 .activity-ongoing {
-    margin-bottom: 12px;
     border: 1px solid var(--border);
     border-radius: 6px;
     background: var(--card-bg);
     overflow: hidden;
+}
+/* In the dropdown, keep margin; in the tab panel, strip card chrome */
+.queue-dropdown .activity-ongoing { margin-bottom: 0; }
+.queue-panel > .activity-ongoing {
+    border: none;
+    border-radius: 0;
+    background: none;
 }
 .activity-ongoing-row {
     display: flex;
@@ -3059,6 +3065,7 @@ tr.processed-detail-row td { padding: 0 !important; }
     padding: 16px;
     font-size: 13px;
 }
+.queue-panel .activity-ongoing-empty { padding: 48px 16px; }
 
 /* Pause button active state (paused — shows play icon) */
 .action-btn.active {
