@@ -509,6 +509,7 @@ class DownloadManager:
             log.debug("download", "Completed: %s", filename)
             db.set_file_download_status(file_id, "completed", downloaded_bytes=expected_size)
             self._notify("file_complete", {"file_id": file_id, "filename": filename, "identifier": identifier})
+            self._notify("queue_update", {"queue_type": "download", "action": "completed", "file_id": file_id})
             activity.log(None, "success", f"Downloaded {filename}",
                          archive_id=archive_id, file_id=file_id, category="download")
             activity.flush()
@@ -522,8 +523,10 @@ class DownloadManager:
             log.debug("download", "Skipped (dequeued): %s (%d bytes on disk)", filename, partial)
             db.set_file_download_status(file_id, "pending", downloaded_bytes=partial)
             self._notify("file_skipped", {"file_id": file_id, "filename": filename, "identifier": identifier, "downloaded": partial, "size": expected_size})
+            self._notify("queue_update", {"queue_type": "download", "action": "completed", "file_id": file_id})
         elif not self._stop_event.is_set() and not success:
             self._notify("file_failed", {"file_id": file_id, "filename": filename, "identifier": identifier})
+            self._notify("queue_update", {"queue_type": "download", "action": "completed", "file_id": file_id})
 
         # Check if all files in this archive are done
         self._check_archive_completion(archive_id)

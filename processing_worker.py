@@ -489,6 +489,10 @@ def _run_processing(job):
         pqe = pq_map.get(file_id)
         if pqe:
             db.claim_processing_queue_entry(pqe["id"])
+            _broadcast("queue_update", {
+                "queue_type": "processing", "action": "status_changed",
+                "entry_id": pqe["id"], "status": "running",
+            })
 
         db.set_file_processing_status(file_id, "processing")
 
@@ -574,6 +578,10 @@ def _run_processing(job):
             # Mark processing queue entry as completed
             if pqe:
                 db.complete_processing_queue_entry(pqe["id"])
+                _broadcast("queue_update", {
+                    "queue_type": "processing", "action": "completed",
+                    "entry_id": pqe["id"],
+                })
 
         except ProcessingCancelled:
             db.set_file_processing_status(file_id, "cancelled", error="Cancelled")
@@ -607,6 +615,10 @@ def _run_processing(job):
             db.set_file_processing_status(file_id, "failed", error=str(e))
             if pqe:
                 db.complete_processing_queue_entry(pqe["id"], error_message=str(e))
+                _broadcast("queue_update", {
+                    "queue_type": "processing", "action": "status_changed",
+                    "entry_id": pqe["id"], "status": "failed",
+                })
             if act_job_id:
                 activity.log(act_job_id, "error", f"Failed: {filename}",
                              archive_id=archive_id, file_id=file_id,
@@ -627,6 +639,10 @@ def _run_processing(job):
             db.set_file_processing_status(file_id, "failed", error=str(e))
             if pqe:
                 db.complete_processing_queue_entry(pqe["id"], error_message=str(e))
+                _broadcast("queue_update", {
+                    "queue_type": "processing", "action": "status_changed",
+                    "entry_id": pqe["id"], "status": "failed",
+                })
             if act_job_id:
                 activity.log(act_job_id, "error", f"Failed: {filename}",
                              archive_id=archive_id, file_id=file_id,

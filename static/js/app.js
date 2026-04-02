@@ -527,10 +527,9 @@
         es.addEventListener("file_complete", (e) => {
             const data = JSON.parse(e.data);
             updateFileRow(data.file_id, { download_status: "completed", downloaded: 1, queue_position: null });
-            // Remove from active downloads and queue data
+            // Remove from active downloads (queue_update event handles queue data removal)
             activeDownloads = activeDownloads.filter(d => d.file_id !== data.file_id);
             currentDownloadInfo = activeDownloads.length > 0 ? activeDownloads[0] : null;
-            removeFromQueueData(data.file_id);
             lastProgressRefresh = 0; // force immediate refresh
             throttledProgressRefresh();
             refreshQueueCount();
@@ -541,10 +540,9 @@
 
         es.addEventListener("file_error", (e) => {
             const data = JSON.parse(e.data);
-            // Remove from active downloads and queue data
+            // Remove from active downloads (queue_update event handles queue data removal)
             activeDownloads = activeDownloads.filter(d => d.file_id !== data.file_id);
             currentDownloadInfo = activeDownloads.length > 0 ? activeDownloads[0] : null;
-            removeFromQueueData(data.file_id);
             refreshOngoingActivity();
             if (queueDropdownOpen) loadQueueDropdown();
             _refreshActivityIfVisible();
@@ -557,10 +555,9 @@
         es.addEventListener("file_failed", (e) => {
             const data = JSON.parse(e.data);
             updateFileRow(data.file_id, { download_status: "failed" });
-            // Remove from active downloads and queue data
+            // Remove from active downloads (queue_update event handles queue data removal)
             activeDownloads = activeDownloads.filter(d => d.file_id !== data.file_id);
             currentDownloadInfo = activeDownloads.length > 0 ? activeDownloads[0] : null;
-            removeFromQueueData(data.file_id);
             lastProgressRefresh = 0;
             throttledProgressRefresh();
             refreshOngoingActivity();
@@ -579,7 +576,6 @@
                 downloaded_bytes: data.downloaded || 0,
                 size: data.size,
             });
-            removeFromQueueData(data.file_id);
             lastProgressRefresh = 0;
             throttledProgressRefresh();
             refreshQueueCount();
@@ -1020,20 +1016,6 @@
                 item.download_status = "downloading";
                 if (dl.size > 0) item.size = dl.size;
             }
-        }
-    }
-
-    /**
-     * Remove a file from the download queue data and re-render if visible.
-     * Called when a file completes, fails, or is skipped/dequeued.
-     */
-    function removeFromQueueData(fileId) {
-        const dlQueue = queueData["download"];
-        if (!dlQueue) return;
-        const idx = dlQueue.findIndex(q => (q.file_id || q.id) == fileId);
-        if (idx !== -1) dlQueue.splice(idx, 1);
-        if ($("#page-queues").classList.contains("active") && activeQueueTab === "download") {
-            renderQueueTable("download");
         }
     }
 
