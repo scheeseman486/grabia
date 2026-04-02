@@ -135,21 +135,47 @@ def cancel_archive_processing(archive_id):
 
     # Also cancel via DB — handles pending jobs and running jobs that
     # somehow lack a cancel event (e.g. after crash recovery).
-    if not cancelled:
-        job = db.get_active_processing_job_for_archive(archive_id)
-        if job:
-            db.cancel_processing_job(job["id"])
-            cancelled = True
+    job = db.get_active_processing_job_for_archive(archive_id)
+    if job:
+        db.cancel_processing_job(job["id"])
+        # Cancel all pending queue entries for this job so they don't get
+        # picked up one-by-one by the worker loop.
+        _cancel_job_queue_entries(job["id"], archive_id)
+        cancelled = True
 
     if cancelled:
         # Flash notification for cancellation
         db.create_notification(f'Processing cancelled', type="warning")
         # Close any running activity job for this archive.
-        # The processing loop may also call finish_job when it detects the
-        # cancel event, but that's harmless (just an extra UPDATE).
         _cancel_activity_job(archive_id)
+        # Clean up cancel event
+        with _processing_lock:
+            _cancel_events.pop(archive_id, None)
 
     return cancelled
+
+
+def _cancel_job_queue_entries(job_id, archive_id):
+    """Cancel all pending queue entries for a job and reset their file statuses."""
+    with db._db() as conn:
+        # Get pending entries to reset file statuses
+        pending = conn.execute(
+            "SELECT file_id FROM processing_queue WHERE job_id = ? AND status = 'pending'",
+            (job_id,),
+        ).fetchall()
+        for row in pending:
+            db.set_file_processing_status(row["file_id"], "cancelled", error="Cancelled")
+        # Bulk cancel queue entries
+        conn.execute(
+            "UPDATE processing_queue SET status = 'cancelled', updated_at = ? WHERE job_id = ? AND status = 'pending'",
+            (time.time(), job_id),
+        )
+        conn.commit()
+    # Notify frontend to remove them from queue display
+    _broadcast("queue_update", {
+        "queue_type": "processing", "action": "removed",
+        "data": {"cancelled": len(pending)},
+    })
 
 
 def _cancel_activity_job(archive_id):
@@ -219,6 +245,10 @@ def _populate_processing_queue(job_id, archive_id, profile_id, file_ids, options
     entries = [(f["id"], archive_id, profile_id, options_json) for f in files]
     db.add_processing_queue_entries_batch(job_id, entries)
 
+    # Mark all files as queued so the file list shows correct status immediately
+    for f in files:
+        db.set_file_processing_status(f["id"], "queued", processor_type=profile["processor_type"])
+
     _broadcast("queue_changed", {"queue_type": "processing", "count": len(entries), "archive_id": archive_id})
 
 
@@ -231,7 +261,296 @@ def _broadcast(event, data):
 # Worker loop — polls DB for pending jobs
 # ---------------------------------------------------------------------------
 
+def _build_job_context(job):
+    """Load and validate all resources needed to process files for a job.
+
+    Returns a context dict, or None if the job can't run (profile/archive
+    missing, etc.).  Caller is responsible for failing/skipping the job.
+    """
+    archive_id = job["archive_id"]
+    profile_id = job["profile_id"]
+    options_override = json.loads(job["options_override_json"]) if job.get("options_override_json") else {}
+
+    act_job_id = _find_activity_job(job["id"])
+
+    archive = db.get_archive(archive_id)
+    if not archive:
+        if act_job_id:
+            activity.log(act_job_id, "error", "Archive not found", archive_id=archive_id)
+            activity.flush()
+            activity.finish_job(act_job_id, "failed", summary="Archive not found")
+        db.complete_processing_job(job["id"], error_message="Archive not found")
+        return None
+
+    archive_name = archive["title"] or archive["identifier"]
+
+    profile = db.get_processing_profile(profile_id)
+    if not profile:
+        msg = "Processing profile not found"
+        if act_job_id:
+            activity.log(act_job_id, "error", msg, archive_id=archive_id)
+            activity.flush()
+            activity.finish_job(act_job_id, "failed", summary=msg)
+        _broadcast("processing_progress", {
+            "archive_id": archive_id, "phase": "error", "error": msg,
+        })
+        db.complete_processing_job(job["id"], error_message=msg)
+        return None
+
+    processor_cls = get_processor(profile["processor_type"])
+    if not processor_cls:
+        msg = f"Unknown processor type: {profile['processor_type']}"
+        if act_job_id:
+            activity.log(act_job_id, "error", msg, archive_id=archive_id)
+            activity.flush()
+            activity.finish_job(act_job_id, "failed", summary=msg)
+        _broadcast("processing_progress", {
+            "archive_id": archive_id, "phase": "error", "error": msg,
+        })
+        db.complete_processing_job(job["id"], error_message=msg)
+        return None
+
+    profile_options = json.loads(profile.get("options_json", "{}"))
+    merged_options = {**profile_options, **options_override}
+
+    download_dir = db.get_setting("download_dir", os.path.expanduser("~/ia-downloads"))
+    archive_dir = os.path.join(download_dir, archive["identifier"])
+
+    return {
+        "job": job,
+        "job_id": job["id"],
+        "archive_id": archive_id,
+        "archive_name": archive_name,
+        "profile": profile,
+        "processor_cls": processor_cls,
+        "merged_options": merged_options,
+        "archive_dir": archive_dir,
+        "act_job_id": act_job_id,
+    }
+
+
+def _process_single_entry(entry, ctx):
+    """Process one processing_queue entry using the cached job context."""
+    job_id = ctx["job_id"]
+    archive_id = ctx["archive_id"]
+    act_job_id = ctx["act_job_id"]
+    merged_options = ctx["merged_options"]
+    processor_cls = ctx["processor_cls"]
+    profile = ctx["profile"]
+    archive_dir = ctx["archive_dir"]
+
+    file_id = entry["file_id"]
+    file_info = db.get_file(file_id)
+    if not file_info:
+        db.complete_processing_queue_entry(entry["id"], error_message="File not found")
+        _broadcast("queue_update", {
+            "queue_type": "processing", "action": "completed",
+            "entry_id": entry["id"],
+        })
+        return
+
+    filename = file_info["name"]
+    file_path = os.path.join(archive_dir, filename)
+
+    # Claim the queue entry
+    if not db.claim_processing_queue_entry(entry["id"]):
+        return  # Already claimed
+    _broadcast("queue_update", {
+        "queue_type": "processing", "action": "status_changed",
+        "entry_id": entry["id"], "status": "running",
+    })
+
+    db.set_file_processing_status(file_id, "processing")
+
+    cancel_evt = _cancel_events.get(archive_id)
+
+    def _cancelled():
+        return cancel_evt and cancel_evt.is_set()
+
+    def progress_cb(**kwargs):
+        _broadcast("processing_progress", {
+            "archive_id": archive_id,
+            "file_id": file_id,
+            "filename": filename,
+            **kwargs,
+        })
+
+    try:
+        log.debug("worker", "Processing file: %s (entry %d)", filename, entry["id"])
+        processor = processor_cls(
+            options=merged_options,
+            cancel_check=_cancelled,
+            progress_callback=progress_cb,
+        )
+
+        if not os.path.isfile(file_path):
+            raise ProcessingError(f"File not found: {file_path}")
+
+        result = processor.process(file_path, archive_dir)
+
+        if result.get("skipped"):
+            reason = result.get("reason", "Not processable")
+            log.info("worker", "Skipped %s: %s", filename, reason)
+            db.set_file_processing_status(file_id, "skipped", error=reason)
+            if act_job_id:
+                activity.log(act_job_id, "info", f"Skipped: {filename}",
+                             archive_id=archive_id, file_id=file_id,
+                             detail=reason)
+        else:
+            delete_original = merged_options.get("delete_original", "yes") == "yes"
+            if delete_original:
+                for to_delete in result.get("files_to_delete", []):
+                    try:
+                        os.remove(to_delete)
+                    except OSError:
+                        pass
+                with db._db() as conn:
+                    conn.execute(
+                        "UPDATE archive_files SET downloaded = 0 WHERE id = ?",
+                        (file_id,),
+                    )
+                    conn.commit()
+
+            log.info("worker", "Processed %s -> %s", filename, result["processed_filename"])
+            db.set_file_processing_status(
+                file_id, "processed",
+                processed_filename=result["processed_filename"],
+                processor_type=profile["processor_type"],
+                processed_files=result.get("processed_files"),
+            )
+            if act_job_id:
+                activity.log(act_job_id, "success",
+                             f"Converted: {filename} → {result['processed_filename']}",
+                             archive_id=archive_id, file_id=file_id)
+
+        _broadcast("processing_progress", {
+            "archive_id": archive_id,
+            "file_id": file_id,
+            "filename": filename,
+            "phase": "file_done",
+            "skipped": result.get("skipped", False),
+        })
+
+        db.complete_processing_queue_entry(entry["id"])
+        _broadcast("queue_update", {
+            "queue_type": "processing", "action": "completed",
+            "entry_id": entry["id"],
+        })
+
+    except ProcessingCancelled:
+        db.set_file_processing_status(file_id, "cancelled", error="Cancelled")
+        db.cancel_processing_queue_entry(entry["id"])
+        if act_job_id:
+            activity.log(act_job_id, "warning",
+                         f"Cancelled during: {filename}",
+                         archive_id=archive_id, file_id=file_id)
+            activity.flush()
+        _broadcast("processing_progress", {
+            "archive_id": archive_id,
+            "phase": "cancelled",
+        })
+
+    except (ProcessingError, Exception) as e:
+        is_proc_err = isinstance(e, ProcessingError)
+        if is_proc_err:
+            log.error("worker", "Failed %s: %s", filename, e)
+        db.set_file_processing_status(file_id, "failed", error=str(e))
+        db.complete_processing_queue_entry(entry["id"], error_message=str(e))
+        _broadcast("queue_update", {
+            "queue_type": "processing", "action": "status_changed",
+            "entry_id": entry["id"], "status": "failed",
+        })
+        if act_job_id:
+            activity.log(act_job_id, "error", f"Failed: {filename}",
+                         archive_id=archive_id, file_id=file_id,
+                         detail=str(e))
+            activity.flush()
+        _broadcast("processing_progress", {
+            "archive_id": archive_id,
+            "file_id": file_id,
+            "filename": filename,
+            "phase": "file_error",
+            "error": str(e),
+        })
+
+
+def _handle_cancellation(entry, ctx):
+    """Cancel a single queue entry when the job's cancel event is set."""
+    db.set_file_processing_status(entry["file_id"], "cancelled", error="Cancelled")
+    db.cancel_processing_queue_entry(entry["id"])
+    _broadcast("queue_update", {
+        "queue_type": "processing", "action": "completed",
+        "entry_id": entry["id"],
+    })
+
+
+def _finalise_job(job_id, ctx, job_cache):
+    """Finalise a job when all its queue entries are done."""
+    archive_id = ctx["archive_id"]
+    archive_name = ctx["archive_name"]
+    act_job_id = ctx["act_job_id"]
+
+    counts = db.count_total_queue_entries_for_job(job_id)
+
+    db.complete_processing_job(job_id)
+
+    # Clean up cancel event
+    with _processing_lock:
+        _cancel_events.pop(archive_id, None)
+
+    # Remove from context cache
+    job_cache.pop(job_id, None)
+
+    # Build summary
+    parts = []
+    if counts["completed"] > 0:
+        parts.append(f'{counts["completed"]} converted')
+    if counts["failed"] > 0:
+        parts.append(f'{counts["failed"]} failed')
+    if counts["cancelled"] > 0:
+        parts.append(f'{counts["cancelled"]} cancelled')
+    summary_str = ", ".join(parts) if parts else "no eligible files"
+
+    if act_job_id:
+        activity.flush()
+        status = "cancelled" if counts["cancelled"] > 0 and counts["completed"] == 0 else "completed"
+        activity.finish_job(act_job_id, status, summary=summary_str)
+
+    ntype = "warning" if counts["failed"] > 0 or counts["cancelled"] > 0 else "success"
+    result_notif_id = db.create_notification(
+        f'Processing "{archive_name}": {summary_str}', type=ntype,
+    )
+    _broadcast("notification_created", db.get_notification(result_notif_id))
+
+    log.info("worker", "Processing job %d complete: %s", job_id, summary_str)
+
+    _broadcast("processing_progress", {
+        "archive_id": archive_id,
+        "phase": "done",
+        "summary": {"processed": counts["completed"], "failed": counts["failed"]},
+    })
+
+
+def _finalise_empty_jobs():
+    """Check for running jobs that have no remaining queue entries and finalise them."""
+    jobs = db.get_processing_jobs(status="running")
+    for job in jobs:
+        remaining = db.count_pending_queue_entries_for_job(job["id"])
+        if remaining == 0:
+            ctx = _build_job_context(job)
+            if ctx:
+                _finalise_job(job["id"], ctx, {})
+            else:
+                db.complete_processing_job(job["id"])
+                with _processing_lock:
+                    _cancel_events.pop(job["archive_id"], None)
+
+
 def _worker_loop():
+    # Cache of job contexts keyed by job_id, so we don't re-load profile/archive
+    # for every single file in the same job.
+    _job_ctx = {}  # job_id -> dict
+
     while True:
         # Check pause state
         if db.get_setting("processing_paused", "0") == "1":
@@ -239,48 +558,86 @@ def _worker_loop():
             _wake_event.clear()
             continue
 
-        job = db.get_next_processing_job()
-        if not job:
-            # No work — wait for a wake signal or poll every 5s
+        # Pick the next pending entry by global queue position
+        entry = db.get_next_processing_queue_entry()
+        if not entry:
+            # No file-level work.  Check for jobs that have no queue entries
+            # (e.g. zero eligible files) so they can be finalised.
+            _finalise_empty_jobs()
             _wake_event.wait(timeout=5)
             _wake_event.clear()
             continue
 
-        if not db.claim_processing_job(job["id"]):
-            # Another thread/instance claimed it (shouldn't happen with single worker)
+        job_id = entry["job_id"]
+
+        # Ensure the parent job is claimed (running).  It may still be 'pending'
+        # if this is the first entry we pick from it.
+        job = db.get_processing_job(job_id)
+        if not job or job["status"] not in ("pending", "running"):
+            # Job was cancelled or removed — skip this entry
+            db.cancel_processing_queue_entry(entry["id"])
+            _broadcast("queue_update", {
+                "queue_type": "processing", "action": "completed",
+                "entry_id": entry["id"],
+            })
             continue
 
-        # Ensure a cancel event exists for this archive so cancel requests work.
-        # queue_archive_processing() creates one for new jobs, but recovered
-        # jobs (from a crash) won't have one.
+        if job["status"] == "pending":
+            if not db.claim_processing_job(job_id):
+                continue
+            job = db.get_processing_job(job_id)
+
+        archive_id = job["archive_id"]
+
+        # Ensure a cancel event exists for this archive
         with _processing_lock:
-            if job["archive_id"] not in _cancel_events:
-                _cancel_events[job["archive_id"]] = threading.Event()
+            if archive_id not in _cancel_events:
+                _cancel_events[archive_id] = threading.Event()
 
+        # Get or build job context
+        ctx = _job_ctx.get(job_id)
+        if not ctx:
+            ctx = _build_job_context(job)
+            if ctx is None:
+                # Invalid job (missing profile/archive/processor) — already
+                # handled inside _build_job_context which fails the job.
+                db.cancel_processing_queue_entry(entry["id"])
+                _broadcast("queue_update", {
+                    "queue_type": "processing", "action": "completed",
+                    "entry_id": entry["id"],
+                })
+                continue
+            _job_ctx[job_id] = ctx
+
+        # Check cancellation before starting
+        cancel_evt = _cancel_events.get(archive_id)
+        if cancel_evt and cancel_evt.is_set():
+            _handle_cancellation(entry, ctx)
+            _finalise_job(job_id, ctx, _job_ctx)
+            continue
+
+        # Process this single file
         try:
-            _run_processing(job)
-            db.complete_processing_job(job["id"])
+            _process_single_entry(entry, ctx)
         except Exception as e:
-            log.error("worker", "Processing job %d failed: %s", job["id"], e)
-            db.complete_processing_job(job["id"], error_message=str(e))
-
-            # Reset any files left stuck in 'processing' or 'queued' for this archive
-            _reset_stuck_files(job["archive_id"])
-
-            # Close the activity job if it's still running
-            _fail_activity_job(job["id"], str(e))
-
-            # Dismiss the processing notification
-            _dismiss_processing_notification(job["archive_id"], str(e))
-
-            _broadcast("processing_progress", {
-                "archive_id": job["archive_id"],
-                "phase": "error",
-                "error": str(e),
+            log.error("worker", "Unexpected error processing entry %d: %s", entry["id"], e)
+            db.set_file_processing_status(entry["file_id"], "failed", error=str(e))
+            db.complete_processing_queue_entry(entry["id"], error_message=str(e))
+            _broadcast("queue_update", {
+                "queue_type": "processing", "action": "status_changed",
+                "entry_id": entry["id"], "status": "failed",
             })
-        finally:
-            with _processing_lock:
-                _cancel_events.pop(job["archive_id"], None)
+            if ctx["act_job_id"]:
+                activity.log(ctx["act_job_id"], "error",
+                             f"Failed: {entry.get('file_name', 'unknown')}",
+                             archive_id=archive_id, file_id=entry["file_id"],
+                             detail=str(e))
+                activity.flush()
+
+        # Check if this job is now complete (no more pending entries)
+        remaining = db.count_pending_queue_entries_for_job(job_id)
+        if remaining == 0:
+            _finalise_job(job_id, ctx, _job_ctx)
 
 
 def _reset_stuck_files(archive_id):
@@ -337,363 +694,4 @@ def _find_activity_job(processing_job_id):
         return row["id"] if row else None
 
 
-def _run_processing(job):
-    archive_id = job["archive_id"]
-    profile_id = job["profile_id"]
-    file_ids = json.loads(job["file_ids_json"]) if job.get("file_ids_json") else None
-    options_override = json.loads(job["options_override_json"]) if job.get("options_override_json") else {}
-
-    cancel_evt = _cancel_events.get(archive_id)
-
-    def _cancelled():
-        return cancel_evt and cancel_evt.is_set()
-
-    # Find the activity job linked to this processing job
-    act_job_id = _find_activity_job(job["id"])
-
-    log.info("worker", "Processing job started: archive=%d, profile=%d", archive_id, profile_id)
-
-    archive = db.get_archive(archive_id)
-    archive_name = archive["title"] or archive["identifier"] if archive else f"Archive #{archive_id}"
-
-    # No persistent notification — progress is shown in queue tab via SSE
-
-    # Load profile
-    profile = db.get_processing_profile(profile_id)
-    if not profile:
-        msg = "Processing profile not found"
-        if act_job_id:
-            activity.log(act_job_id, "error", msg, archive_id=archive_id)
-            activity.flush()
-            activity.finish_job(act_job_id, "failed", summary=msg)
-        _broadcast("processing_progress", {
-            "archive_id": archive_id,
-            "phase": "error",
-            "error": msg,
-        })
-        return
-
-    if not archive:
-        if act_job_id:
-            activity.log(act_job_id, "error", "Archive not found", archive_id=archive_id)
-            activity.flush()
-            activity.finish_job(act_job_id, "failed", summary="Archive not found")
-        return
-
-    # Get processor class
-    processor_cls = get_processor(profile["processor_type"])
-    if not processor_cls:
-        msg = f"Unknown processor type: {profile['processor_type']}"
-        if act_job_id:
-            activity.log(act_job_id, "error", msg, archive_id=archive_id)
-            activity.flush()
-            activity.finish_job(act_job_id, "failed", summary=msg)
-        _broadcast("processing_progress", {
-            "archive_id": archive_id,
-            "phase": "error",
-            "error": msg,
-        })
-        return
-
-    # Merge profile options with overrides
-    profile_options = json.loads(profile.get("options_json", "{}"))
-    merged_options = {**profile_options, **options_override}
-    log.debug("worker", "Profile: %s, processor: %s, options: %s",
-              profile["name"], profile["processor_type"], merged_options)
-
-    # Get download directory
-    download_dir = db.get_setting("download_dir", os.path.expanduser("~/ia-downloads"))
-    archive_dir = os.path.join(download_dir, archive["identifier"])
-
-    # Get file-level queue entries for this job
-    with db._db() as conn:
-        pq_entries = [dict(r) for r in conn.execute(
-            "SELECT * FROM processing_queue WHERE job_id = ? AND status = 'pending' ORDER BY position ASC",
-            (job["id"],),
-        ).fetchall()]
-
-    # Resolve to actual file info
-    files = []
-    pq_map = {}  # file_id -> processing_queue entry
-    for pqe in pq_entries:
-        f = db.get_file(pqe["file_id"])
-        if f:
-            files.append(f)
-            pq_map[f["id"]] = pqe
-        else:
-            db.complete_processing_queue_entry(pqe["id"], error_message="File not found")
-
-    log.debug("worker", "Processing queue has %d file entries for job %d", len(files), job["id"])
-
-    if not files:
-        log.info("worker", "No files to process after filtering — done")
-        if act_job_id:
-            activity.log(act_job_id, "info", "No eligible files after filtering",
-                         archive_id=archive_id)
-            activity.flush()
-            activity.finish_job(act_job_id, "completed", summary="No eligible files")
-        _broadcast("processing_progress", {
-            "archive_id": archive_id,
-            "phase": "done",
-            "summary": {"processed": 0, "skipped": 0, "failed": 0},
-        })
-        return
-
-    # Mark all as queued
-    for f in files:
-        db.set_file_processing_status(f["id"], "queued", processor_type=profile["processor_type"])
-
-    if act_job_id:
-        activity.log(act_job_id, "info",
-                     f"Processing started: {len(files)} files with {profile['name']}",
-                     archive_id=archive_id)
-        activity.flush()
-
-    _broadcast("processing_progress", {
-        "archive_id": archive_id,
-        "phase": "starting",
-        "total": len(files),
-    })
-
-    summary = {"processed": 0, "skipped": 0, "failed": 0}
-
-    for i, file_info in enumerate(files):
-        if _cancelled():
-            for remaining in files[i:]:
-                db.set_file_processing_status(remaining["id"], "cancelled", error="Cancelled")
-                rpqe = pq_map.get(remaining["id"])
-                if rpqe:
-                    db.cancel_processing_queue_entry(rpqe["id"])
-            if act_job_id:
-                activity.log(act_job_id, "warning", "Processing cancelled by user",
-                             archive_id=archive_id)
-                activity.flush()
-                parts = []
-                if summary["processed"]: parts.append(f'{summary["processed"]} converted')
-                if summary["skipped"]: parts.append(f'{summary["skipped"]} skipped')
-                if summary["failed"]: parts.append(f'{summary["failed"]} failed')
-                activity.finish_job(act_job_id, "cancelled",
-                                    summary=", ".join(parts) if parts else "Cancelled before processing")
-            _broadcast("processing_progress", {
-                "archive_id": archive_id,
-                "phase": "cancelled",
-                "summary": summary,
-            })
-            return
-
-        file_id = file_info["id"]
-        filename = file_info["name"]
-        file_path = os.path.join(archive_dir, filename)
-
-        # Claim the processing queue entry
-        pqe = pq_map.get(file_id)
-        if pqe:
-            db.claim_processing_queue_entry(pqe["id"])
-            _broadcast("queue_update", {
-                "queue_type": "processing", "action": "status_changed",
-                "entry_id": pqe["id"], "status": "running",
-            })
-
-        db.set_file_processing_status(file_id, "processing")
-
-        def progress_cb(**kwargs):
-            _broadcast("processing_progress", {
-                "archive_id": archive_id,
-                "file_id": file_id,
-                "filename": filename,
-                "current": i + 1,
-                "total": len(files),
-                **kwargs,
-            })
-
-        try:
-            log.debug("worker", "Processing file %d/%d: %s", i + 1, len(files), filename)
-            processor = processor_cls(
-                options=merged_options,
-                cancel_check=_cancelled,
-                progress_callback=progress_cb,
-            )
-
-            if not os.path.isfile(file_path):
-                raise ProcessingError(f"File not found: {file_path}")
-
-            result = processor.process(file_path, archive_dir)
-
-            if result.get("skipped"):
-                reason = result.get("reason", "Not processable")
-                log.info("worker", "Skipped %s: %s", filename, reason)
-                db.set_file_processing_status(
-                    file_id, "skipped",
-                    error=reason,
-                )
-                if act_job_id:
-                    activity.log(act_job_id, "info", f"Skipped: {filename}",
-                                 archive_id=archive_id, file_id=file_id,
-                                 detail=reason)
-                summary["skipped"] += 1
-            else:
-                # === Non-cancellable deletion block ===
-                # Once we start deleting originals, we must finish to avoid
-                # an inconsistent state (processed file exists, original partially deleted).
-                delete_original = merged_options.get("delete_original", "yes") == "yes"
-                has_processed_files = bool(result.get("processed_files") or result.get("processed_filename"))
-                if delete_original:
-                    for to_delete in result.get("files_to_delete", []):
-                        try:
-                            os.remove(to_delete)
-                        except OSError:
-                            pass
-                    # Original deleted: mark downloaded=0 so UI shows strikethrough
-                    with db._db() as conn:
-                        conn.execute(
-                            "UPDATE archive_files SET downloaded = 0 WHERE id = ?",
-                            (file_id,),
-                        )
-                        conn.commit()
-                # === End non-cancellable block ===
-
-                log.info("worker", "Processed %s -> %s", filename, result["processed_filename"])
-                db.set_file_processing_status(
-                    file_id, "processed",
-                    processed_filename=result["processed_filename"],
-                    processor_type=profile["processor_type"],
-                    processed_files=result.get("processed_files"),
-                )
-                if act_job_id:
-                    activity.log(act_job_id, "success",
-                                 f"Converted: {filename} → {result['processed_filename']}",
-                                 archive_id=archive_id, file_id=file_id)
-                summary["processed"] += 1
-
-            _broadcast("processing_progress", {
-                "archive_id": archive_id,
-                "file_id": file_id,
-                "filename": filename,
-                "phase": "file_done",
-                "current": i + 1,
-                "total": len(files),
-                "skipped": result.get("skipped", False),
-            })
-
-            # Mark processing queue entry as completed
-            if pqe:
-                db.complete_processing_queue_entry(pqe["id"])
-                _broadcast("queue_update", {
-                    "queue_type": "processing", "action": "completed",
-                    "entry_id": pqe["id"],
-                })
-
-        except ProcessingCancelled:
-            db.set_file_processing_status(file_id, "cancelled", error="Cancelled")
-            if pqe:
-                db.cancel_processing_queue_entry(pqe["id"])
-            for remaining in files[i + 1:]:
-                db.set_file_processing_status(remaining["id"], "cancelled", error="Cancelled")
-                rpqe = pq_map.get(remaining["id"])
-                if rpqe:
-                    db.cancel_processing_queue_entry(rpqe["id"])
-            if act_job_id:
-                activity.log(act_job_id, "warning",
-                             f"Cancelled during: {filename}",
-                             archive_id=archive_id, file_id=file_id)
-                activity.flush()
-                parts = []
-                if summary["processed"]: parts.append(f'{summary["processed"]} converted')
-                if summary["skipped"]: parts.append(f'{summary["skipped"]} skipped')
-                if summary["failed"]: parts.append(f'{summary["failed"]} failed')
-                activity.finish_job(act_job_id, "cancelled",
-                                    summary=", ".join(parts) if parts else "Cancelled")
-            _broadcast("processing_progress", {
-                "archive_id": archive_id,
-                "phase": "cancelled",
-                "summary": summary,
-            })
-            return
-
-        except ProcessingError as e:
-            log.error("worker", "Failed %s: %s", filename, e)
-            db.set_file_processing_status(file_id, "failed", error=str(e))
-            if pqe:
-                db.complete_processing_queue_entry(pqe["id"], error_message=str(e))
-                _broadcast("queue_update", {
-                    "queue_type": "processing", "action": "status_changed",
-                    "entry_id": pqe["id"], "status": "failed",
-                })
-            if act_job_id:
-                activity.log(act_job_id, "error", f"Failed: {filename}",
-                             archive_id=archive_id, file_id=file_id,
-                             detail=str(e))
-                activity.flush()  # errors flush immediately for visibility
-            summary["failed"] += 1
-            _broadcast("processing_progress", {
-                "archive_id": archive_id,
-                "file_id": file_id,
-                "filename": filename,
-                "phase": "file_error",
-                "error": str(e),
-                "current": i + 1,
-                "total": len(files),
-            })
-
-        except Exception as e:
-            db.set_file_processing_status(file_id, "failed", error=str(e))
-            if pqe:
-                db.complete_processing_queue_entry(pqe["id"], error_message=str(e))
-                _broadcast("queue_update", {
-                    "queue_type": "processing", "action": "status_changed",
-                    "entry_id": pqe["id"], "status": "failed",
-                })
-            if act_job_id:
-                activity.log(act_job_id, "error", f"Failed: {filename}",
-                             archive_id=archive_id, file_id=file_id,
-                             detail=str(e))
-                activity.flush()  # errors flush immediately for visibility
-            summary["failed"] += 1
-            _broadcast("processing_progress", {
-                "archive_id": archive_id,
-                "file_id": file_id,
-                "filename": filename,
-                "phase": "file_error",
-                "error": str(e),
-                "current": i + 1,
-                "total": len(files),
-            })
-
-        # Periodic flush so entries are visible during long jobs
-        if act_job_id and (i + 1) % 10 == 0:
-            activity.flush()
-
-    log.info("worker", "Processing complete for archive %d: %d processed, %d skipped, %d failed",
-             archive_id, summary["processed"], summary["skipped"], summary["failed"])
-
-    # Flush activity log and finish the activity job
-    if act_job_id:
-        parts = []
-        if summary["processed"]: parts.append(f'{summary["processed"]} converted')
-        if summary["skipped"]: parts.append(f'{summary["skipped"]} skipped')
-        if summary["failed"]: parts.append(f'{summary["failed"]} failed')
-        summary_str = ", ".join(parts) if parts else "no eligible files"
-        status = "completed" if summary["failed"] == 0 else "completed"
-        activity.flush()
-        activity.finish_job(act_job_id, status, summary=summary_str)
-
-    # Flash notification with final result
-    parts = []
-    if summary["processed"] > 0:
-        parts.append(f'{summary["processed"]} converted')
-    if summary["skipped"] > 0:
-        parts.append(f'{summary["skipped"]} skipped')
-    if summary["failed"] > 0:
-        parts.append(f'{summary["failed"]} failed')
-    result_msg = ", ".join(parts) if parts else "no eligible files"
-    ntype = "warning" if summary["failed"] > 0 else "success"
-    result_notif_id = db.create_notification(
-        f'Processing "{archive_name}": {result_msg}', type=ntype,
-    )
-    _broadcast("notification_created", db.get_notification(result_notif_id))
-
-    _broadcast("processing_progress", {
-        "archive_id": archive_id,
-        "phase": "done",
-        "summary": summary,
-    })
+    # _run_processing has been replaced by the entry-at-a-time loop above.

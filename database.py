@@ -2317,6 +2317,29 @@ def cancel_all_pending_processing():
         return count
 
 
+def count_pending_queue_entries_for_job(job_id):
+    """Return the number of pending processing queue entries for a given job."""
+    with _db() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM processing_queue WHERE job_id = ? AND status = 'pending'",
+            (job_id,),
+        ).fetchone()
+        return row[0]
+
+
+def count_total_queue_entries_for_job(job_id):
+    """Return total and completed/failed counts for a job to build summaries."""
+    with _db() as conn:
+        row = conn.execute("""
+            SELECT COUNT(*) as total,
+                   SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completed,
+                   SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) as failed,
+                   SUM(CASE WHEN status = 'cancelled' THEN 1 ELSE 0 END) as cancelled
+            FROM processing_queue WHERE job_id = ?
+        """, (job_id,)).fetchone()
+        return dict(row) if row else {"total": 0, "completed": 0, "failed": 0, "cancelled": 0}
+
+
 def get_processing_queue(limit=200):
     """Get the processing queue entries in position order."""
     with _db() as conn:
