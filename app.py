@@ -257,7 +257,8 @@ def update_settings():
                "confirm_delete_processed", "confirm_delete_profile",
                "default_enable_archive", "default_select_all", "sse_update_rate",
                "processing_temp_dir",
-               "debug_enabled", "debug_log_file"]
+               "debug_enabled", "debug_log_file",
+               "max_connections_per_node", "max_connections_total"]
     credentials_changed = False
     for key in allowed:
         if key in data:

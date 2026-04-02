@@ -15,7 +15,7 @@
 # with this program; if not, write to the Free Software Foundation, Inc.,
 # 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 
-"""Download manager - runs in a background thread, handles sequential downloads with pause/resume/retry."""
+"""Download manager - parallel downloads with per-datanode and total connection limits."""
 
 import os
 import json
@@ -65,6 +65,44 @@ def get_scheduled_limit():
     return None
 
 
+class SharedTokenBucket:
+    """Thread-safe token bucket for shared bandwidth limiting across multiple download workers."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._tokens = 0.0
+        self._last_time = time.monotonic()
+
+    def consume(self, amount, limit):
+        """Consume tokens for a chunk download.  Blocks (sleeps) if the bucket
+        is empty.  ``limit`` is the *aggregate* bytes-per-second cap
+        (positive int).  A negative or zero limit is handled by the caller
+        (unlimited / paused) — this method should only be called when
+        limit > 0.
+        """
+        with self._lock:
+            now = time.monotonic()
+            elapsed = max(0.0, now - self._last_time)
+            self._last_time = now
+            self._tokens += elapsed * limit
+            if self._tokens > limit:
+                self._tokens = limit
+            self._tokens -= amount
+            sleep_time = 0.0
+            if self._tokens < 0:
+                sleep_time = -self._tokens / limit
+                self._tokens = 0.0
+
+        if sleep_time > 0.001:
+            time.sleep(sleep_time)
+
+    def reset(self):
+        """Reset the bucket (e.g. after a pause/resume cycle)."""
+        with self._lock:
+            self._tokens = 0.0
+            self._last_time = time.monotonic()
+
+
 class DownloadManager:
     def __init__(self):
         self.state = "stopped"  # stopped, running, paused
@@ -76,11 +114,14 @@ class DownloadManager:
         self._schedule_overridden = False  # True when user manually changed BW; cleared on schedule transition
         self._paused_by_bandwidth = False  # True when paused because bandwidth was set to 0
         self._last_schedule_limit = None   # Track schedule transitions
-        self._current_file_info = None
-        self._current_speed = 0
-        self._skip_file_event = threading.Event()
         self._lock = threading.Lock()
         self._listeners = []
+
+        # --- Parallel download state ---
+        self._active_downloads = {}      # file_id → {file_info, thread, datanode, speed, skip_event}
+        self._pool_lock = threading.Lock()
+        self._slot_available = threading.Event()  # Signaled when a download completes
+        self._token_bucket = SharedTokenBucket()
 
     def add_listener(self, callback):
         with self._lock:
@@ -146,6 +187,7 @@ class DownloadManager:
                 self.state = "running"
                 self._paused_by_bandwidth = False
                 self._last_schedule_limit = None
+                self._token_bucket.reset()
                 self._thread = threading.Thread(target=self._download_loop, daemon=True)
                 self._thread.start()
         self._notify("state", "running")
@@ -162,69 +204,107 @@ class DownloadManager:
         with self._lock:
             self.state = "stopped"
             self._stop_event.set()
-            self._pause_event.set()  # Unblock if paused so thread can exit
+            self._pause_event.set()  # Unblock if paused so threads can exit
             self._paused_by_bandwidth = False
             self._last_schedule_limit = None
             thread = self._thread
+        # Signal all per-file skip events so workers exit promptly
+        with self._pool_lock:
+            for dl in self._active_downloads.values():
+                dl["skip_event"].set()
         if thread and thread.is_alive():
-            thread.join(timeout=10)
+            thread.join(timeout=15)
+        # Join any remaining worker threads
+        with self._pool_lock:
+            for dl in list(self._active_downloads.values()):
+                dl["thread"].join(timeout=5)
+            self._active_downloads.clear()
         with self._lock:
             self._thread = None
-            self._current_file_info = None
-            self._current_speed = 0
         # Reset any files stuck in downloading state
         db.reset_downloading_files()
         self._notify("state", "stopped")
 
     def skip_current_file(self, file_id):
-        """Skip the currently downloading file if it matches file_id."""
-        with self._lock:
-            if self._current_file_info and self._current_file_info.get("file_id") == file_id:
-                self._skip_file_event.set()
+        """Skip a downloading file by file_id."""
+        with self._pool_lock:
+            dl = self._active_downloads.get(file_id)
+            if dl:
+                dl["skip_event"].set()
                 return True
         return False
 
     def get_status(self):
         with self._lock:
-            return {
-                "state": self.state,
-                "bandwidth_limit": self._bandwidth_limit,
-                "current_file": self._current_file_info,
-                "current_speed": self._current_speed,
-                "progress": db.get_download_progress(),
-            }
+            state = self.state
+            bw_limit = self._bandwidth_limit
+        with self._pool_lock:
+            active = []
+            total_speed = 0
+            for fid, dl in self._active_downloads.items():
+                info = dl.get("file_info", {})
+                spd = dl.get("speed", 0)
+                total_speed += spd
+                active.append({
+                    "file_id": info.get("file_id", fid),
+                    "archive_id": info.get("archive_id"),
+                    "identifier": info.get("identifier"),
+                    "filename": info.get("filename"),
+                    "size": info.get("size", 0),
+                    "downloaded": info.get("downloaded", 0),
+                    "status": "downloading",
+                    "datanode": dl.get("datanode", ""),
+                    "speed": spd,
+                })
+        # Backwards compat: current_file is the first active download (or None)
+        current_file = active[0] if active else None
+        return {
+            "state": state,
+            "bandwidth_limit": bw_limit,
+            "current_file": current_file,
+            "active_downloads": active,
+            "current_speed": total_speed,
+            "progress": db.get_download_progress(),
+        }
+
+    # ── Coordinator loop ──────────────────────────────────────────────────
 
     def _download_loop(self):
+        """Main coordinator: fills download slots, waits for completions, loops."""
         while not self._stop_event.is_set():
             # Wait if paused
             self._pause_event.wait()
             if self._stop_event.is_set():
                 break
 
-            file_info = db.get_next_download_file()
-            if not file_info:
-                # Queue is empty — auto-stop the download manager
+            # Reap any finished workers
+            self._reap_completed()
+
+            # Try to fill available slots
+            launched = self._fill_slots()
+
+            # Check if we have nothing active and nothing was launched
+            with self._pool_lock:
+                active_count = len(self._active_downloads)
+            if active_count == 0 and launched == 0:
+                # Queue is empty — auto-stop
                 break
 
-            # If this is a retry of a previously failed file, wait retry_delay first
-            if file_info.get("download_status") == "failed":
-                retry_delay = int(db.get_setting("retry_delay", "5"))
-                for _ in range(retry_delay):
-                    if self._stop_event.is_set():
-                        break
-                    time.sleep(1)
-                if self._stop_event.is_set():
-                    break
+            # Wait for a slot to open up (or timeout to re-check)
+            self._slot_available.clear()
+            self._slot_available.wait(timeout=1.0)
 
-            self._download_file(file_info)
+        # Wait for all active workers to finish
+        with self._pool_lock:
+            threads = [dl["thread"] for dl in self._active_downloads.values()]
+        for t in threads:
+            t.join(timeout=10)
+        with self._pool_lock:
+            self._active_downloads.clear()
 
         # Clean up after loop exit
         auto_stopped = False
         with self._lock:
-            self._current_file_info = None
-            self._current_speed = 0
-            # If the loop exited because the queue emptied (not user stop),
-            # transition to stopped state and notify clients.
             if not self._stop_event.is_set():
                 self.state = "stopped"
                 self._stop_event.set()
@@ -234,8 +314,113 @@ class DownloadManager:
             db.reset_downloading_files()
             self._notify("state", "stopped")
 
-    def _download_file(self, file_info):
-        self._skip_file_event.clear()
+    def _fill_slots(self):
+        """Launch new download workers up to the connection limits.  Returns count launched."""
+        max_per_node = int(db.get_setting("max_connections_per_node", "2"))
+        max_total = int(db.get_setting("max_connections_total", "6"))
+
+        with self._pool_lock:
+            current_total = len(self._active_downloads)
+            available = max_total - current_total
+            if available <= 0:
+                return 0
+            # Build per-node usage map and exclude set from active downloads
+            node_usage = {}
+            exclude_ids = set()
+            for fid, dl in self._active_downloads.items():
+                node = dl.get("datanode", "archive.org")
+                node_usage[node] = node_usage.get(node, 0) + 1
+                exclude_ids.add(fid)
+
+        # Query DB for candidates (outside pool_lock to avoid holding it during IO)
+        candidates = db.get_next_download_files_batch(
+            limit=available,
+            active_nodes=node_usage,
+            max_per_node=max_per_node,
+            exclude_ids=exclude_ids,
+        )
+
+        launched = 0
+        for file_info in candidates:
+            if self._stop_event.is_set():
+                break
+
+            # If this is a retry, wait retry_delay first (only for the first retry file)
+            if file_info.get("download_status") == "failed":
+                retry_delay = int(db.get_setting("retry_delay", "5"))
+                for _ in range(retry_delay):
+                    if self._stop_event.is_set():
+                        break
+                    time.sleep(1)
+                if self._stop_event.is_set():
+                    break
+
+            file_id = file_info["id"]
+            node = file_info.get("server") or "archive.org"
+            skip_evt = threading.Event()
+
+            worker = threading.Thread(
+                target=self._download_worker,
+                args=(file_info, skip_evt),
+                daemon=True,
+            )
+
+            with self._pool_lock:
+                # Double-check we haven't exceeded limits while waiting
+                if len(self._active_downloads) >= max_total:
+                    break
+                node_count = sum(1 for dl in self._active_downloads.values() if dl.get("datanode") == node)
+                if node_count >= max_per_node:
+                    continue
+                self._active_downloads[file_id] = {
+                    "file_info": {
+                        "file_id": file_id,
+                        "archive_id": file_info["archive_id"],
+                        "identifier": file_info["identifier"],
+                        "filename": file_info["name"],
+                        "size": file_info["size"],
+                        "downloaded": 0,
+                        "status": "downloading",
+                    },
+                    "thread": worker,
+                    "datanode": node,
+                    "speed": 0,
+                    "skip_event": skip_evt,
+                    "done": False,
+                }
+
+            worker.start()
+            launched += 1
+
+        return launched
+
+    def _reap_completed(self):
+        """Join finished worker threads and remove from active pool."""
+        with self._pool_lock:
+            done_ids = [fid for fid, dl in self._active_downloads.items() if dl.get("done")]
+        for fid in done_ids:
+            with self._pool_lock:
+                dl = self._active_downloads.pop(fid, None)
+            if dl and dl["thread"].is_alive():
+                dl["thread"].join(timeout=5)
+
+    # ── Download worker (runs in its own thread) ──────────────────────────
+
+    def _download_worker(self, file_info, skip_event):
+        """Download a single file.  Runs in a worker thread."""
+        file_id = file_info["id"]
+        try:
+            self._download_file(file_info, skip_event)
+        except Exception as e:
+            log.warning("download", "Unexpected error in worker for file %s: %s", file_id, e)
+        finally:
+            with self._pool_lock:
+                dl = self._active_downloads.get(file_id)
+                if dl:
+                    dl["done"] = True
+            self._slot_available.set()  # Wake coordinator
+
+    def _download_file(self, file_info, skip_event):
         file_id = file_info["id"]
         archive_id = file_info["archive_id"]
         identifier = file_info["identifier"]
@@ -269,16 +454,19 @@ class DownloadManager:
         if auth_error:
             log.warning("download", "IA auth issue for %s: %s", filename, auth_error)
 
-        with self._lock:
-            self._current_file_info = {
-                "file_id": file_id,
-                "archive_id": archive_id,
-                "identifier": identifier,
-                "filename": filename,
-                "size": expected_size,
-                "downloaded": 0,
-                "status": "downloading",
-            }
+        # Update pool info
+        with self._pool_lock:
+            dl = self._active_downloads.get(file_id)
+            if dl:
+                dl["file_info"] = {
+                    "file_id": file_id,
+                    "archive_id": archive_id,
+                    "identifier": identifier,
+                    "filename": filename,
+                    "size": expected_size,
+                    "downloaded": 0,
+                    "status": "downloading",
+                }
 
         log.debug("download", "Starting download: %s (%s bytes)", filename, expected_size)
         db.set_file_download_status(file_id, "downloading")
@@ -287,7 +475,7 @@ class DownloadManager:
 
         success = False
         try:
-            success = self._do_download(url, local_path, file_id, expected_size, expected_md5, cookies)
+            success = self._do_download(url, local_path, file_id, expected_size, expected_md5, cookies, skip_event)
         except requests.exceptions.HTTPError as e:
             status_code = e.response.status_code if e.response is not None else "?"
             if status_code in (403, 401) and auth_error:
@@ -314,26 +502,25 @@ class DownloadManager:
             log.debug("download", "Completed: %s", filename)
             db.set_file_download_status(file_id, "completed", downloaded_bytes=expected_size)
             self._notify("file_complete", {"file_id": file_id, "filename": filename, "identifier": identifier})
-        elif self._skip_file_event.is_set():
-            # File was removed from queue mid-download — reset to pending
+        elif skip_event.is_set() and not self._stop_event.is_set():
+            # File was skipped/dequeued mid-download — reset to pending
             log.debug("download", "Skipped (dequeued): %s", filename)
             db.set_file_download_status(file_id, "pending", downloaded_bytes=0)
-            self._skip_file_event.clear()
             self._notify("file_skipped", {"file_id": file_id, "filename": filename, "identifier": identifier})
         elif not self._stop_event.is_set() and not success:
-            # Mark failed, increment retry — the download loop will re-pick it
-            # if retries remain, after processing other pending files first
             self._notify("file_failed", {"file_id": file_id, "filename": filename, "identifier": identifier})
 
         # Check if all files in this archive are done
         self._check_archive_completion(archive_id)
 
-        with self._lock:
-            self._current_file_info = None
-            self._current_speed = 0
+        # Clear speed in pool
+        with self._pool_lock:
+            dl = self._active_downloads.get(file_id)
+            if dl:
+                dl["speed"] = 0
 
-    def _do_download(self, url, local_path, file_id, expected_size, expected_md5, cookies):
-        """Perform the actual download with resume support and bandwidth limiting."""
+    def _do_download(self, url, local_path, file_id, expected_size, expected_md5, cookies, skip_event):
+        """Perform the actual download with resume support and shared bandwidth limiting."""
         headers = {"User-Agent": "grabia/1.0"}
 
         # Resume support
@@ -375,23 +562,20 @@ class DownloadManager:
             chunk_size = 8192
             update_interval = 0.5
             next_update = time.monotonic() + update_interval
-            # Token bucket for bandwidth limiting
-            tokens = 0.0
-            token_time = time.monotonic()
             # For speed measurement: track bytes in a rolling window
             speed_samples = []
 
             with open(local_path, mode) as f:
                 for chunk in resp.iter_content(chunk_size=chunk_size):
-                    if self._stop_event.is_set() or self._skip_file_event.is_set():
+                    if self._stop_event.is_set() or skip_event.is_set():
                         return False
 
                     # Wait if paused — reset timer on resume to avoid burst
                     if not self._pause_event.is_set():
                         self._pause_event.wait()
                         next_update = time.monotonic() + update_interval
-                        token_time = time.monotonic()
-                    if self._stop_event.is_set() or self._skip_file_event.is_set():
+                        self._token_bucket.reset()
+                    if self._stop_event.is_set() or skip_event.is_set():
                         return False
 
                     if chunk:
@@ -468,27 +652,14 @@ class DownloadManager:
                                     do_resume_notify = True
                             if do_resume_notify:
                                 self._notify("state", "running")
-                            tokens = 0.0
-                            token_time = time.monotonic()
+                            self._token_bucket.reset()
                             next_update = time.monotonic() + update_interval
                             if self._stop_event.is_set():
                                 return False
 
-                        # Positive limit: throttle via token bucket
+                        # Positive limit: throttle via shared token bucket
                         if limit > 0:
-                            now = time.monotonic()
-                            elapsed = now - token_time
-                            token_time = now
-                            tokens += elapsed * limit
-                            if tokens > limit:
-                                tokens = limit
-                            tokens -= len(chunk)
-                            if tokens < 0:
-                                sleep_time = -tokens / limit
-                                if sleep_time > 0.001:
-                                    time.sleep(sleep_time)
-                                tokens = 0.0
-                                token_time = time.monotonic()
+                            self._token_bucket.consume(len(chunk), limit)
                         # limit == -1: unlimited, no throttling
 
                         # Update progress on a fixed interval
@@ -511,10 +682,13 @@ class DownloadManager:
                                 speed = window_bytes / max(window_time, 0.001)
                             else:
                                 speed = 0
-                            with self._lock:
-                                if self._current_file_info:
-                                    self._current_file_info["downloaded"] = downloaded
-                                    self._current_speed = speed
+                            # Update pool info
+                            with self._pool_lock:
+                                dl = self._active_downloads.get(file_id)
+                                if dl:
+                                    if dl.get("file_info"):
+                                        dl["file_info"]["downloaded"] = downloaded
+                                    dl["speed"] = speed
                             db.set_file_download_status(file_id, "downloading", downloaded_bytes=downloaded)
                             self._notify("file_progress", {
                                 "file_id": file_id,

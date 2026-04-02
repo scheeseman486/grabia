@@ -264,6 +264,8 @@ def init_db():
         "theme": "dark",
         "files_per_page": "50",
         "sse_update_rate": "500",
+        "max_connections_per_node": "2",
+        "max_connections_total": "6",
     }
     for key, value in defaults.items():
         conn.execute(
@@ -1051,6 +1053,52 @@ def get_next_download_file():
                 LIMIT 1
             """, (max_retries,)).fetchone()
             return dict(row) if row else None
+
+
+def get_next_download_files_batch(limit, active_nodes, max_per_node, exclude_ids=None):
+    """Get the next batch of files to download, respecting per-datanode limits.
+
+    Args:
+        limit: Maximum files to return (available total slots).
+        active_nodes: Dict mapping datanode hostname → current active connection count.
+        max_per_node: Maximum concurrent connections allowed per datanode.
+        exclude_ids: Set of file IDs already being downloaded (to skip).
+
+    Returns list of file_info dicts ordered by queue_position.
+    """
+    if limit <= 0:
+        return []
+    exclude_ids = exclude_ids or set()
+    with _download_queue_lock:
+        with _db() as conn:
+            max_retries = int(get_setting("max_retries") or 3)
+            rows = conn.execute("""
+                SELECT af.*, a.identifier, a.server, a.dir, a.id as archive_id
+                FROM archive_files af
+                JOIN archives a ON af.archive_id = a.id
+                WHERE af.queue_position IS NOT NULL
+                  AND (af.download_status = 'pending'
+                       OR (af.download_status = 'failed' AND af.retry_count < ?))
+                ORDER BY af.queue_position ASC
+            """, (max_retries,)).fetchall()
+
+            result = []
+            node_counts = dict(active_nodes)  # Copy to avoid mutating caller's dict
+
+            for row in rows:
+                if len(result) >= limit:
+                    break
+                r = dict(row)
+                if r["id"] in exclude_ids:
+                    continue
+                node = r.get("server") or "archive.org"
+                node_count = node_counts.get(node, 0)
+                if node_count >= max_per_node:
+                    continue
+                result.append(r)
+                node_counts[node] = node_count + 1
+
+            return result
 
 
 def get_download_queue(limit=200):

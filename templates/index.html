@@ -683,6 +683,18 @@
                             <label>Download Directory
                                 <input type="text" id="set-download-dir" placeholder="/path/to/downloads">
                             </label>
+                            <h4 class="settings-subheading">Parallel Downloads</h4>
+                            <p class="settings-desc">Control how many files download simultaneously. Per-node limits prevent overloading individual IA servers; total limits cap overall connections.</p>
+                            <label>Max Connections per Server
+                                <input type="number" id="set-max-connections-per-node" min="1" max="10" value="2">
+                                <small>Maximum simultaneous downloads from a single IA datanode.</small>
+                            </label>
+                            <label>Max Total Connections
+                                <input type="number" id="set-max-connections-total" min="1" max="20" value="6">
+                                <small>Maximum simultaneous downloads across all IA servers combined.</small>
+                            </label>
+                            <hr class="settings-divider">
+                            <h4 class="settings-subheading">Retries</h4>
                             <label>Max Retries
                                 <input type="number" id="set-max-retries" min="0" max="20" value="3">
                                 <small>How many times to retry a failed download before giving up.</small>
