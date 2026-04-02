@@ -629,6 +629,7 @@
                     current: data.current || 0,
                     total: data.total || 0,
                     phase: data.phase || "",
+                    pct: data.pct,  // per-file tool progress (e.g. chdman %)
                 };
                 startUiTick();
             }
@@ -980,11 +981,37 @@
         // Update queue dropdown if open
         if (queueDropdownOpen) loadQueueDropdown();
 
+        // Update queue page tables if visible — sync live progress into queue data
+        if ($("#page-queues").classList.contains("active")) {
+            syncActiveProgressToQueueData();
+            // Force re-render of visible rows without re-filtering/re-sorting
+            qsLastRange[activeQueueTab] = null;
+            qsVsRenderVisible(activeQueueTab);
+        }
+
         // Stop ticking when nothing is active
         const hasWork = (activeDownloads.length > 0 && (dlState === "running" || dlState === "paused"))
             || (ongoingProcessing && !["done", "error", "cancelled"].includes(ongoingProcessing.phase))
             || (ongoingScanning && !["done", "error", "cancelled"].includes(ongoingScanning.phase));
         if (!hasWork) stopUiTick();
+    }
+
+    /**
+     * Merge real-time progress from activeDownloads into queueData["download"]
+     * so queue table re-renders show live percentages.
+     */
+    function syncActiveProgressToQueueData() {
+        if (activeDownloads.length === 0) return;
+        const dlQueue = queueData["download"];
+        if (!dlQueue) return;
+        for (const dl of activeDownloads) {
+            const item = dlQueue.find(q => (q.id || q.file_id) == dl.file_id);
+            if (item) {
+                item.downloaded_bytes = dl.downloaded || 0;
+                item.download_status = "downloading";
+                if (dl.size > 0) item.size = dl.size;
+            }
+        }
     }
 
     function loadQueueDropdown() {
@@ -1230,7 +1257,7 @@
                     <span>${a.identifier}</span>
                 </div>
             </div>
-            <span class="archive-status ${a.status}">${a.status === 'partial' ? (a.status_pct || 0) + '%' : a.status}</span>
+            <span class="archive-status ${a.status}"${(a.status === 'partial' || a.status === 'downloading') && a.status_pct != null ? ` style="--pct:${a.status_pct}%"` : ''}>${(a.status === 'partial' || a.status === 'downloading') && a.status_pct != null ? a.status_pct + '%' : a.status}</span>
             <div class="archive-actions">
                 <button data-action="retry" title="Retry failed files" class="retry" style="display:${a.status === 'error' ? 'flex' : 'none'}">
                     <svg viewBox="0 0 24 24" width="16" height="16"><path d="M17.65 6.35A7.958 7.958 0 0012 4c-4.42 0-7.99 3.58-7.99 8s3.57 8 7.99 8c3.73 0 6.84-2.55 7.73-6h-2.08A5.99 5.99 0 0112 18c-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z" fill="currentColor"/></svg>
@@ -3851,16 +3878,21 @@
         // Processing row
         if (ongoingProcessing && ongoingProcessing.phase !== "done" && ongoingProcessing.phase !== "error" && ongoingProcessing.phase !== "cancelled") {
             const fname = escapeHtml(ongoingProcessing.filename || "");
-            const pct = ongoingProcessing.total > 0 ? Math.min(100, (ongoingProcessing.current / ongoingProcessing.total) * 100) : 0;
-            const progText = ongoingProcessing.total > 0 ? `${ongoingProcessing.current}/${ongoingProcessing.total}` : "";
+            const phase = ongoingProcessing.phase || "";
+            const hasPct = ongoingProcessing.pct != null;
+            const hasFileCount = ongoingProcessing.total > 0;
+            // Use tool-level pct (e.g. chdman) when available, otherwise file-level
+            const barPct = hasPct ? Math.min(100, ongoingProcessing.pct) : (hasFileCount ? Math.min(100, (ongoingProcessing.current / ongoingProcessing.total) * 100) : 0);
+            const progText = hasFileCount ? `${ongoingProcessing.current}/${ongoingProcessing.total}` : "";
+            const phaseText = hasPct ? `${phase} ${ongoingProcessing.pct.toFixed(1)}%` : progText;
             html += `<div class="activity-ongoing-row activity-dl-row" data-navigate="processing" data-archive-id="${ongoingProcessing.archive_id || ""}">`;
             html += `<div class="activity-dl-info">`;
             html += `<span class="activity-dl-name"><strong>Processing</strong>${fname ? " — " + fname : ""}</span>`;
-            html += `<span class="activity-dl-stats">${progText}`;
+            html += `<span class="activity-dl-stats">${phaseText}`;
             if (ongoingProcessing.archive_id) html += ` <button class="activity-cancel-btn" data-cancel="processing" data-archive-id="${ongoingProcessing.archive_id}">Cancel</button>`;
             html += `</span></div>`;
-            if (ongoingProcessing.total > 0) {
-                html += `<div class="activity-dl-bar"><div class="activity-dl-fill" style="width:${pct.toFixed(1)}%"></div></div>`;
+            if (hasPct || hasFileCount) {
+                html += `<div class="activity-dl-bar"><div class="activity-dl-fill" style="width:${barPct.toFixed(1)}%"></div></div>`;
             } else {
                 html += `<div class="activity-dl-bar"><div class="activity-dl-fill activity-dl-fill-indeterminate"></div></div>`;
             }
@@ -4146,10 +4178,18 @@
             const statusClass = (status === "running" || status === "processing") ? "proc-active" : status;
             let statusLabel = status;
             let statusPctStyle = "";
-            if ((status === "running" || status === "processing") && ongoingProcessing && ongoingProcessing.total > 0) {
-                const pct = Math.min(100, (ongoingProcessing.current / ongoingProcessing.total) * 100);
-                statusLabel = pct.toFixed(1) + "%";
-                statusPctStyle = ` style="--pct:${pct.toFixed(1)}%"`;
+            if ((status === "running" || status === "processing") && ongoingProcessing) {
+                // Prefer per-file tool progress (e.g. chdman %) when available
+                if (ongoingProcessing.pct != null) {
+                    const pct = Math.min(100, ongoingProcessing.pct);
+                    const phase = ongoingProcessing.phase || "processing";
+                    statusLabel = pct.toFixed(1) + "%";
+                    statusPctStyle = ` style="--pct:${pct.toFixed(1)}%" title="${phase}"`;
+                } else if (ongoingProcessing.total > 0) {
+                    const pct = Math.min(100, (ongoingProcessing.current / ongoingProcessing.total) * 100);
+                    statusLabel = pct.toFixed(1) + "%";
+                    statusPctStyle = ` style="--pct:${pct.toFixed(1)}%"`;
+                }
             }
             if (byPosition) {
                 html += buildGripCell();

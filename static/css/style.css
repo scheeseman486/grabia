@@ -622,12 +622,28 @@ main {
     border-radius: 10px;
     font-weight: 500;
     flex-shrink: 0;
+    min-width: 72px;
+    text-align: center;
+    position: relative;
+    overflow: hidden;
+    z-index: 0;
+}
+.archive-status::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    z-index: -1;
+    border-radius: inherit;
+    width: var(--pct, 0%);
+    transition: width 0.3s ease;
 }
 .archive-status.idle { background: var(--bg-tertiary); color: var(--text-muted); }
 .archive-status.queued { background: var(--accent-dim); color: var(--accent); }
-.archive-status.downloading { background: rgba(81, 207, 102, 0.15); color: var(--success); }
+.archive-status.downloading { background: rgba(81, 207, 102, 0.08); color: var(--success); }
+.archive-status.downloading::before { background: rgba(81, 207, 102, 0.25); }
 .archive-status.complete { background: rgba(81, 207, 102, 0.15); color: var(--success); }
-.archive-status.partial { background: rgba(81, 207, 102, 0.15); color: var(--success); }
+.archive-status.partial { background: rgba(81, 207, 102, 0.08); color: var(--success); }
+.archive-status.partial::before { background: rgba(81, 207, 102, 0.25); }
 .archive-status.error { background: rgba(255, 107, 107, 0.15); color: var(--danger); }
 
 .archive-actions {

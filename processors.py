@@ -717,6 +717,48 @@ class BaseProcessor:
         if self._cancel_check():
             raise ProcessingCancelled("Processing cancelled")
 
+    # Regex for chdman progress lines like "Compressing, 45.3% complete..."
+    # or "Verifying, 100.0% complete..."
+    _CHDMAN_PCT_RE = re.compile(r'(\d+(?:\.\d+)?)%\s*complete')
+
+    def _run_chdman_with_progress(self, cmd, phase="converting", timeout=7200):
+        """Run a chdman command, parsing stderr for progress percentages.
+
+        Reports progress via self._progress(phase=phase, pct=XX.X) at most
+        once per second. Returns (returncode, stderr_text).
+        """
+        import time
+        self._check_cancel()
+        log.debug("proc", "Running: %s", " ".join(cmd))
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        stderr_lines = []
+        last_report = 0
+        try:
+            for line in proc.stderr:
+                stderr_lines.append(line)
+                m = self._CHDMAN_PCT_RE.search(line)
+                if m:
+                    now = time.monotonic()
+                    if now - last_report >= 1.0:
+                        last_report = now
+                        self._progress(phase=phase, pct=float(m.group(1)))
+                        self._check_cancel()
+            proc.wait(timeout=timeout)
+        except ProcessingCancelled:
+            proc.kill()
+            proc.wait(timeout=5)
+            raise
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
+            raise ProcessingError(f"chdman timed out after {timeout}s")
+        return proc.returncode, "".join(stderr_lines)
+
     def can_process(self, filename):
         """Check if this processor can handle the given filename."""
         ext = os.path.splitext(filename)[1].lower()
@@ -924,26 +966,16 @@ class CHDCDProcessor(BaseProcessor):
         threads = _get_chdman_threads(self.options.get("num_processors", 0))
         cmd.extend(["-np", str(threads)])
 
-        log.debug("proc", "Running: %s", " ".join(cmd))
-        self._check_cancel()
-        result = subprocess.run(
-            cmd,
-            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-            text=True, timeout=7200,
-        )
-        if result.returncode != 0:
-            err = (result.stderr or "").strip()
-            log.error("proc", "chdman createcd failed (rc=%d): %s", result.returncode, err[:500])
+        rc, stderr = self._run_chdman_with_progress(cmd, phase="converting", timeout=7200)
+        if rc != 0:
+            err = (stderr or "").strip()
+            log.error("proc", "chdman createcd failed (rc=%d): %s", rc, err[:500])
             raise ProcessingError(f"chdman createcd failed: {err[:500]}")
 
         log.debug("proc", "chdman createcd succeeded, verifying %s", os.path.basename(output_path))
-        # Verify the output
-        verify_result = subprocess.run(
-            [chdman, "verify", "-i", output_path],
-            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-            text=True, timeout=3600,
-        )
-        if verify_result.returncode != 0:
+        vrc, vstderr = self._run_chdman_with_progress(
+            [chdman, "verify", "-i", output_path], phase="verifying", timeout=3600)
+        if vrc != 0:
             os.remove(output_path)
             raise ProcessingError("CHD verification failed after conversion")
 
@@ -1173,12 +1205,10 @@ class CHDAutoProcessor(BaseProcessor):
         threads = _get_chdman_threads(self.options.get("num_processors", 0))
         cmd.extend(["-np", str(threads)])
 
-        log.debug("proc", "Running: %s", " ".join(cmd))
-        self._check_cancel()
-        result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, timeout=7200)
-        if result.returncode != 0:
-            err = (result.stderr or "").strip()
-            log.error("proc", "chdman createcd failed (rc=%d): %s", result.returncode, err[:500])
+        rc, stderr = self._run_chdman_with_progress(cmd, phase="converting", timeout=7200)
+        if rc != 0:
+            err = (stderr or "").strip()
+            log.error("proc", "chdman createcd failed (rc=%d): %s", rc, err[:500])
             raise ProcessingError(f"chdman createcd failed: {err[:500]}")
 
         self._verify_chd(chdman, output_path)
@@ -1189,23 +1219,19 @@ class CHDAutoProcessor(BaseProcessor):
         threads = _get_chdman_threads(self.options.get("num_processors", 0))
         cmd.extend(["-np", str(threads)])
 
-        log.debug("proc", "Running: %s", " ".join(cmd))
-        self._check_cancel()
-        result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, timeout=14400)
-        if result.returncode != 0:
-            err = (result.stderr or "").strip()
-            log.error("proc", "chdman createdvd failed (rc=%d): %s", result.returncode, err[:500])
+        rc, stderr = self._run_chdman_with_progress(cmd, phase="converting", timeout=14400)
+        if rc != 0:
+            err = (stderr or "").strip()
+            log.error("proc", "chdman createdvd failed (rc=%d): %s", rc, err[:500])
             raise ProcessingError(f"chdman createdvd failed: {err[:500]}")
 
         self._verify_chd(chdman, output_path)
 
     def _verify_chd(self, chdman, chd_path):
         log.debug("proc", "Verifying %s", os.path.basename(chd_path))
-        verify_result = subprocess.run(
-            [chdman, "verify", "-i", chd_path],
-            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, timeout=7200,
-        )
-        if verify_result.returncode != 0:
+        rc, stderr = self._run_chdman_with_progress(
+            [chdman, "verify", "-i", chd_path], phase="verifying", timeout=7200)
+        if rc != 0:
             log.error("proc", "CHD verification failed for %s", os.path.basename(chd_path))
             os.remove(chd_path)
             raise ProcessingError("CHD verification failed after conversion")
@@ -1339,17 +1365,14 @@ class CHDDVDProcessor(BaseProcessor):
         threads = _get_chdman_threads(self.options.get("num_processors", 0))
         cmd.extend(["-np", str(threads)])
 
-        self._check_cancel()
-        result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, timeout=14400)
-        if result.returncode != 0:
-            err = (result.stderr or "").strip()
+        rc, stderr = self._run_chdman_with_progress(cmd, phase="converting", timeout=14400)
+        if rc != 0:
+            err = (stderr or "").strip()
             raise ProcessingError(f"chdman createdvd failed: {err[:500]}")
 
-        verify_result = subprocess.run(
-            [chdman, "verify", "-i", output_path],
-            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, timeout=7200,
-        )
-        if verify_result.returncode != 0:
+        vrc, vstderr = self._run_chdman_with_progress(
+            [chdman, "verify", "-i", output_path], phase="verifying", timeout=7200)
+        if vrc != 0:
             os.remove(output_path)
             raise ProcessingError("CHD verification failed after conversion")
 
