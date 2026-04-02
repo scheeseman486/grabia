@@ -513,10 +513,15 @@ class DownloadManager:
                          archive_id=archive_id, file_id=file_id, category="download")
             activity.flush()
         elif skip_event.is_set() and not self._stop_event.is_set():
-            # File was skipped/dequeued mid-download — reset to pending
-            log.debug("download", "Skipped (dequeued): %s", filename)
-            db.set_file_download_status(file_id, "pending", downloaded_bytes=0)
-            self._notify("file_skipped", {"file_id": file_id, "filename": filename, "identifier": identifier})
+            # File was skipped/dequeued mid-download — keep partial bytes on disk
+            partial = 0
+            try:
+                partial = os.path.getsize(local_path) if os.path.exists(local_path) else 0
+            except OSError:
+                pass
+            log.debug("download", "Skipped (dequeued): %s (%d bytes on disk)", filename, partial)
+            db.set_file_download_status(file_id, "pending", downloaded_bytes=partial)
+            self._notify("file_skipped", {"file_id": file_id, "filename": filename, "identifier": identifier, "downloaded": partial, "size": expected_size})
         elif not self._stop_event.is_set() and not success:
             self._notify("file_failed", {"file_id": file_id, "filename": filename, "identifier": identifier})
 

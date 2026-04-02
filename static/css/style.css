@@ -1363,6 +1363,8 @@ main {
 .file-status.queued { background: var(--bg-tertiary); color: var(--text-muted); }
 .file-status.downloading { background: rgba(81, 207, 102, 0.08); color: var(--success); }
 .file-status.downloading::before { background: rgba(81, 207, 102, 0.25); }
+.file-status.partial { background: rgba(81, 207, 102, 0.06); color: var(--text-muted); }
+.file-status.partial::before { background: rgba(81, 207, 102, 0.18); }
 .file-status.completed { background: rgba(81, 207, 102, 0.15); color: var(--success); }
 .file-status.failed { background: rgba(255, 107, 107, 0.15); color: var(--danger); }
 .file-status.conflict { background: rgba(252, 196, 25, 0.15); color: var(--warning); }

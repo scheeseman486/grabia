@@ -570,7 +570,12 @@
 
         es.addEventListener("file_skipped", (e) => {
             const data = JSON.parse(e.data);
-            updateFileRow(data.file_id, { download_status: "pending", queue_position: null });
+            updateFileRow(data.file_id, {
+                download_status: "pending",
+                queue_position: null,
+                downloaded_bytes: data.downloaded || 0,
+                size: data.size,
+            });
             lastProgressRefresh = 0;
             throttledProgressRefresh();
             refreshQueueCount();
@@ -2133,9 +2138,11 @@
         html += `<td class="col-modified">${formatDate(f.mtime)}</td>`;
         const displayStatus = formatFileStatus(f);
         const isSkipped = !isQueued && f.download_status === "pending";
+        const isPartial = isSkipped && f.downloaded_bytes > 0 && f.size > 0;
         const statusClass = procStatus === "processed" ? "processed"
             : procStatus === "failed" ? "proc-failed"
             : procStatus === "processing" || procStatus === "queued" ? "proc-active"
+            : isPartial ? "partial"
             : isSkipped ? "skipped"
             : f.download_status;
         const hasError = ((f.download_status === "failed" || f.download_status === "conflict" || f.download_status === "unknown") && f.error_message)
@@ -2326,7 +2333,7 @@
      * or empty string if no progress applies.
      */
     function getStatusPct(f, statusClass) {
-        if (statusClass === "downloading" && f.size > 0) {
+        if ((statusClass === "downloading" || statusClass === "partial") && f.size > 0) {
             const pct = Math.min(100, (f.downloaded_bytes || 0) / f.size * 100);
             return ` style="--pct:${pct.toFixed(1)}%"`;
         }
@@ -2716,13 +2723,20 @@
         if (!tr) return;
         const statusCell = tr.querySelector(".file-status");
         if (statusCell && updates.download_status) {
-            statusCell.className = "file-status " + updates.download_status;
-            if (updates.download_status === "downloading" && updates.size > 0) {
-                const pct = Math.min(100, (updates.downloaded_bytes / updates.size) * 100);
-                statusCell.textContent = pct.toFixed(1) + "%";
+            const f = vsFile || updates;
+            const ds = formatFileStatus(f);
+            const isQueued = f.queue_position != null;
+            const isSkipped = !isQueued && f.download_status === "pending";
+            const isPartial = isSkipped && (f.downloaded_bytes || 0) > 0 && (f.size || 0) > 0;
+            const cls = isPartial ? "partial"
+                : isSkipped ? "skipped"
+                : f.download_status;
+            statusCell.className = "file-status " + cls;
+            statusCell.textContent = ds;
+            if ((cls === "downloading" || cls === "partial") && (f.size || 0) > 0) {
+                const pct = Math.min(100, (f.downloaded_bytes || 0) / f.size * 100);
                 statusCell.style.setProperty("--pct", pct.toFixed(1) + "%");
             } else {
-                statusCell.textContent = updates.download_status;
                 statusCell.style.removeProperty("--pct");
             }
         }
