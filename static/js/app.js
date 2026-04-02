@@ -67,11 +67,6 @@
     let alScrollRAF = null;         // requestAnimationFrame handle
     let alLastRange = null;         // { start, end } of last rendered range
 
-    // --- Activity Job Progress Tracking ---
-    // Maps archive_id → { current, total, phase } from SSE events
-    const jobProgressMap = new Map();
-    let showFinishedJobs = false;   // toggle for finished jobs visibility
-
     // --- Notifications ---
     let notifications = [];
     let notifIdCounter = 0;
@@ -3798,23 +3793,38 @@
         // Processing row
         if (ongoingProcessing && ongoingProcessing.phase !== "done" && ongoingProcessing.phase !== "error" && ongoingProcessing.phase !== "cancelled") {
             const fname = escapeHtml(ongoingProcessing.filename || "");
-            const prog = ongoingProcessing.total > 0 ? `${ongoingProcessing.current}/${ongoingProcessing.total}` : "";
-            const badge = queueCounts.processing > 0 ? `<span class="activity-ongoing-badge">${queueCounts.processing}</span>` : "";
-            html += `<div class="activity-ongoing-row" data-navigate="processing">`;
-            html += `<span class="activity-ongoing-label">Processing</span>`;
-            html += `<span class="activity-ongoing-detail">${fname} ${prog}</span>`;
-            html += badge;
+            const pct = ongoingProcessing.total > 0 ? Math.min(100, (ongoingProcessing.current / ongoingProcessing.total) * 100) : 0;
+            const progText = ongoingProcessing.total > 0 ? `${ongoingProcessing.current}/${ongoingProcessing.total}` : "";
+            html += `<div class="activity-ongoing-row activity-dl-row" data-navigate="processing">`;
+            html += `<div class="activity-dl-info">`;
+            html += `<span class="activity-dl-name"><strong>Processing</strong>${fname ? " — " + fname : ""}</span>`;
+            html += `<span class="activity-dl-stats">${progText}`;
+            if (ongoingProcessing.archive_id) html += ` <button class="activity-cancel-btn" data-cancel="processing" data-archive-id="${ongoingProcessing.archive_id}">Cancel</button>`;
+            html += `</span></div>`;
+            if (ongoingProcessing.total > 0) {
+                html += `<div class="activity-dl-bar"><div class="activity-dl-fill" style="width:${pct.toFixed(1)}%"></div></div>`;
+            } else {
+                html += `<div class="activity-dl-bar"><div class="activity-dl-fill activity-dl-fill-indeterminate"></div></div>`;
+            }
             html += `</div>`;
         }
 
         // Scanning row
         if (ongoingScanning && ongoingScanning.phase !== "done" && ongoingScanning.phase !== "error" && ongoingScanning.phase !== "cancelled") {
-            const prog = ongoingScanning.total > 0 ? `${ongoingScanning.current}/${ongoingScanning.total}` : "";
-            const badge = queueCounts.scan > 0 ? `<span class="activity-ongoing-badge">${queueCounts.scan}</span>` : "";
-            html += `<div class="activity-ongoing-row" data-navigate="scan">`;
-            html += `<span class="activity-ongoing-label">Scanning</span>`;
-            html += `<span class="activity-ongoing-detail">${prog} ${ongoingScanning.phase || ""}</span>`;
-            html += badge;
+            const pct = ongoingScanning.total > 0 ? Math.min(100, (ongoingScanning.current / ongoingScanning.total) * 100) : 0;
+            const progText = ongoingScanning.total > 0 ? `${ongoingScanning.current}/${ongoingScanning.total}` : "";
+            const phaseText = ongoingScanning.phase || "";
+            html += `<div class="activity-ongoing-row activity-dl-row" data-navigate="scan">`;
+            html += `<div class="activity-dl-info">`;
+            html += `<span class="activity-dl-name"><strong>Scanning</strong>${phaseText ? " — " + escapeHtml(phaseText) : ""}</span>`;
+            html += `<span class="activity-dl-stats">${progText}`;
+            if (ongoingScanning.archive_id) html += ` <button class="activity-cancel-btn" data-cancel="scan" data-archive-id="${ongoingScanning.archive_id}">Cancel</button>`;
+            html += `</span></div>`;
+            if (ongoingScanning.total > 0) {
+                html += `<div class="activity-dl-bar"><div class="activity-dl-fill" style="width:${pct.toFixed(1)}%"></div></div>`;
+            } else {
+                html += `<div class="activity-dl-bar"><div class="activity-dl-fill activity-dl-fill-indeterminate"></div></div>`;
+            }
             html += `</div>`;
         }
 
@@ -3823,9 +3833,20 @@
 
         // Click handlers to navigate to queue tabs
         container.querySelectorAll(".activity-ongoing-row").forEach((row) => {
-            row.addEventListener("click", () => {
+            row.addEventListener("click", (e) => {
+                if (e.target.closest(".activity-cancel-btn")) return;
                 const tab = row.dataset.navigate;
                 if (tab) openQueues(tab);
+            });
+        });
+        // Cancel buttons
+        container.querySelectorAll(".activity-cancel-btn").forEach((btn) => {
+            btn.addEventListener("click", (e) => {
+                e.stopPropagation();
+                const archiveId = parseInt(btn.dataset.archiveId);
+                const type = btn.dataset.cancel;
+                if (type === "processing") cancelProcessing(archiveId);
+                else if (type === "scan") cancelScan(archiveId);
             });
         });
     }
@@ -4429,7 +4450,6 @@
     let db_scan_paused = false;
 
     // ── Activity Log ──────────────────────────────────────────────
-    let activityJobFilter = null;  // set when navigating from a notification
     let activeActivityTab = "ongoing";
 
     function switchActivityTab(tab) {
@@ -4439,14 +4459,12 @@
         $("#activity-panel-log").classList.toggle("active", tab === "log");
         if (tab === "ongoing") refreshOngoingActivity();
         if (tab === "log") {
-            loadActivityJobs(activityJobFilter);
             loadActivityLog();
         }
     }
 
     async function openActivityLog(opts) {
         opts = opts || {};
-        activityJobFilter = opts.job_id || null;
 
         // Reset filters unless navigating with specific opts
         if (!opts.job_id && !opts.category && !opts.archive_id) {
@@ -4464,192 +4482,11 @@
 
         await populateActivityArchiveFilter();
         if (targetTab === "log") {
-            await loadActivityJobs(opts.job_id || null);
             await loadActivityLog();
         }
         refreshOngoingActivity();
         switchActivityTab(targetTab);
         showPage("page-activity");
-    }
-
-    async function loadActivityJobs(highlightJobId) {
-        const banner = $("#activity-job-banner");
-        try {
-            const data = await api("GET", "/api/activity/jobs?limit=50");
-            const jobs = data.jobs || [];
-            if (jobs.length === 0) {
-                banner.style.display = "none";
-                return;
-            }
-
-            const running = jobs.filter(j => j.status === "running");
-            const finished = jobs.filter(j => j.status !== "running");
-
-            // If highlighting a specific job, ensure it's visible
-            if (highlightJobId) {
-                activityJobFilter = highlightJobId;
-                const inRunning = running.some(j => j.id === highlightJobId);
-                const inFinished = finished.some(j => j.id === highlightJobId);
-                if (inFinished && !inRunning) showFinishedJobs = true;
-                if (!inRunning && !inFinished) {
-                    // Fetch it directly and prepend
-                    try {
-                        const j = await api("GET", `/api/activity/jobs/${highlightJobId}`);
-                        if (j) {
-                            if (j.status === "running") running.unshift(j);
-                            else { finished.unshift(j); showFinishedJobs = true; }
-                        }
-                    } catch (_) {}
-                }
-            }
-
-            // Build HTML
-            let html = "";
-
-            // Running jobs — always visible
-            for (const j of running) {
-                html += buildJobCardHtml(j);
-            }
-
-            // Finished jobs section
-            if (finished.length > 0) {
-                const toggleLabel = showFinishedJobs
-                    ? `Hide finished (${finished.length})`
-                    : `Show finished (${finished.length})`;
-                html += `<div class="job-finished-toggle">
-                    <button class="job-toggle-btn" id="toggle-finished-jobs">${toggleLabel}</button>
-                    ${showFinishedJobs ? `<button class="job-clear-all-btn" id="clear-finished-jobs">Clear all</button>` : ""}
-                </div>`;
-                if (showFinishedJobs) {
-                    for (const j of finished) {
-                        html += buildJobCardHtml(j);
-                    }
-                }
-            }
-
-            banner.innerHTML = html;
-            banner.style.display = "";
-
-            // Wire up toggle finished
-            const toggleBtn = banner.querySelector("#toggle-finished-jobs");
-            if (toggleBtn) {
-                toggleBtn.addEventListener("click", (e) => {
-                    e.stopPropagation();
-                    showFinishedJobs = !showFinishedJobs;
-                    loadActivityJobs(activityJobFilter);
-                });
-            }
-
-            // Wire up clear all finished
-            const clearAllBtn = banner.querySelector("#clear-finished-jobs");
-            if (clearAllBtn) {
-                clearAllBtn.addEventListener("click", async (e) => {
-                    e.stopPropagation();
-                    for (const j of finished) {
-                        try { await api("DELETE", `/api/activity/jobs/${j.id}`); } catch (_) {}
-                    }
-                    loadActivityJobs(activityJobFilter);
-                });
-            }
-
-            // Wire up individual job card interactions
-            banner.querySelectorAll(".job-card").forEach(el => {
-                const jid = parseInt(el.dataset.jobId);
-
-                // Click card to filter log
-                el.addEventListener("click", (e) => {
-                    if (e.target.closest(".job-card-cancel") || e.target.closest(".job-card-dismiss")) return;
-                    if (activityJobFilter === jid) {
-                        activityJobFilter = null;
-                        el.classList.remove("job-card-active");
-                    } else {
-                        activityJobFilter = jid;
-                        banner.querySelectorAll(".job-card").forEach(c => c.classList.remove("job-card-active"));
-                        el.classList.add("job-card-active");
-                    }
-                    loadActivityLog();
-                });
-
-                // Cancel button
-                const cancelBtn = el.querySelector(".job-card-cancel");
-                if (cancelBtn) {
-                    cancelBtn.addEventListener("click", (e) => {
-                        e.stopPropagation();
-                        const archiveId = parseInt(cancelBtn.dataset.archiveId);
-                        const cancelType = cancelBtn.dataset.cancelType;
-                        if (cancelType === "processing") cancelProcessing(archiveId);
-                        else if (cancelType === "scan") cancelScan(archiveId);
-                    });
-                }
-
-                // Dismiss button
-                const dismissBtn = el.querySelector(".job-card-dismiss");
-                if (dismissBtn) {
-                    dismissBtn.addEventListener("click", async (e) => {
-                        e.stopPropagation();
-                        try { await api("DELETE", `/api/activity/jobs/${jid}`); } catch (_) {}
-                        loadActivityJobs(activityJobFilter);
-                    });
-                }
-            });
-        } catch (_) {
-            banner.style.display = "none";
-        }
-    }
-
-    function buildJobCardHtml(j) {
-        const started = new Date(j.started_at * 1000).toLocaleString();
-        const statusCls = j.status || "running";
-        const isFiltered = activityJobFilter === j.id;
-        const filterCls = isFiltered ? " job-card-active" : "";
-        const isRunning = j.status === "running";
-        const archiveName = (j.archive_title || j.archive_identifier)
-            ? esc(j.archive_title || j.archive_identifier)
-            : "";
-
-        // Progress bar for running jobs
-        let progressHtml = "";
-        if (isRunning && j.archive_id) {
-            const prog = jobProgressMap.get(j.archive_id);
-            if (prog && prog.total > 0) {
-                const pct = Math.round((prog.current / prog.total) * 100);
-                progressHtml = `<div class="job-progress-track"><div class="job-progress-fill" style="width:${pct}%"></div></div>
-                    <span class="job-progress-text">${prog.current}/${prog.total}</span>`;
-            } else {
-                progressHtml = `<div class="job-progress-track"><div class="job-progress-fill indeterminate"></div></div>`;
-            }
-        }
-
-        // Action buttons
-        let actionsHtml = "";
-        if (isRunning && j.archive_id) {
-            const cancelType = j.category === "scan" ? "scan" : "processing";
-            actionsHtml = `<button class="job-card-cancel" data-archive-id="${j.archive_id}" data-cancel-type="${cancelType}" title="Cancel">Cancel</button>`;
-        } else if (!isRunning) {
-            actionsHtml = `<button class="job-card-dismiss" title="Remove">
-                <svg viewBox="0 0 24 24" width="12" height="12"><path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z" fill="currentColor"/></svg>
-            </button>`;
-        }
-
-        // Duration for finished jobs
-        let durationHtml = "";
-        if (!isRunning && j.completed_at && j.started_at) {
-            const dur = j.completed_at - j.started_at;
-            durationHtml = `<span class="job-duration">${formatDuration(dur)}</span>`;
-        }
-
-        return `<div class="job-card job-card-${statusCls}${filterCls}" data-job-id="${j.id}">
-            <div class="job-card-header">
-                <span class="job-category">${esc(j.category)}</span>
-                <span class="job-status ${statusCls}">${esc(j.status)}</span>
-                ${archiveName ? `<span class="job-archive">${archiveName}</span>` : ""}
-                <span class="job-time">${started}</span>
-                ${durationHtml}
-                ${actionsHtml}
-            </div>
-            ${progressHtml}
-            ${j.summary ? `<span class="job-summary">${esc(j.summary)}</span>` : ""}
-        </div>`;
     }
 
     function formatDuration(seconds) {
@@ -4695,20 +4532,16 @@
 
     async function loadActivityLog() {
         const params = new URLSearchParams();
-        if (activityJobFilter) {
-            params.set("job_id", activityJobFilter);
-        } else {
-            const cat = $("#activity-filter-category").value;
-            const lvl = $("#activity-filter-level").value;
-            const grp = $("#activity-filter-group").value;
-            const arc = $("#activity-filter-archive").value;
-            const srch = $("#activity-filter-search").value.trim();
-            if (cat) params.set("category", cat);
-            if (lvl) params.set("level", lvl);
-            if (grp) params.set("group_id", grp);
-            if (arc) params.set("archive_id", arc);
-            if (srch) params.set("search", srch);
-        }
+        const cat = $("#activity-filter-category").value;
+        const lvl = $("#activity-filter-level").value;
+        const grp = $("#activity-filter-group").value;
+        const arc = $("#activity-filter-archive").value;
+        const srch = $("#activity-filter-search").value.trim();
+        if (cat) params.set("category", cat);
+        if (lvl) params.set("level", lvl);
+        if (grp) params.set("group_id", grp);
+        if (arc) params.set("archive_id", arc);
+        if (srch) params.set("search", srch);
         params.set("limit", 5000);
 
         try {
@@ -4894,15 +4727,12 @@
         $("#activity-filter-group").value = "";
         $("#activity-filter-archive").value = "";
         $("#activity-filter-search").value = "";
-        activityJobFilter = null;
-        loadActivityJobs(null);
         loadActivityLog();
     }
 
     function _refreshActivityIfVisible() {
         if ($("#page-activity").classList.contains("active")) {
             if (activeActivityTab === "log") {
-                loadActivityJobs(activityJobFilter);
                 loadActivityLog();
             } else {
                 refreshOngoingActivity();
@@ -4911,51 +4741,11 @@
     }
 
     function _updateJobProgress(data) {
-        const { archive_id, phase, current, total } = data;
+        const { archive_id, phase } = data;
         if (!archive_id) return;
 
-        const terminal = phase === "done" || phase === "cancelled" || phase === "error";
-
-        if (terminal) {
-            jobProgressMap.delete(archive_id);
-            // Full refresh on terminal events — job status changed
-            if ($("#page-activity").classList.contains("active")) {
-                loadActivityJobs(activityJobFilter);
-            }
-        } else if (current !== undefined && total !== undefined) {
-            jobProgressMap.set(archive_id, { current, total, phase });
-            // Update progress bar in-place without full re-render
-            _updateJobProgressBar(archive_id, current, total);
-        }
-    }
-
-    function _updateJobProgressBar(archiveId, current, total) {
-        const banner = $("#activity-job-banner");
-        if (!banner) return;
-        // Find job cards for this archive
-        banner.querySelectorAll(".job-card").forEach(card => {
-            const fill = card.querySelector(".job-progress-fill");
-            const text = card.querySelector(".job-progress-text");
-            if (!fill) return;
-            // Match by checking if this card's data relates to the archive
-            // We need to check the cancel button's archive id or walk the job data
-            const cancelBtn = card.querySelector(".job-card-cancel");
-            if (cancelBtn && parseInt(cancelBtn.dataset.archiveId) === archiveId) {
-                if (total > 0) {
-                    const pct = Math.round((current / total) * 100);
-                    fill.classList.remove("indeterminate");
-                    fill.style.width = pct + "%";
-                    if (text) text.textContent = `${current}/${total}`;
-                    else {
-                        // Add text element if missing
-                        const span = document.createElement("span");
-                        span.className = "job-progress-text";
-                        span.textContent = `${current}/${total}`;
-                        fill.closest(".job-progress-track").after(span);
-                    }
-                }
-            }
-        });
+        // Refresh the Ongoing tab when job progress changes
+        refreshOngoingActivity();
     }
 
     async function openCollections() {

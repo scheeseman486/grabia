@@ -2621,55 +2621,8 @@ tr.processed-detail-row td { padding: 0 !important; }
 #page-activity .activity-filters input::placeholder { color: var(--text-muted); }
 .activity-search { width: 160px; }
 
-.activity-job-banner {
-    display: flex;
-    flex-direction: column;
-    gap: 6px;
-    margin-bottom: 12px;
-    font-size: 13px;
-}
-.job-card {
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-    padding: 8px 12px;
-    border-radius: 6px;
-    background: var(--bg-secondary);
-    border: 1px solid var(--border);
-    cursor: pointer;
-    transition: border-color 0.15s;
-}
-.job-card:hover { border-color: var(--accent); }
-.job-card-active { border-color: var(--accent); background: var(--surface); }
-.job-card-header {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-}
-.job-card .job-category {
-    font-weight: 600;
-    text-transform: uppercase;
-    font-size: 11px;
-    color: var(--text-dim);
-}
-.job-card .job-status {
-    display: inline-block;
-    padding: 2px 8px;
-    border-radius: 10px;
-    font-size: 11px;
-    font-weight: 600;
-}
-.job-card .job-status.running { background: var(--accent); color: #fff; }
-.job-card .job-status.completed { background: var(--success); color: #fff; }
-.job-card .job-status.failed { background: var(--danger); color: #fff; }
-.job-card .job-status.cancelled { background: var(--warning); color: #000; }
-.job-card .job-archive { color: var(--text); font-size: 12px; font-weight: 500; }
-.job-card .job-time { color: var(--text-dim); font-size: 12px; margin-left: auto; }
-.job-card .job-duration { color: var(--text-dim); font-size: 11px; }
-.job-card .job-summary { color: var(--text-secondary); font-size: 12px; }
-
-/* Job card action buttons */
-.job-card-cancel {
+/* Activity cancel button (used in Ongoing tab) */
+.activity-cancel-btn {
     background: none;
     border: none;
     color: #c44;
@@ -2678,63 +2631,15 @@ tr.processed-detail-row td { padding: 0 !important; }
     padding: 0 4px;
     font-weight: 600;
 }
-.job-card-cancel:hover { color: #e55; text-decoration: underline; }
-.job-card-dismiss {
-    background: none;
-    border: none;
-    color: var(--text-dim);
-    cursor: pointer;
-    padding: 0 4px;
-    line-height: 1;
-}
-.job-card-dismiss:hover { color: var(--text); }
+.activity-cancel-btn:hover { color: #e55; text-decoration: underline; }
 
-/* Job card progress bar */
-.job-progress-track {
-    height: 4px;
-    background: var(--bg-tertiary);
-    border-radius: 2px;
-    overflow: hidden;
-}
-.job-progress-fill {
-    height: 100%;
-    background: var(--accent);
-    border-radius: 2px;
-    transition: width 0.2s ease;
-}
-.job-progress-fill.indeterminate {
+/* Indeterminate progress fill for activity rows */
+.activity-dl-fill-indeterminate {
     width: 100% !important;
     animation: indeterminate 1.2s ease-in-out infinite;
-    background: linear-gradient(90deg, transparent, var(--accent), transparent);
-    background-size: 200% 100%;
+    background: linear-gradient(90deg, transparent, var(--accent), transparent) !important;
+    background-size: 200% 100% !important;
 }
-.job-progress-text { color: var(--text-dim); font-size: 11px; }
-
-/* Finished jobs toggle */
-.job-finished-toggle {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    padding: 4px 0;
-}
-.job-toggle-btn {
-    background: none;
-    border: none;
-    color: var(--text-secondary);
-    font-size: 12px;
-    cursor: pointer;
-    padding: 2px 0;
-}
-.job-toggle-btn:hover { color: var(--text); text-decoration: underline; }
-.job-clear-all-btn {
-    background: none;
-    border: none;
-    color: #c44;
-    font-size: 12px;
-    cursor: pointer;
-    padding: 2px 0;
-}
-.job-clear-all-btn:hover { color: #e55; text-decoration: underline; }
 
 /* Activity log table — mirrors .file-table-wrap / .file-table */
 #activity-log-list {
