@@ -4224,12 +4224,10 @@
         });
         tr.addEventListener("dblclick", (e) => {
             if (e.target.closest("button, .queue-toggle")) return;
-            if (archiveId) {
-                if (tab === "download" && fileId) {
-                    navigateToFile(parseInt(archiveId), parseInt(fileId));
-                } else {
-                    openArchiveDetail(parseInt(archiveId));
-                }
+            if (archiveId && fileId) {
+                navigateToFile(parseInt(archiveId), parseInt(fileId));
+            } else if (archiveId) {
+                openArchiveDetail(parseInt(archiveId));
             }
         });
 
