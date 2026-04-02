@@ -50,6 +50,7 @@
     }
     let realBandwidth = -1; // tracks the actual backend bandwidth setting
     let lastProgressRefresh = 0; // timestamp of last throttled progress refresh
+    let uiTickTimer = null;  // 1-second periodic UI refresh during active work
 
     // --- Virtual Scroll State ---
     const VS_ROW_HEIGHT = 37;       // px per normal file row
@@ -509,6 +510,7 @@
             if (dlState === "stopped") {
                 activeDownloads = [];
                 currentDownloadInfo = null;
+                stopUiTick();
             }
             updateQueueDisplayText();
             // Refresh file list when downloader stops so status resets are visible
@@ -521,19 +523,14 @@
             if (dlState !== "running") return;
             const data = JSON.parse(e.data);
             updateFileRow(data.file_id, { download_status: "downloading", downloaded_bytes: data.downloaded, size: data.size });
-            // Update the matching entry in activeDownloads
+            // Update the matching entry in activeDownloads (speed/progress displayed by uiTick)
             const dl = activeDownloads.find(d => d.file_id === data.file_id);
             if (dl) {
                 dl.downloaded = data.downloaded;
                 dl.size = data.size;
                 dl.speed = data.speed || 0;
             }
-            // Aggregate speed across all active downloads
-            const totalSpeed = activeDownloads.reduce((sum, d) => sum + (d.speed || 0), 0);
-            speedDisplay.textContent = formatSpeed(totalSpeed);
-            pushSpeed(totalSpeed);
-            // Refresh dropdown if open so per-file progress bars update
-            if (queueDropdownOpen) loadQueueDropdown();
+            startUiTick();
             throttledProgressRefresh();
         });
 
@@ -546,8 +543,9 @@
             lastProgressRefresh = 0; // force immediate refresh
             throttledProgressRefresh();
             refreshQueueCount();
-            if (queueDropdownOpen) loadQueueDropdown();
             refreshOngoingActivity();
+            if (queueDropdownOpen) loadQueueDropdown();
+            _refreshActivityIfVisible();
         });
 
         es.addEventListener("file_error", (e) => {
@@ -555,7 +553,9 @@
             // Remove from active downloads
             activeDownloads = activeDownloads.filter(d => d.file_id !== data.file_id);
             currentDownloadInfo = activeDownloads.length > 0 ? activeDownloads[0] : null;
+            refreshOngoingActivity();
             if (queueDropdownOpen) loadQueueDropdown();
+            _refreshActivityIfVisible();
             const fname = data.filename || "Unknown file";
             const archive = data.identifier || "";
             const detail = data.error || "Unknown error";
@@ -568,9 +568,11 @@
             // Remove from active downloads
             activeDownloads = activeDownloads.filter(d => d.file_id !== data.file_id);
             currentDownloadInfo = activeDownloads.length > 0 ? activeDownloads[0] : null;
-            if (queueDropdownOpen) loadQueueDropdown();
             lastProgressRefresh = 0;
             throttledProgressRefresh();
+            refreshOngoingActivity();
+            if (queueDropdownOpen) loadQueueDropdown();
+            _refreshActivityIfVisible();
             const fname = data.filename || "Unknown file";
             const archive = data.identifier || "";
             addNotification(`Download failed: ${fname}${archive ? " (" + archive + ")" : ""} — retries exhausted`, "error");
@@ -591,7 +593,9 @@
                 activeDownloads.push({ file_id: data.file_id, filename: data.filename, downloaded: 0, size: 0, speed: 0 });
                 currentDownloadInfo = activeDownloads[0];
             }
+            refreshOngoingActivity();
             if (queueDropdownOpen) loadQueueDropdown();
+            startUiTick();
             refreshStatus();
         });
 
@@ -602,6 +606,7 @@
             // Track ongoing scanning state
             if (data.phase === "done" || data.phase === "cancelled" || data.phase === "error") {
                 ongoingScanning = null;
+                _refreshActivityIfVisible();
             } else {
                 ongoingScanning = {
                     archive_id: data.archive_id,
@@ -609,6 +614,7 @@
                     current: data.current || 0,
                     total: data.total || 0,
                 };
+                startUiTick();
             }
             refreshOngoingActivity();
         });
@@ -634,6 +640,7 @@
                     total: data.total || 0,
                     phase: data.phase || "",
                 };
+                startUiTick();
             }
             refreshOngoingActivity();
         });
@@ -822,6 +829,7 @@
             currentDownloadInfo = null;
         }
         updateQueueDisplayText();
+        if (activeDownloads.length > 0 && dlState === "running") startUiTick();
         updateGlobalProgress(data.progress);
     }
 
@@ -946,6 +954,47 @@
     async function refreshQueueCount() {
         await refreshQueueCounts();  // reuse the queue page's count fetch
         updateQueueDisplayText();
+    }
+
+    // ── UI Tick ──────────────────────────────────────────────────────
+    // A 1-second periodic refresh that keeps speed, queue display, and
+    // the Ongoing tab smoothly updated during active downloads/processing.
+    // Starts when work begins, stops when idle.
+
+    function startUiTick() {
+        if (uiTickTimer) return;
+        uiTickTimer = setInterval(uiTick, 1000);
+    }
+
+    function stopUiTick() {
+        if (uiTickTimer) {
+            clearInterval(uiTickTimer);
+            uiTickTimer = null;
+        }
+    }
+
+    function uiTick() {
+        // Aggregate speed across all active downloads
+        const totalSpeed = activeDownloads.reduce((sum, d) => sum + (d.speed || 0), 0);
+        speedDisplay.textContent = formatSpeed(totalSpeed);
+        pushSpeed(totalSpeed);
+
+        // Update topbar text (filename, progress, etc.)
+        updateQueueDisplayText();
+
+        // Update the Ongoing tab (Activities page) if visible
+        if ($("#page-activity").classList.contains("active") && activeActivityTab === "ongoing") {
+            refreshOngoingActivity();
+        }
+
+        // Update queue dropdown if open
+        if (queueDropdownOpen) loadQueueDropdown();
+
+        // Stop ticking when nothing is active
+        const hasWork = (activeDownloads.length > 0 && (dlState === "running" || dlState === "paused"))
+            || (ongoingProcessing && !["done", "error", "cancelled"].includes(ongoingProcessing.phase))
+            || (ongoingScanning && !["done", "error", "cancelled"].includes(ongoingScanning.phase));
+        if (!hasWork) stopUiTick();
     }
 
     function loadQueueDropdown() {
