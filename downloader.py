@@ -27,6 +27,7 @@ from datetime import datetime
 import requests
 import database as db
 import ia_client
+import activity
 from logger import log
 
 log = logging.getLogger(__name__)
@@ -491,17 +492,26 @@ class DownloadManager:
             db.set_file_download_status(file_id, "failed", error_message=error_msg)
             db.increment_file_retry(file_id)
             self._notify("file_error", {"file_id": file_id, "filename": filename, "identifier": identifier, "error": error_msg})
+            activity.log(None, "error", f"Failed to download {filename}",
+                         archive_id=archive_id, file_id=file_id, detail=error_msg, category="download")
+            activity.flush()
         except Exception as e:
             error_msg = str(e)
             log.warning("download", "Failed %s: %s", filename, error_msg)
             db.set_file_download_status(file_id, "failed", error_message=error_msg)
             db.increment_file_retry(file_id)
             self._notify("file_error", {"file_id": file_id, "filename": filename, "identifier": identifier, "error": error_msg})
+            activity.log(None, "error", f"Failed to download {filename}",
+                         archive_id=archive_id, file_id=file_id, detail=error_msg, category="download")
+            activity.flush()
 
         if success:
             log.debug("download", "Completed: %s", filename)
             db.set_file_download_status(file_id, "completed", downloaded_bytes=expected_size)
             self._notify("file_complete", {"file_id": file_id, "filename": filename, "identifier": identifier})
+            activity.log(None, "success", f"Downloaded {filename}",
+                         archive_id=archive_id, file_id=file_id, category="download")
+            activity.flush()
         elif skip_event.is_set() and not self._stop_event.is_set():
             # File was skipped/dequeued mid-download — reset to pending
             log.debug("download", "Skipped (dequeued): %s", filename)
