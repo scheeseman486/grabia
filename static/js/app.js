@@ -537,13 +537,8 @@
             const totalSpeed = activeDownloads.reduce((sum, d) => sum + (d.speed || 0), 0);
             speedDisplay.textContent = formatSpeed(totalSpeed);
             pushSpeed(totalSpeed);
-            // Update queue display progress for the currently displayed download
-            if (currentDownloadInfo && currentDownloadInfo.file_id === data.file_id) {
-                currentDownloadInfo.downloaded = data.downloaded;
-                currentDownloadInfo.size = data.size;
-                const pct = data.size > 0 ? Math.min(100, data.downloaded / data.size * 100) : 0;
-                queueDisplayFill.style.width = pct.toFixed(1) + "%";
-            }
+            // Refresh dropdown if open so per-file progress bars update
+            if (queueDropdownOpen) loadQueueDropdown();
             throttledProgressRefresh();
         });
 
@@ -565,6 +560,7 @@
             // Remove from active downloads
             activeDownloads = activeDownloads.filter(d => d.file_id !== data.file_id);
             currentDownloadInfo = activeDownloads.length > 0 ? activeDownloads[0] : null;
+            if (queueDropdownOpen) loadQueueDropdown();
             const fname = data.filename || "Unknown file";
             const archive = data.identifier || "";
             const detail = data.error || "Unknown error";
@@ -577,6 +573,7 @@
             // Remove from active downloads
             activeDownloads = activeDownloads.filter(d => d.file_id !== data.file_id);
             currentDownloadInfo = activeDownloads.length > 0 ? activeDownloads[0] : null;
+            if (queueDropdownOpen) loadQueueDropdown();
             lastProgressRefresh = 0;
             throttledProgressRefresh();
             const fname = data.filename || "Unknown file";
@@ -599,6 +596,7 @@
                 activeDownloads.push({ file_id: data.file_id, filename: data.filename, downloaded: 0, size: 0, speed: 0 });
                 currentDownloadInfo = activeDownloads[0];
             }
+            if (queueDropdownOpen) loadQueueDropdown();
             refreshStatus();
         });
 
@@ -855,7 +853,6 @@
 
     const queueDisplay = $("#queue-display");
     const queueDisplayText = $("#queue-display-text");
-    const queueDisplayFill = $("#queue-display-fill");
     const queueDisplayBadge = $("#queue-display-badge");
     const queueDropdown = $("#queue-dropdown");
     let queueDropdownOpen = false;
@@ -911,23 +908,15 @@
                 queueDisplayText.textContent = first.filename;
                 queueDisplay.title = `${dlState === "running" ? "Downloading" : "Paused"}: ${first.filename}${first.identifier ? " (" + first.identifier + ")" : ""}`;
             }
-            // Show aggregate progress of all active downloads
-            const totalSize = activeDownloads.reduce((s, d) => s + (d.size || 0), 0);
-            const totalDone = activeDownloads.reduce((s, d) => s + (d.downloaded || 0), 0);
-            const pct = totalSize > 0 ? Math.min(100, totalDone / totalSize * 100) : 0;
-            queueDisplayFill.style.width = pct.toFixed(1) + "%";
         } else if (displayActivity === "processing") {
-            queueDisplayFill.style.width = "0";
             const prog = ongoingProcessing.total > 0 ? ` (${ongoingProcessing.current}/${ongoingProcessing.total})` : "";
             queueDisplayText.textContent = `Processing: ${ongoingProcessing.filename}${prog}`;
             queueDisplay.title = `Processing file`;
         } else if (displayActivity === "scan") {
-            queueDisplayFill.style.width = "0";
             const prog = ongoingScanning.total > 0 ? ` ${ongoingScanning.current}/${ongoingScanning.total}` : "";
             queueDisplayText.textContent = `Scanning${prog}`;
             queueDisplay.title = `Scanning files`;
         } else {
-            queueDisplayFill.style.width = "0";
             const total = (queueCounts.download || 0) + (queueCounts.processing || 0) + (queueCounts.scan || 0);
             if (total > 0) {
                 queueDisplayText.textContent = total + (total === 1 ? " item queued" : " items queued");
@@ -3788,26 +3777,22 @@
     function renderOngoingActivity(container, emptyEl) {
         let html = "";
 
-        // Download row
+        // Individual download rows with per-file progress bars
         if (activeDownloads.length > 0 && (dlState === "running" || dlState === "paused")) {
-            const count = activeDownloads.length;
-            const speed = speedDisplay.textContent || "";
-            const badge = queueCounts.download > 0 ? `<span class="activity-ongoing-badge">${queueCounts.download}</span>` : "";
-            let detail;
-            if (count === 1) {
-                const first = activeDownloads[0];
-                const fname = escapeHtml(first.filename || "");
-                const archive = escapeHtml(first.identifier || "");
-                const pct = first.size > 0 ? ((first.downloaded || 0) / first.size * 100).toFixed(1) + "%" : "";
-                detail = `${fname} (${archive}) ${pct} ${speed}`;
-            } else {
-                detail = `${count} files ${speed}`;
+            for (const dl of activeDownloads) {
+                const fname = escapeHtml(dl.filename || "Unknown");
+                const pct = dl.size > 0 ? Math.min(100, (dl.downloaded || 0) / dl.size * 100) : 0;
+                const pctText = dl.size > 0 ? pct.toFixed(1) + "%" : "";
+                const speedText = dl.speed ? formatSpeed(dl.speed) : "";
+                const sizeText = dl.size > 0 ? formatBytes(dl.size) : "";
+                html += `<div class="activity-ongoing-row activity-dl-row" data-navigate="download">`;
+                html += `<div class="activity-dl-info">`;
+                html += `<span class="activity-dl-name" title="${fname}">${fname}</span>`;
+                html += `<span class="activity-dl-stats">${pctText}${sizeText ? " of " + sizeText : ""}${speedText ? " — " + speedText : ""}</span>`;
+                html += `</div>`;
+                html += `<div class="activity-dl-bar"><div class="activity-dl-fill" style="width:${pct.toFixed(1)}%"></div></div>`;
+                html += `</div>`;
             }
-            html += `<div class="activity-ongoing-row" data-navigate="download">`;
-            html += `<span class="activity-ongoing-label">${dlState === "paused" ? "Paused" : "Downloading"}</span>`;
-            html += `<span class="activity-ongoing-detail">${detail}</span>`;
-            html += badge;
-            html += `</div>`;
         }
 
         // Processing row

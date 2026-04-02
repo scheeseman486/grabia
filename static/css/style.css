@@ -247,20 +247,7 @@ body {
     transition: border-color 0.15s, color 0.15s;
     overflow: hidden;
 }
-.queue-display-fill {
-    position: absolute;
-    top: 0;
-    left: 0;
-    bottom: 0;
-    width: 0;
-    border-radius: 11px;
-    transition: width 0.3s;
-    pointer-events: none;
-}
-/* Downloading: green fill + sweep */
-.queue-display.state-running .queue-display-fill {
-    background: rgba(106, 159, 75, 0.3);
-}
+/* Downloading: sweep animation on bar */
 .queue-display.state-running::after {
     content: "";
     position: absolute;
@@ -271,14 +258,6 @@ body {
     background: linear-gradient(90deg, transparent, rgba(106, 159, 75, 0.18), transparent);
     animation: queue-sweep 2s ease-in-out infinite;
     pointer-events: none;
-}
-/* Paused: grey fill, no sweep */
-.queue-display.state-paused .queue-display-fill {
-    background: rgba(255, 255, 255, 0.08);
-}
-/* Stopped: subtle grey */
-.queue-display.state-stopped .queue-display-fill {
-    background: rgba(255, 255, 255, 0.04);
 }
 @keyframes queue-sweep {
     0%   { left: -50%; }
@@ -327,6 +306,11 @@ body {
     padding: 10px 14px;
     border-bottom: 1px solid var(--border);
     flex-shrink: 0;
+}
+#queue-dropdown-rows {
+    overflow-y: auto;
+    flex: 1;
+    min-height: 0;
 }
 .queue-dropdown-title {
     font-size: 13px;
@@ -2998,6 +2982,46 @@ tr.processed-detail-row td { padding: 0 !important; }
     text-align: center;
     padding: 0 5px;
     font-weight: 600;
+}
+/* Per-file download rows in Active Tasks dropdown */
+.activity-dl-row {
+    flex-direction: column !important;
+    align-items: stretch !important;
+    gap: 4px !important;
+    padding: 8px 12px !important;
+}
+.activity-dl-info {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+}
+.activity-dl-name {
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 12px;
+    color: var(--text-primary);
+}
+.activity-dl-stats {
+    flex-shrink: 0;
+    font-size: 11px;
+    color: var(--text-muted);
+    white-space: nowrap;
+}
+.activity-dl-bar {
+    width: 100%;
+    height: 4px;
+    background: var(--border);
+    border-radius: 2px;
+    overflow: hidden;
+}
+.activity-dl-fill {
+    height: 100%;
+    background: var(--accent-green, #6a9f4b);
+    border-radius: 2px;
+    transition: width 0.3s ease;
 }
 /* Queue display badge (topbar) */
 .queue-display-badge {
