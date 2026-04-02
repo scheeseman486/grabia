@@ -1320,48 +1320,43 @@ main {
 .batch-btn-danger { color: var(--danger); }
 .batch-btn-danger:hover { background: rgba(255, 107, 107, 0.15); border-color: var(--danger); }
 
-.scan-hash-progress {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    min-width: 80px;
-}
-.scan-hash-bar {
-    flex: 1;
-    height: 6px;
-    background: var(--bg-tertiary);
-    border-radius: 3px;
-    overflow: hidden;
-}
-.scan-hash-fill {
-    height: 100%;
-    background: #9b59b6;
-    border-radius: 3px;
-    transition: width 0.3s ease;
-}
-.scan-hash-pct {
-    font-size: 11px;
-    color: var(--text-muted);
-    min-width: 28px;
-    text-align: right;
-}
 
 .file-status {
     font-size: 12px;
     padding: 2px 8px;
     border-radius: 10px;
     display: inline-block;
+    min-width: 72px;
+    text-align: center;
+    position: relative;
+    overflow: hidden;
+    z-index: 0;
+}
+/* Progress fill bar — driven by --pct custom property */
+.file-status::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    z-index: -1;
+    border-radius: inherit;
+    width: var(--pct, 0%);
+    transition: width 0.3s ease;
 }
 .file-status.pending { background: var(--bg-tertiary); color: var(--text-muted); }
 .file-status.skipped { background: var(--bg-tertiary); color: var(--text-muted); font-style: italic; }
-.file-status.downloading { background: rgba(81, 207, 102, 0.15); color: var(--success); }
+.file-status.queued { background: var(--bg-tertiary); color: var(--text-muted); }
+.file-status.downloading { background: rgba(81, 207, 102, 0.08); color: var(--success); }
+.file-status.downloading::before { background: rgba(81, 207, 102, 0.25); }
 .file-status.completed { background: rgba(81, 207, 102, 0.15); color: var(--success); }
 .file-status.failed { background: rgba(255, 107, 107, 0.15); color: var(--danger); }
 .file-status.conflict { background: rgba(252, 196, 25, 0.15); color: var(--warning); }
 .file-status.unknown { background: rgba(155, 89, 182, 0.15); color: #9b59b6; }
 .file-status.processed { background: rgba(52, 152, 219, 0.15); color: #3498db; }
 .file-status.proc-failed { background: rgba(255, 107, 107, 0.15); color: var(--danger); }
-.file-status.proc-active { background: rgba(52, 152, 219, 0.15); color: #3498db; }
+.file-status.proc-active { background: rgba(52, 152, 219, 0.08); color: #3498db; }
+.file-status.proc-active::before { background: rgba(52, 152, 219, 0.25); }
+.file-status.scanning { background: rgba(155, 89, 182, 0.08); color: #9b59b6; }
+.file-status.scanning::before { background: rgba(155, 89, 182, 0.25); }
 .file-status.scan_pending { background: rgba(155, 89, 182, 0.15); color: #9b59b6; }
 
 /* Processed file expandable rows */

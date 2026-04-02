@@ -253,27 +253,17 @@
         const { entry_id, bytes_done, bytes_total, phase } = data;
         scanFileProgress[entry_id] = { bytes_done, bytes_total, phase };
 
-        // Find the row in the scan queue table and update/add progress bar
+        // Find the row in the scan queue table and update status capsule
         const row = $(`#queue-scan-tbody tr[data-entry-id="${entry_id}"]`);
         if (!row) return;
 
-        let bar = row.querySelector(".scan-hash-progress");
-        if (!bar) {
-            // Insert progress bar into the status cell
-            const statusCell = row.querySelector(".col-status");
-            if (!statusCell) return;
-            bar = document.createElement("div");
-            bar.className = "scan-hash-progress";
-            bar.innerHTML = `<div class="scan-hash-bar"><div class="scan-hash-fill"></div></div><span class="scan-hash-pct"></span>`;
-            statusCell.innerHTML = "";
-            statusCell.appendChild(bar);
-        }
+        let capsule = row.querySelector(".file-status");
+        if (!capsule) return;
 
         const pct = bytes_total > 0 ? Math.min(100, (bytes_done / bytes_total) * 100) : 0;
-        const fill = bar.querySelector(".scan-hash-fill");
-        const label = bar.querySelector(".scan-hash-pct");
-        if (fill) fill.style.width = pct.toFixed(1) + "%";
-        if (label) label.textContent = pct < 100 ? `${pct.toFixed(0)}%` : "verifying";
+        capsule.className = "file-status scanning";
+        capsule.style.setProperty("--pct", pct.toFixed(1) + "%");
+        capsule.textContent = pct < 100 ? `${pct.toFixed(0)}%` : "verifying";
     }
 
     function toggleNotifPopup() {
@@ -2125,8 +2115,9 @@
             || (procStatus === "failed" && f.processing_error);
         const isConflict = f.download_status === "conflict";
         const errorMsg = (procStatus === "failed" && f.processing_error) ? f.processing_error : f.error_message;
+        const pctStyle = getStatusPct(f, statusClass);
         html += `<td class="col-status">` +
-            `<span class="file-status ${statusClass}" ${hasError ? `title="${escapeHtml(errorMsg)}"` : ""}>${displayStatus}</span>` +
+            `<span class="file-status ${statusClass}"${pctStyle}${hasError ? ` title="${escapeHtml(errorMsg)}"` : ""}>${displayStatus}</span>` +
             (hasError && isConflict
                 ? `<span class="file-error-hint clickable" data-conflict-file='${JSON.stringify({id: f.id, name: f.name, size: f.size, error: f.error_message})}' title="Click to resolve conflict">&#9432;</span>`
                 : hasError ? `<span class="file-error-hint" title="${escapeHtml(f.error_message)}">&#9432;</span>` : "") +
@@ -2301,6 +2292,22 @@
 
         // Initial virtual scroll render
         vsRenderVisible();
+    }
+
+    /**
+     * Return a style attribute string with --pct for progress-bar capsules,
+     * or empty string if no progress applies.
+     */
+    function getStatusPct(f, statusClass) {
+        if (statusClass === "downloading" && f.size > 0) {
+            const pct = Math.min(100, (f.downloaded_bytes || 0) / f.size * 100);
+            return ` style="--pct:${pct.toFixed(1)}%"`;
+        }
+        if (statusClass === "proc-active" && f.processing_total > 0) {
+            const pct = Math.min(100, (f.processing_current || 0) / f.processing_total * 100);
+            return ` style="--pct:${pct.toFixed(1)}%"`;
+        }
+        return "";
     }
 
     function formatFileStatus(f) {
@@ -2684,10 +2691,12 @@
         if (statusCell && updates.download_status) {
             statusCell.className = "file-status " + updates.download_status;
             if (updates.download_status === "downloading" && updates.size > 0) {
-                const pct = ((updates.downloaded_bytes / updates.size) * 100).toFixed(1);
-                statusCell.textContent = pct + "%";
+                const pct = Math.min(100, (updates.downloaded_bytes / updates.size) * 100);
+                statusCell.textContent = pct.toFixed(1) + "%";
+                statusCell.style.setProperty("--pct", pct.toFixed(1) + "%");
             } else {
                 statusCell.textContent = updates.download_status;
+                statusCell.style.removeProperty("--pct");
             }
         }
     }
@@ -4108,6 +4117,14 @@
 
         if (tab === "download") {
             const status = item.download_status || "queued";
+            const fileSize = item.size || item.file_size || 0;
+            let statusLabel = status;
+            let statusPctStyle = "";
+            if (status === "downloading" && fileSize > 0) {
+                const pct = Math.min(100, ((item.downloaded_bytes || 0) / fileSize) * 100);
+                statusLabel = pct.toFixed(1) + "%";
+                statusPctStyle = ` style="--pct:${pct.toFixed(1)}%"`;
+            }
             if (byPosition) {
                 html += buildGripCell();
             } else {
@@ -4117,8 +4134,8 @@
                 `<svg viewBox="0 0 16 16" width="14" height="14"><rect x="3" y="7" width="10" height="2" rx="1" fill="currentColor"/></svg></button></td>`;
             html += `<td class="col-name"><div class="file-name-wrap">${renderFileName(fname, bold)}</div></td>`;
             html += `<td class="col-archive-q" title="${escapeHtml(archiveLabel)}">${escapeHtml(archiveLabel)}</td>`;
-            html += `<td class="col-size" style="text-align:right">${formatBytes(item.size || item.file_size || 0)}</td>`;
-            html += `<td class="col-status"><span class="file-status ${status}">${status}</span></td>`;
+            html += `<td class="col-size" style="text-align:right">${formatBytes(fileSize)}</td>`;
+            html += `<td class="col-status"><span class="file-status ${status}"${statusPctStyle}>${statusLabel}</span></td>`;
             if (byPosition) {
                 html += buildPriorityCell(fileId, i === 0, i === lastIdx);
             } else {
@@ -4126,6 +4143,14 @@
             }
         } else if (tab === "processing") {
             const status = item.status || "pending";
+            const statusClass = (status === "running" || status === "processing") ? "proc-active" : status;
+            let statusLabel = status;
+            let statusPctStyle = "";
+            if ((status === "running" || status === "processing") && ongoingProcessing && ongoingProcessing.total > 0) {
+                const pct = Math.min(100, (ongoingProcessing.current / ongoingProcessing.total) * 100);
+                statusLabel = pct.toFixed(1) + "%";
+                statusPctStyle = ` style="--pct:${pct.toFixed(1)}%"`;
+            }
             if (byPosition) {
                 html += buildGripCell();
             } else {
@@ -4134,12 +4159,20 @@
             html += `<td class="col-name"><div class="file-name-wrap">${renderFileName(fname, bold)}</div></td>`;
             html += `<td class="col-archive-q" title="${escapeHtml(archiveLabel)}">${escapeHtml(archiveLabel)}</td>`;
             html += `<td class="col-profile-q" title="${escapeHtml(item.profile_name || "")}">${escapeHtml(item.profile_name || "")}</td>`;
-            html += `<td class="col-status"><span class="file-status ${status}">${status}</span></td>`;
+            html += `<td class="col-status"><span class="file-status ${statusClass}"${statusPctStyle}>${statusLabel}</span></td>`;
         } else {
             const status = item.status || "pending";
+            const statusClass = (status === "running" || status === "scanning") ? "scanning" : status;
+            let statusLabel = status;
+            let statusPctStyle = "";
+            if ((status === "running" || status === "scanning") && ongoingScanning && ongoingScanning.total > 0) {
+                const pct = Math.min(100, (ongoingScanning.current / ongoingScanning.total) * 100);
+                statusLabel = pct.toFixed(1) + "%";
+                statusPctStyle = ` style="--pct:${pct.toFixed(1)}%"`;
+            }
             html += `<td class="col-name"><div class="file-name-wrap">${renderFileName(fname, bold)}</div></td>`;
             html += `<td class="col-archive-q" title="${escapeHtml(archiveLabel)}">${escapeHtml(archiveLabel)}</td>`;
-            html += `<td class="col-status"><span class="file-status ${status}">${status}</span></td>`;
+            html += `<td class="col-status"><span class="file-status ${statusClass}"${statusPctStyle}>${statusLabel}</span></td>`;
         }
 
         tr.innerHTML = html;
