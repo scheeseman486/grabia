@@ -1131,7 +1131,60 @@
         }, 50);
     }
 
+    // Flash state: tracks which elements should be flashing, keyed by a selector string.
+    // Survives virtual scroll re-renders because row builders check this set.
+    const flashingElements = new Map(); // selector -> { on: bool, intervalId }
+
     function flashElement(el, times = 3) {
+        // Determine a stable selector that survives DOM rebuilds
+        const selector = _flashSelector(el);
+        if (!selector) {
+            // Fallback for non-identifiable elements (e.g. settings sections) — direct DOM flash
+            _flashDirect(el, times);
+            return;
+        }
+
+        // If already flashing this selector, skip
+        if (flashingElements.has(selector)) return;
+
+        let flashes = 0;
+        const state = { on: true };
+        el.classList.add("queue-flash");
+
+        const interval = setInterval(() => {
+            flashes++;
+            state.on = !state.on;
+            // Apply to whichever DOM element currently matches (may be a rebuilt node)
+            const current = document.querySelector(selector);
+            if (current) current.classList.toggle("queue-flash", state.on);
+            if (flashes >= times * 2) {
+                clearInterval(interval);
+                flashingElements.delete(selector);
+                const final = document.querySelector(selector);
+                if (final) final.classList.remove("queue-flash");
+            }
+        }, 200);
+
+        state.intervalId = interval;
+        flashingElements.set(selector, state);
+    }
+
+    /** Build a selector that can re-find this element after a virtual scroll rebuild. */
+    function _flashSelector(el) {
+        if (el.dataset?.fileId) return `tr[data-file-id="${el.dataset.fileId}"]`;
+        if (el.dataset?.entryId) return `tr[data-entry-id="${el.dataset.entryId}"]`;
+        if (el.id) return `#${el.id}`;
+        return null;
+    }
+
+    /** Check if a row should have the flash class applied at build time. */
+    function isFlashing(el) {
+        const sel = _flashSelector(el);
+        return sel && flashingElements.has(sel) && flashingElements.get(sel).on;
+    }
+
+    /** Direct DOM flash for elements that don't survive rebuilds (rare fallback). */
+    function _flashDirect(el, times) {
         let flashes = 0;
         const interval = setInterval(() => {
             el.classList.toggle("queue-flash");
@@ -2105,8 +2158,9 @@
     function buildFileRow(f, isPriority, queuedFiles, lastQueuedIdx) {
         const tr = document.createElement("tr");
         tr.dataset.fileId = f.id;
+        if (isFlashing(tr)) tr.classList.add("queue-flash");
 
-        if (f.change_status) tr.className = "file-row-" + f.change_status;
+        if (f.change_status) tr.className += (tr.className ? " " : "") + "file-row-" + f.change_status;
 
         const changeIcon = f.change_status
             ? `<span class="change-info ${f.change_status}" aria-label="${escapeHtml(f.change_detail)}">` +
@@ -4231,6 +4285,7 @@
         else tr.dataset.entryId = item.id;
         if (isCompleting) tr.className = "queue-completing";
         if (selectedQueueIds.has(selKey)) tr.classList.add("selected");
+        if (isFlashing(tr)) tr.classList.add("queue-flash");
 
         let html = "";
 
