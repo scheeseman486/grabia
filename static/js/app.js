@@ -4225,12 +4225,10 @@
         tr.addEventListener("dblclick", (e) => {
             if (e.target.closest("button, .queue-toggle")) return;
             if (archiveId) {
-                openArchiveDetail(parseInt(archiveId));
                 if (tab === "download" && fileId) {
-                    setTimeout(() => {
-                        const row = $(`#file-list tr[data-file-id="${fileId}"]`);
-                        if (row) flashElement(row);
-                    }, 300);
+                    navigateToFile(parseInt(archiveId), parseInt(fileId));
+                } else {
+                    openArchiveDetail(parseInt(archiveId));
                 }
             }
         });
