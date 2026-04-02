@@ -91,8 +91,14 @@ def queue_archive_processing(archive_id, profile_id, file_ids=None, options_over
 
     pending = db.count_pending_processing_jobs()
 
-    # Flash notification for processing queued
+    # Log the queuing event so it shows up in the Activity Log
     archive_name = archive["title"] or archive["identifier"] if archive else f"Archive #{archive_id}"
+    activity.log(act_job_id, "info",
+                 f"Queued \"{archive_name}\" for processing",
+                 archive_id=archive_id)
+    activity.flush()
+
+    # Flash notification for processing queued
     notif_id = db.create_notification(
         f'Queued "{archive_name}" for processing',
         type="info", job_id=act_job_id,

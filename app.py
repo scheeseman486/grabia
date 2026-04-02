@@ -696,6 +696,12 @@ def _start_archive_scan(archive_id):
     # Create activity job
     act_job_id = activity.start_job("scan", archive_id=archive_id, group_id=group_id)
 
+    # Log the scan queuing event so it shows up in the Activity Log
+    activity.log(act_job_id, "info",
+                 f"Scanning \"{archive_name}\"",
+                 archive_id=archive_id)
+    activity.flush()
+
     # Flash notification for scan start
     notif_id = db.create_notification(
         f'Scanning "{archive_name}"...',
