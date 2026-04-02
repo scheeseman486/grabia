@@ -3780,7 +3780,7 @@
                 const pctText = dl.size > 0 ? pct.toFixed(1) + "%" : "";
                 const speedText = dl.speed ? formatSpeed(dl.speed) : "";
                 const sizeText = dl.size > 0 ? formatBytes(dl.size) : "";
-                html += `<div class="activity-ongoing-row activity-dl-row" data-navigate="download">`;
+                html += `<div class="activity-ongoing-row activity-dl-row" data-navigate="download" data-file-id="${dl.file_id || ""}">`;
                 html += `<div class="activity-dl-info">`;
                 html += `<span class="activity-dl-name" title="${fname}">${fname}</span>`;
                 html += `<span class="activity-dl-stats">${pctText}${sizeText ? " of " + sizeText : ""}${speedText ? " — " + speedText : ""}</span>`;
@@ -3795,7 +3795,7 @@
             const fname = escapeHtml(ongoingProcessing.filename || "");
             const pct = ongoingProcessing.total > 0 ? Math.min(100, (ongoingProcessing.current / ongoingProcessing.total) * 100) : 0;
             const progText = ongoingProcessing.total > 0 ? `${ongoingProcessing.current}/${ongoingProcessing.total}` : "";
-            html += `<div class="activity-ongoing-row activity-dl-row" data-navigate="processing">`;
+            html += `<div class="activity-ongoing-row activity-dl-row" data-navigate="processing" data-archive-id="${ongoingProcessing.archive_id || ""}">`;
             html += `<div class="activity-dl-info">`;
             html += `<span class="activity-dl-name"><strong>Processing</strong>${fname ? " — " + fname : ""}</span>`;
             html += `<span class="activity-dl-stats">${progText}`;
@@ -3814,7 +3814,7 @@
             const pct = ongoingScanning.total > 0 ? Math.min(100, (ongoingScanning.current / ongoingScanning.total) * 100) : 0;
             const progText = ongoingScanning.total > 0 ? `${ongoingScanning.current}/${ongoingScanning.total}` : "";
             const phaseText = ongoingScanning.phase || "";
-            html += `<div class="activity-ongoing-row activity-dl-row" data-navigate="scan">`;
+            html += `<div class="activity-ongoing-row activity-dl-row" data-navigate="scan" data-archive-id="${ongoingScanning.archive_id || ""}">`;
             html += `<div class="activity-dl-info">`;
             html += `<span class="activity-dl-name"><strong>Scanning</strong>${phaseText ? " — " + escapeHtml(phaseText) : ""}</span>`;
             html += `<span class="activity-dl-stats">${progText}`;
@@ -3831,12 +3831,19 @@
         container.innerHTML = html;
         emptyEl.style.display = html ? "none" : "";
 
-        // Click handlers to navigate to queue tabs
+        // Click handlers to navigate to queue tabs and scroll to the item
         container.querySelectorAll(".activity-ongoing-row").forEach((row) => {
-            row.addEventListener("click", (e) => {
+            row.addEventListener("click", async (e) => {
                 if (e.target.closest(".activity-cancel-btn")) return;
                 const tab = row.dataset.navigate;
-                if (tab) openQueues(tab);
+                if (!tab) return;
+                const fileId = row.dataset.fileId;
+                const archiveId = row.dataset.archiveId;
+                await openQueues(tab);
+                // After queue loads, scroll to and flash the relevant row
+                requestAnimationFrame(() => {
+                    scrollToQueueItemAndFlash(tab, { fileId, archiveId });
+                });
             });
         });
         // Cancel buttons
@@ -4158,6 +4165,45 @@
         // Reset virtual scroll range so it fully re-renders
         qsLastRange[tab] = null;
         qsVsRenderVisible(tab);
+    }
+
+    /**
+     * Scroll to a specific item in a queue tab's virtual scroll and flash it.
+     * For download tab, pass fileId; for processing/scan, pass archiveId to match first entry.
+     */
+    function scrollToQueueItemAndFlash(tab, { fileId, archiveId } = {}) {
+        const view = queueView[tab] || [];
+        let idx = -1;
+        if (tab === "download" && fileId) {
+            idx = view.findIndex(item => (item.file_id || item.id) == fileId);
+        } else if (archiveId) {
+            idx = view.findIndex(item => item.archive_id == archiveId);
+        }
+        if (idx === -1) return;
+
+        const abbr = tab === "download" ? "dl" : tab === "processing" ? "proc" : "scan";
+        const wrap = $(`#queue-${abbr}-wrap`);
+        if (!wrap) return;
+
+        // Scroll so the target row is centered
+        const targetTop = idx * QS_ROW_HEIGHT;
+        wrap.scrollTop = targetTop - wrap.clientHeight / 2 + QS_ROW_HEIGHT / 2;
+
+        // Force re-render at the new scroll position, then flash
+        qsLastRange[tab] = null;
+        qsVsRenderVisible(tab);
+
+        setTimeout(() => {
+            const tbody = $(`#queue-${abbr}-tbody`);
+            if (!tbody) return;
+            let row;
+            if (tab === "download" && fileId) {
+                row = tbody.querySelector(`tr[data-file-id="${fileId}"]`);
+            } else if (archiveId) {
+                row = tbody.querySelector(`tr[data-archive-id="${archiveId}"]`);
+            }
+            if (row) flashElement(row);
+        }, 50);
     }
 
     // Render only the visible slice of rows in a queue table (virtual scroll)
