@@ -275,6 +275,56 @@
     const $ = (sel) => document.querySelector(sel);
     const $$ = (sel) => document.querySelectorAll(sel);
 
+    // ── Context Menu ────────────────────────────────────────────────
+
+    function showContextMenu(e, items) {
+        e.preventDefault();
+        const menu = $("#context-menu");
+        const ul = $("#context-menu-items");
+        ul.innerHTML = "";
+
+        for (const item of items) {
+            if (item.separator) {
+                const sep = document.createElement("li");
+                sep.className = "context-menu-separator";
+                ul.appendChild(sep);
+                continue;
+            }
+            const li = document.createElement("li");
+            li.className = "context-menu-item"
+                + (item.danger ? " danger" : "")
+                + (item.disabled ? " disabled" : "");
+            li.textContent = item.label;
+            if (!item.disabled) {
+                li.addEventListener("click", () => {
+                    hideContextMenu();
+                    item.action();
+                });
+            }
+            ul.appendChild(li);
+        }
+
+        menu.style.display = "";
+
+        // Position at cursor, clamped to viewport
+        const rect = menu.getBoundingClientRect();
+        let x = e.clientX;
+        let y = e.clientY;
+        if (x + rect.width > window.innerWidth) x = window.innerWidth - rect.width - 4;
+        if (y + rect.height > window.innerHeight) y = window.innerHeight - rect.height - 4;
+        menu.style.left = x + "px";
+        menu.style.top = y + "px";
+    }
+
+    function hideContextMenu() {
+        $("#context-menu").style.display = "none";
+    }
+
+    // Dismiss on click anywhere, Escape, or scroll
+    document.addEventListener("click", hideContextMenu);
+    document.addEventListener("keydown", (e) => { if (e.key === "Escape") hideContextMenu(); });
+    document.addEventListener("scroll", hideContextMenu, true);
+
     const pageHome = $("#page-home");
     const pageDetail = $("#page-detail");
     const archiveListEl = $("#archive-list");
@@ -285,9 +335,6 @@
     const speedDisplay = $("#speed-display");
     const sparkCanvas = $("#speed-sparkline");
     const sparkCtx = sparkCanvas.getContext("2d");
-    const globalProgress = $("#global-progress");
-    const progressFill = $("#progress-fill");
-    const progressText = $("#progress-text");
 
     // --- Speed sparkline ---
 
@@ -826,7 +873,6 @@
         }
         updateQueueDisplayText();
         if (activeDownloads.length > 0 && dlState === "running") startUiTick();
-        updateGlobalProgress(data.progress);
     }
 
 
@@ -1110,22 +1156,6 @@
         }, 100);
     }
 
-    function updateGlobalProgress(progress) {
-        if (!progress || progress.total_files === 0) {
-            globalProgress.style.display = "none";
-            return;
-        }
-        globalProgress.style.display = "flex";
-        const pct = progress.total_size > 0
-            ? Math.min(100, (progress.downloaded_bytes / progress.total_size) * 100)
-            : 0;
-        progressFill.style.width = pct.toFixed(1) + "%";
-        progressText.textContent =
-            `${progress.completed_files}/${progress.total_files} files \u2022 ` +
-            `${formatBytes(progress.downloaded_bytes)} / ${formatBytes(progress.total_size)} \u2022 ` +
-            `${pct.toFixed(1)}%`;
-    }
-
     async function refreshStatus() {
         try {
             const data = await api("GET", "/api/download/status");
@@ -1199,14 +1229,6 @@
     let selectedArchiveIds = new Set();
 
     function updateArchiveBatchActions() {
-        const bar = $("#archive-batch-actions");
-        if (!bar) return;
-        if (selectedArchiveIds.size > 0) {
-            bar.style.display = "";
-            $("#archive-batch-count").textContent = selectedArchiveIds.size + (selectedArchiveIds.size === 1 ? " archive selected" : " archives selected");
-        } else {
-            bar.style.display = "none";
-        }
         // Update visual selection on archive items
         $$("#archive-list .archive-item").forEach(li => {
             li.classList.toggle("selected", selectedArchiveIds.has(parseInt(li.dataset.id)));
@@ -1574,6 +1596,36 @@
         );
     }
 
+    // --- Archive List Context Menu ---
+    archiveListEl.addEventListener("contextmenu", (e) => {
+        const li = e.target.closest(".archive-item");
+        if (!li) return;
+        e.preventDefault();
+        const id = parseInt(li.dataset.id);
+
+        // Modifier key handling: ctrl/shift behave as single-click before opening menu
+        if (e.ctrlKey || e.metaKey || e.shiftKey) {
+            const visibleArchives = getVisibleArchives();
+            const idx = visibleArchives.findIndex(a => a.id === id);
+            if (idx !== -1) handleArchiveSelect(id, idx, e);
+        } else if (!selectedArchiveIds.has(id)) {
+            selectedArchiveIds.clear();
+            selectedArchiveIds.add(id);
+            updateArchiveBatchActions();
+        }
+
+        const n = selectedArchiveIds.size;
+        showContextMenu(e, [
+            { label: "Scan Existing Files", action: archiveBatchScan },
+            { label: "Process Archive", action: archiveBatchProcess },
+            { label: "Retry All Files", action: archiveBatchRetry },
+            { separator: true },
+            { label: `Delete Folders (${n})`, action: archiveBatchDeleteFolders, danger: true },
+            { separator: true },
+            { label: "Deselect", action: () => { selectedArchiveIds.clear(); updateArchiveBatchActions(); } },
+        ]);
+    });
+
     async function moveArchive(fromIdx, toIdx) {
         if (toIdx < 0 || toIdx >= archives.length) return;
         // Only allow reorder within the same enabled/disabled group
@@ -1838,23 +1890,8 @@
     }
 
     function updateBatchActions() {
-        const bar = $("#batch-actions");
-        if (!bar) return;
-        if (selectedFileIds.size > 0) {
-            bar.style.display = "";
-            $("#batch-count").textContent = selectedFileIds.size + (selectedFileIds.size === 1 ? " file selected" : " files selected");
-            // Update Queue/Unqueue button label based on selected files' queue state
-            const queueBtn = $("#batch-queue");
-            if (queueBtn) {
-                const allQueued = [...selectedFileIds].every(id => {
-                    const f = vsFiles.find(f => f.id === id);
-                    return f && f.queue_position != null;
-                });
-                queueBtn.textContent = allQueued ? "Unqueue" : "Queue";
-            }
-        } else {
-            bar.style.display = "none";
-        }
+        // Batch bar removed — just update visual selection classes
+        updateFileSelectionClasses();
     }
 
     // --- File table header (dynamic based on sort mode) ---
@@ -3223,6 +3260,42 @@
         updateFileSelectionClasses();
     }
 
+    // --- File List Context Menu ---
+    fileListEl.addEventListener("contextmenu", (e) => {
+        const tr = e.target.closest("tr[data-file-id]");
+        if (!tr) return;
+        e.preventDefault();
+        const fid = parseInt(tr.dataset.fileId);
+
+        // Modifier key handling: ctrl/shift behave as single-click before opening menu
+        if (e.ctrlKey || e.metaKey || e.shiftKey) {
+            const f = vsFiles.find(f => f.id === fid);
+            if (f) handleFileSelect(f, e);
+        } else if (!selectedFileIds.has(fid)) {
+            selectedFileIds.clear();
+            selectedFileIds.add(fid);
+            updateBatchActions();
+            updateFileSelectionClasses();
+        }
+
+        const n = selectedFileIds.size;
+        const allQueued = [...selectedFileIds].every(id => {
+            const f = vsFiles.find(f => f.id === id);
+            return f && f.queue_position != null;
+        });
+
+        showContextMenu(e, [
+            { label: allQueued ? `Unqueue (${n})` : `Queue (${n})`, action: batchQueueFiles },
+            { label: "Scan", action: batchScanFiles },
+            { label: "Process", action: batchProcessFiles },
+            { label: "Retry", action: batchRetryFiles },
+            { separator: true },
+            { label: `Delete (${n})`, action: batchDeleteFiles, danger: true },
+            { separator: true },
+            { label: "Deselect", action: () => { selectedFileIds.clear(); updateBatchActions(); updateFileSelectionClasses(); } },
+        ]);
+    });
+
     // --- Confirmation System ---
 
     // Keys and their default-enabled state (true = warn by default)
@@ -4245,6 +4318,34 @@
             }
         });
 
+        // Right-click: context menu
+        tr.addEventListener("contextmenu", (e) => {
+            e.preventDefault();
+
+            // Modifier key handling: ctrl/shift behave as single-click before opening menu
+            if (e.ctrlKey || e.metaKey || e.shiftKey) {
+                handleQueueSelect(tab, i, e);
+            } else if (!selectedQueueIds.has(selKey)) {
+                selectedQueueIds.clear();
+                selectedQueueIds.add(selKey);
+                renderQueueTable(tab);
+            }
+
+            const n = selectedQueueIds.size;
+            const byPos = isQueueSortedByPosition(tab);
+            const items = [
+                { label: `Remove from Queue (${n})`, action: () => batchRemoveFromQueue(tab) },
+            ];
+            if (byPos) {
+                items.push({ label: "Move to Top", action: () => batchMoveQueue(tab, "top") });
+                items.push({ label: "Move to Bottom", action: () => batchMoveQueue(tab, "bottom") });
+            }
+            items.push({ separator: true });
+            items.push({ label: "Deselect", action: () => { selectedQueueIds.clear(); renderQueueTable(tab); } });
+
+            showContextMenu(e, items);
+        });
+
         // Queue remove toggle (download only)
         const queueBtn = tr.querySelector(".queue-toggle");
         if (queueBtn) {
@@ -4394,6 +4495,55 @@
 
         wrap.scrollTop = savedScroll;
         applyTruncationTooltips(tbody);
+    }
+
+    // --- Queue Batch Actions (context menu) ---
+
+    async function batchRemoveFromQueue(tab) {
+        if (selectedQueueIds.size === 0) return;
+        const ids = Array.from(selectedQueueIds);
+
+        if (tab === "download") {
+            // Download queue: unqueue each file
+            let done = 0;
+            for (const fid of ids) {
+                try { await api("POST", `/api/files/${fid}/queue`, { queued: false }); done++; } catch (e) {}
+            }
+            addNotification(`Removed ${done} file(s) from download queue`, "info");
+            queueStale.download = true;
+            loadQueueTab("download");
+            refreshQueueCounts();
+        } else if (tab === "processing") {
+            // Processing queue: cancel selected entries
+            const result = await api("POST", "/api/processing/queue/remove", { entry_ids: ids });
+            addNotification(`Removed ${result.removed || 0} entry/entries from processing queue`, "info");
+            queueStale.processing = true;
+            loadQueueTab("processing");
+            refreshQueueCounts();
+        } else if (tab === "scan") {
+            // Scan queue: cancel selected entries
+            const result = await api("POST", "/api/scan/queue/remove", { entry_ids: ids });
+            addNotification(`Removed ${result.removed || 0} entry/entries from scan queue`, "info");
+            queueStale.scan = true;
+            loadQueueTab("scan");
+            refreshQueueCounts();
+        }
+
+        selectedQueueIds.clear();
+    }
+
+    async function batchMoveQueue(tab, position) {
+        if (selectedQueueIds.size === 0) return;
+        const ids = Array.from(selectedQueueIds);
+        const targetPos = position === "top" ? 0 : 999999999;
+
+        if (tab === "download") {
+            await api("POST", "/api/download/queue/reorder", { file_ids: ids, position: targetPos });
+        } else if (tab === "processing") {
+            await api("POST", "/api/processing/queue/reorder", { entry_ids: ids, position: targetPos });
+        }
+
+        loadQueueTab(tab);
     }
 
     function moveQueueItem(tab, fromIdx, direction) {
@@ -5401,18 +5551,6 @@
             }
         });
 
-        // Archive batch deselect
-        $("#archive-batch-deselect").addEventListener("click", () => {
-            selectedArchiveIds.clear();
-            updateArchiveBatchActions();
-        });
-
-        // Archive batch actions
-        $("#archive-batch-scan").addEventListener("click", archiveBatchScan);
-        $("#archive-batch-process").addEventListener("click", archiveBatchProcess);
-        $("#archive-batch-retry").addEventListener("click", archiveBatchRetry);
-        $("#archive-batch-delete-folders").addEventListener("click", archiveBatchDeleteFolders);
-
         // Archive controls
         $("#btn-retry-all-archives").addEventListener("click", retryAllArchives);
         $("#btn-refresh-all-meta").addEventListener("click", refreshAllMetadata);
@@ -5476,21 +5614,6 @@
         $("#btn-scan-files").addEventListener("click", scanExistingFiles);
         $("#btn-process-all-files").addEventListener("click", openProcessArchiveModal);
         $("#btn-clear-changes").addEventListener("click", clearChanges);
-
-        // File batch deselect
-        $("#batch-deselect").addEventListener("click", () => {
-            selectedFileIds.clear();
-            updateBatchActions();
-            vsLastRange = null;
-            vsRenderVisible();
-        });
-
-        // Batch actions
-        $("#batch-queue").addEventListener("click", batchQueueFiles);
-        $("#batch-scan").addEventListener("click", batchScanFiles);
-        $("#batch-process").addEventListener("click", batchProcessFiles);
-        $("#batch-retry").addEventListener("click", batchRetryFiles);
-        $("#batch-delete").addEventListener("click", batchDeleteFiles);
 
         // Process Archive modal
         $("#btn-process-cancel").addEventListener("click", () => $("#modal-process-archive").classList.remove("open"));

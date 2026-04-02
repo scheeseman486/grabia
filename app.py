@@ -1671,6 +1671,34 @@ def clear_scan_queue():
     return jsonify({"ok": True, "cleared": count})
 
 
+@app.route("/api/processing/queue/remove", methods=["POST"])
+@login_required
+def remove_processing_queue_entries():
+    """Remove specific pending entries from the processing queue by ID."""
+    data = request.json
+    entry_ids = data.get("entry_ids", [])
+    if not entry_ids:
+        return jsonify({"ok": False, "error": "No entry_ids provided"}), 400
+    count = db.cancel_processing_entries(entry_ids)
+    broadcast_sse("queue_update", {"queue_type": "processing", "action": "removed",
+                                    "data": {"entry_ids": entry_ids, "removed": count}})
+    return jsonify({"ok": True, "removed": count})
+
+
+@app.route("/api/scan/queue/remove", methods=["POST"])
+@login_required
+def remove_scan_queue_entries():
+    """Remove specific pending entries from the scan queue by ID."""
+    data = request.json
+    entry_ids = data.get("entry_ids", [])
+    if not entry_ids:
+        return jsonify({"ok": False, "error": "No entry_ids provided"}), 400
+    count = db.cancel_scan_entries(entry_ids)
+    broadcast_sse("queue_update", {"queue_type": "scan", "action": "removed",
+                                    "data": {"entry_ids": entry_ids, "removed": count}})
+    return jsonify({"ok": True, "removed": count})
+
+
 @app.route("/api/download/bandwidth", methods=["POST"])
 @login_required
 def set_bandwidth():

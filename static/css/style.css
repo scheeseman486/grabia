@@ -410,36 +410,6 @@ body {
 
 /* ===== Global Progress ===== */
 
-.global-progress {
-    padding: 6px 16px;
-    background: var(--bg-secondary);
-    border-bottom: 1px solid var(--border);
-    display: flex;
-    align-items: center;
-    gap: 12px;
-    flex-shrink: 0;
-}
-.progress-bar {
-    flex: 1;
-    height: 6px;
-    background: var(--progress-bg);
-    border-radius: 3px;
-    overflow: hidden;
-}
-.progress-fill {
-    height: 100%;
-    background: var(--progress-fill);
-    border-radius: 3px;
-    transition: width 0.3s;
-    width: 0%;
-}
-.progress-text {
-    font-size: 12px;
-    color: var(--text-secondary);
-    min-width: 180px;
-    text-align: right;
-    font-variant-numeric: tabular-nums;
-}
 
 /* ===== Main Content ===== */
 
@@ -1294,47 +1264,6 @@ main {
 .rename-cancel:hover { background: rgba(255, 107, 107, 0.15); }
 
 /* Batch action bar */
-.batch-actions {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    padding: 6px 12px;
-    margin-top: 6px;
-    flex-shrink: 0;
-    background: rgba(81, 207, 102, 0.08);
-    border: 1px solid rgba(81, 207, 102, 0.25);
-    border-radius: 6px;
-    font-size: 13px;
-}
-.batch-deselect {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    width: 20px;
-    height: 20px;
-    padding: 0;
-    border: none;
-    border-radius: 4px;
-    background: transparent;
-    color: var(--text-muted);
-    cursor: pointer;
-    flex-shrink: 0;
-}
-.batch-deselect:hover {
-    background: rgba(255, 107, 107, 0.15);
-    color: var(--danger);
-}
-.batch-count {
-    font-weight: 600;
-    color: var(--text-primary);
-    margin-right: 4px;
-}
-.batch-btn {
-    padding: 4px 10px;
-    font-size: 12px;
-}
-.batch-btn-danger { color: var(--danger); }
-.batch-btn-danger:hover { background: rgba(255, 107, 107, 0.15); border-color: var(--danger); }
 
 
 .file-status {
@@ -1797,6 +1726,8 @@ tr.processed-detail-row td { padding: 0 !important; }
     display: flex;
     align-items: center;
     flex-shrink: 0;
+    position: relative;
+    z-index: 1;
 }
 .lock-indicator .lock-icon {
     display: none;
@@ -2998,4 +2929,54 @@ tr.processed-detail-row td { padding: 0 !important; }
     opacity: 0.4;
     pointer-events: none;
     transition: opacity 0.3s;
+}
+
+/* ── Context Menu ──────────────────────────────────────────── */
+.context-menu {
+    position: fixed;
+    z-index: 10000;
+    min-width: 180px;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    box-shadow: 0 6px 20px rgba(0, 0, 0, 0.3);
+    padding: 4px 0;
+    font-size: 13px;
+}
+
+.context-menu ul {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+}
+
+.context-menu-item {
+    padding: 6px 16px;
+    cursor: pointer;
+    color: var(--text-primary);
+    white-space: nowrap;
+}
+
+.context-menu-item:hover {
+    background: var(--accent-bg, rgba(99, 102, 241, 0.12));
+}
+
+.context-menu-item.danger {
+    color: var(--danger);
+}
+
+.context-menu-item.danger:hover {
+    background: rgba(255, 107, 107, 0.15);
+}
+
+.context-menu-item.disabled {
+    color: var(--text-muted);
+    pointer-events: none;
+    opacity: 0.5;
+}
+
+.context-menu-separator {
+    height: 1px;
+    background: var(--border);
+    margin: 4px 8px;
 }

@@ -2317,6 +2317,36 @@ def cancel_all_pending_processing():
         return count
 
 
+def cancel_processing_entries(entry_ids):
+    """Cancel specific pending processing queue entries by ID. Returns count cancelled."""
+    if not entry_ids:
+        return 0
+    with _db() as conn:
+        placeholders = ",".join("?" for _ in entry_ids)
+        conn.execute(
+            f"UPDATE processing_queue SET status = 'cancelled', updated_at = ? WHERE id IN ({placeholders}) AND status = 'pending'",
+            (time.time(), *entry_ids),
+        )
+        count = conn.execute("SELECT changes()").fetchone()[0]
+        conn.commit()
+        return count
+
+
+def cancel_scan_entries(entry_ids):
+    """Cancel specific pending scan queue entries by ID. Returns count cancelled."""
+    if not entry_ids:
+        return 0
+    with _db() as conn:
+        placeholders = ",".join("?" for _ in entry_ids)
+        conn.execute(
+            f"UPDATE scan_queue SET status = 'cancelled' WHERE id IN ({placeholders}) AND status = 'pending'",
+            (*entry_ids,),
+        )
+        count = conn.execute("SELECT changes()").fetchone()[0]
+        conn.commit()
+        return count
+
+
 def count_pending_queue_entries_for_job(job_id):
     """Return the number of pending processing queue entries for a given job."""
     with _db() as conn:

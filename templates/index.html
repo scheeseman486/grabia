@@ -53,6 +53,10 @@
         </div>
         <div class="topbar-center">
             <button class="queue-display state-stopped" id="queue-display" title="View queues">
+                <span id="lock-indicator" class="lock-indicator lock-secure" title="Downloads use HTTPS">
+                    <svg class="lock-icon lock-icon-secure" viewBox="0 0 24 24" width="14" height="14"><path d="M18 8h-1V6c0-2.76-2.24-5-5-5S7 3.24 7 6v2H6c-1.1 0-2 .9-2 2v10c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V10c0-1.1-.9-2-2-2zM12 17c-1.1 0-2-.9-2-2s.9-2 2-2 2 .9 2 2-.9 2-2 2zM9 8V6c0-1.66 1.34-3 3-3s3 1.34 3 3v2H9z" fill="currentColor"/></svg>
+                    <svg class="lock-icon lock-icon-broken" viewBox="0 0 24 24" width="14" height="14"><path d="M18 8h-1V6c0-2.76-2.24-5-5-5S7 3.24 7 6h2c0-1.66 1.34-3 3-3s3 1.34 3 3v2H6c-1.1 0-2 .9-2 2v10c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V10c0-1.1-.9-2-2-2zM12 17c-1.1 0-2-.9-2-2s.9-2 2-2 2 .9 2 2-.9 2-2 2z" fill="currentColor"/></svg>
+                </span>
                 <span class="queue-display-text" id="queue-display-text">Idle</span>
                 <span class="queue-display-cycle" id="queue-display-cycle" style="display:none" title="Click to cycle through active tasks"></span>
                 <span class="queue-display-badge" id="queue-display-badge" style="display:none"></span>
@@ -102,16 +106,6 @@
             </button>
         </div>
     </header>
-
-    <!-- Progress Bar -->
-    <div id="global-progress" class="global-progress" style="display:none;">
-        <div class="progress-bar"><div class="progress-fill" id="progress-fill"></div></div>
-        <span id="lock-indicator" class="lock-indicator lock-secure" title="Downloads use HTTPS">
-            <svg class="lock-icon lock-icon-secure" viewBox="0 0 24 24" width="14" height="14"><path d="M18 8h-1V6c0-2.76-2.24-5-5-5S7 3.24 7 6v2H6c-1.1 0-2 .9-2 2v10c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V10c0-1.1-.9-2-2-2zM12 17c-1.1 0-2-.9-2-2s.9-2 2-2 2 .9 2 2-.9 2-2 2zM9 8V6c0-1.66 1.34-3 3-3s3 1.34 3 3v2H9z" fill="currentColor"/></svg>
-            <svg class="lock-icon lock-icon-broken" viewBox="0 0 24 24" width="14" height="14"><path d="M18 8h-1V6c0-2.76-2.24-5-5-5S7 3.24 7 6h2c0-1.66 1.34-3 3-3s3 1.34 3 3v2H6c-1.1 0-2 .9-2 2v10c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V10c0-1.1-.9-2-2-2zM12 17c-1.1 0-2-.9-2-2s.9-2 2-2 2 .9 2 2-.9 2-2 2z" fill="currentColor"/></svg>
-        </span>
-        <div class="progress-text" id="progress-text"></div>
-    </div>
 
     <!-- Main Content -->
     <main id="main-content">
@@ -163,14 +157,6 @@
             </div>
             <div class="archive-list-wrap">
                 <ul id="archive-list" class="archive-list"></ul>
-            </div>
-            <div class="batch-actions" id="archive-batch-actions" style="display:none">
-                <button class="batch-deselect" id="archive-batch-deselect" title="Deselect all"><svg viewBox="0 0 24 24" width="14" height="14"><path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z" fill="currentColor"/></svg></button>
-                <span class="batch-count" id="archive-batch-count">0 selected</span>
-                <button class="action-btn batch-btn" id="archive-batch-scan" title="Scan selected archives for existing files">Scan Existing Files</button>
-                <button class="action-btn batch-btn" id="archive-batch-process" title="Process selected archives">Process Archive</button>
-                <button class="action-btn batch-btn" id="archive-batch-retry" title="Retry all failed files in selected archives">Retry All Files</button>
-                <button class="action-btn batch-btn batch-btn-danger" id="archive-batch-delete-folders" title="Delete download folders from disk">Delete Folder(s)</button>
             </div>
         </section>
 
@@ -234,15 +220,6 @@
                     </thead>
                     <tbody id="file-list"></tbody>
                 </table>
-            </div>
-            <div class="batch-actions" id="batch-actions" style="display:none">
-                <button class="batch-deselect" id="batch-deselect" title="Deselect all"><svg viewBox="0 0 24 24" width="14" height="14"><path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z" fill="currentColor"/></svg></button>
-                <span class="batch-count" id="batch-count">0 selected</span>
-                <button class="action-btn batch-btn" id="batch-queue" title="Queue or unqueue selected files">Queue</button>
-                <button class="action-btn batch-btn" id="batch-scan" title="Scan selected files against disk">Scan</button>
-                <button class="action-btn batch-btn" id="batch-process" title="Process selected files">Process</button>
-                <button class="action-btn batch-btn" id="batch-retry" title="Retry failed among selected">Retry</button>
-                <button class="action-btn batch-btn batch-btn-danger" id="batch-delete" title="Delete selected files">Delete</button>
             </div>
         </section>
 
@@ -1012,6 +989,9 @@
         <div class="conn-throbber-dot"></div>
     </div>
     <div id="toast-container" class="toast-container"></div>
+    <div id="context-menu" class="context-menu" style="display:none">
+        <ul id="context-menu-items"></ul>
+    </div>
     <script src="{{ static_url('js/app.js') }}"></script>
 </body>
 </html>
