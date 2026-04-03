@@ -1351,6 +1351,33 @@
             </div>
         `;
 
+        // Drag-to-group: make archive items draggable
+        li.draggable = true;
+        li.addEventListener("dragstart", (e) => {
+            if (e.target.closest("button, .archive-actions, .queue-toggle")) {
+                e.preventDefault(); return;
+            }
+            // Drag all selected archives, or just this one
+            if (selectedArchiveIds.has(a.id) && selectedArchiveIds.size > 1) {
+                dragSrcId = Array.from(selectedArchiveIds);
+            } else {
+                dragSrcId = [a.id];
+            }
+            dragSrcGroupId = a.group_id || null;
+            isDragging = true;
+            li.classList.add("dragging");
+            e.dataTransfer.effectAllowed = "move";
+            e.dataTransfer.setData("text/plain", ""); // required for Firefox
+        });
+        li.addEventListener("dragend", () => {
+            li.classList.remove("dragging");
+            isDragging = false;
+            dragSrcId = null;
+            dragSrcGroupId = null;
+            // Remove all drag-over highlights
+            $$("#archive-list .drag-over-group").forEach(el => el.classList.remove("drag-over-group"));
+        });
+
         // Double-click to open archive detail
         li.addEventListener("dblclick", (e) => {
             if (e.target.closest("button, .archive-actions, .archive-grip, .queue-toggle")) return;
@@ -1454,6 +1481,30 @@
             archiveListEl.appendChild(buildArchiveItem(a, idx, ungrouped));
         });
 
+        // Ungroup drop zone — visible only when groups exist, accepts drags to remove from group
+        if (sortedGroups.length > 0) {
+            const dropZone = document.createElement("li");
+            dropZone.className = "ungroup-drop-zone";
+            dropZone.innerHTML = '<div class="ungroup-divider">Ungrouped</div>';
+            dropZone.addEventListener("dragover", (e) => {
+                if (!isDragging) return;
+                e.preventDefault();
+                e.dataTransfer.dropEffect = "move";
+                dropZone.classList.add("drag-over-group");
+            });
+            dropZone.addEventListener("dragleave", () => dropZone.classList.remove("drag-over-group"));
+            dropZone.addEventListener("drop", async (e) => {
+                e.preventDefault();
+                dropZone.classList.remove("drag-over-group");
+                if (!dragSrcId) return;
+                for (const aid of dragSrcId) {
+                    try { await api("POST", `/api/archives/${aid}/group`, { group_id: null }); } catch (e) {}
+                }
+                await refreshArchives();
+            });
+            archiveListEl.appendChild(dropZone);
+        }
+
         sortedGroups.forEach((g, gIdx) => {
             const groupArchives = sortArchives(archives.filter((a) => a.group_id === g.id && filteredSet.has(a.id)));
             // Hide empty groups when searching
@@ -1492,6 +1543,24 @@
                     saveExpandedGroups();
                     renderArchiveList();
                 }
+            });
+
+            // Drop-to-group: accept archive drags
+            header.addEventListener("dragover", (e) => {
+                if (!isDragging) return;
+                e.preventDefault();
+                e.dataTransfer.dropEffect = "move";
+                header.classList.add("drag-over-group");
+            });
+            header.addEventListener("dragleave", () => header.classList.remove("drag-over-group"));
+            header.addEventListener("drop", async (e) => {
+                e.preventDefault();
+                header.classList.remove("drag-over-group");
+                if (!dragSrcId) return;
+                for (const aid of dragSrcId) {
+                    try { await api("POST", `/api/archives/${aid}/group`, { group_id: g.id }); } catch (e) {}
+                }
+                await refreshArchives();
             });
 
             archiveListEl.appendChild(header);
