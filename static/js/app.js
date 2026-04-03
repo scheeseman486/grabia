@@ -5340,6 +5340,8 @@
         const scopeLabel = { processed: "Processed files", downloaded: "Downloaded files", both: "All files" }[coll.file_scope] || coll.file_scope;
         let meta = `${coll.file_count} files \u2022 ${scopeLabel}`;
         if (coll.auto_tag) meta += ` \u2022 auto-tag: ${coll.auto_tag}`;
+        if (!coll.flatten) meta += ` \u2022 flatten: off`;
+        if (!coll.use_media_units) meta += ` \u2022 media units: off`;
         $("#collection-detail-meta").textContent = meta;
 
         // Layouts
@@ -5557,6 +5559,8 @@
         $("#collection-name-input").value = coll ? coll.name : "";
         $("#collection-scope-input").value = coll ? coll.file_scope : "processed";
         $("#collection-autotag-input").value = coll ? (coll.auto_tag || "") : "";
+        $("#collection-flatten-input").checked = coll ? !!coll.flatten : true;
+        $("#collection-media-units-input").checked = coll ? !!coll.use_media_units : true;
         $("#collection-modal-error").textContent = "";
         $("#modal-collection").classList.add("open");
         $("#collection-name-input").focus();
@@ -5577,6 +5581,8 @@
             name,
             file_scope: $("#collection-scope-input").value,
             auto_tag: $("#collection-autotag-input").value.trim(),
+            flatten: $("#collection-flatten-input").checked ? 1 : 0,
+            use_media_units: $("#collection-media-units-input").checked ? 1 : 0,
         };
         try {
             if (editingCollectionId) {

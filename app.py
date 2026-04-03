@@ -829,15 +829,27 @@ def _detect_media_units(archive_id):
     """Auto-detect multi-file media units for an archive after scan completes.
 
     Analyses file names by directory and applies heuristics:
-    - Folder with .cue + .bin files → media unit
-    - Folder with .gdi + track files → media unit
-    - Folder with one playable file + metadata (.txt, .nfo, .jpg, etc.) → media unit
-    - Single files without siblings → standalone (no media_root)
+    - Folder that exclusively contains a CUE+BIN set → media unit
+    - Folder that exclusively contains a GDI + track set → media unit
+    - Folder with one playable file + metadata only → media unit
+    - Directories with many unrelated files (flat collections) → left alone
 
-    Only sets media_root on files that don't already have one (preserves manual overrides)
-    and only on unprocessed files (processed files are always standalone).
+    Only sets media_root on files that don't already have one (preserves manual
+    overrides) and only on unprocessed files (processed files are always standalone).
+
+    Key constraint: heuristics only apply to small directories that look like a
+    single piece of media (max ~50 files).  Large directories containing many
+    standalone games are never treated as a media unit.
     """
     with db._db() as conn:
+        # Reset all media_root values so re-scan re-evaluates from scratch.
+        # Manual overrides are lost, but the user can re-apply them.
+        conn.execute(
+            "UPDATE archive_files SET media_root = '' WHERE archive_id = ? AND media_root != ''",
+            (archive_id,),
+        )
+        conn.commit()
+
         rows = conn.execute(
             """SELECT id, name, processing_status, media_root
                FROM archive_files
@@ -858,6 +870,10 @@ def _detect_media_units(archive_id):
 
     METADATA_EXTS = {".txt", ".nfo", ".jpg", ".jpeg", ".png", ".pdf", ".xml",
                      ".htm", ".html", ".bmp", ".gif", ".svg"}
+    # Max files in a directory to consider it a media unit candidate.
+    # Real media units (CUE+BIN, multi-disc) rarely exceed this.
+    # Flat collections of games will have hundreds/thousands and be skipped.
+    MAX_MEDIA_UNIT_FILES = 50
     updates = []  # (file_id, media_root)
 
     for dir_path, files in by_dir.items():
@@ -872,26 +888,48 @@ def _detect_media_units(archive_id):
         if not eligible:
             continue
 
-        basenames_lower = {bn.lower() for _, bn, _, _ in files}
+        # Large directories are flat collections, not media units
+        if len(files) > MAX_MEDIA_UNIT_FILES:
+            # Still check for CUE+BIN pairs within the directory
+            _detect_cue_bin_pairs(files, dir_path, updates)
+            continue
+
         exts = {os.path.splitext(bn)[1].lower() for _, bn, _, _ in files}
 
-        # Heuristic 1: CUE+BIN set
-        has_cue = any(e == ".cue" for e in exts)
-        has_bin = any(e == ".bin" for e in exts)
+        # Heuristic 1: CUE+BIN set — the directory must be predominantly
+        # CUE/BIN files, not a mix with many other types
+        cue_bin_exts = {".cue", ".bin"}
+        has_cue = ".cue" in exts
+        has_bin = ".bin" in exts
         if has_cue and has_bin:
-            for fid, bn, ps, mr in eligible:
-                updates.append((fid, dir_path))
-            continue
+            cue_bin_count = sum(1 for _, bn, _, _ in files
+                               if os.path.splitext(bn)[1].lower() in cue_bin_exts)
+            other_count = len(files) - cue_bin_count
+            # Only treat as media unit if CUE/BIN files are the majority
+            # (allow a few metadata/artwork files alongside)
+            meta_count = sum(1 for _, bn, _, _ in files
+                            if os.path.splitext(bn)[1].lower() in METADATA_EXTS)
+            if other_count <= meta_count + 1:  # at most 1 non-CUE/BIN/metadata file
+                for fid, bn, ps, mr in eligible:
+                    updates.append((fid, dir_path))
+                continue
 
-        # Heuristic 2: GDI + track files
-        has_gdi = any(e == ".gdi" for e in exts)
+        # Heuristic 2: GDI + track files — same logic
+        has_gdi = ".gdi" in exts
         has_raw = any(e in (".raw", ".bin") for e in exts)
         if has_gdi and has_raw:
-            for fid, bn, ps, mr in eligible:
-                updates.append((fid, dir_path))
-            continue
+            gdi_track_exts = {".gdi", ".raw", ".bin"}
+            gdi_count = sum(1 for _, bn, _, _ in files
+                           if os.path.splitext(bn)[1].lower() in gdi_track_exts)
+            other_count = len(files) - gdi_count
+            meta_count = sum(1 for _, bn, _, _ in files
+                            if os.path.splitext(bn)[1].lower() in METADATA_EXTS)
+            if other_count <= meta_count + 1:
+                for fid, bn, ps, mr in eligible:
+                    updates.append((fid, dir_path))
+                continue
 
-        # Heuristic 3: one playable file + metadata
+        # Heuristic 3: one playable file + metadata only
         non_meta = [(fid, bn) for fid, bn, ps, mr in eligible
                     if os.path.splitext(bn)[1].lower() not in METADATA_EXTS]
         meta_only = [(fid, bn) for fid, bn, ps, mr in eligible
@@ -2162,8 +2200,11 @@ def create_collection():
     if file_scope not in ("processed", "downloaded", "both"):
         return jsonify({"error": "Invalid file_scope"}), 400
     auto_tag = data.get("auto_tag", "").strip() or None
+    flatten = int(data.get("flatten", 1))
+    use_media_units = int(data.get("use_media_units", 1))
     try:
-        coll = db.create_collection(name, file_scope=file_scope, auto_tag=auto_tag)
+        coll = db.create_collection(name, file_scope=file_scope, auto_tag=auto_tag,
+                                    flatten=flatten, use_media_units=use_media_units)
     except Exception as e:
         if "UNIQUE" in str(e):
             return jsonify({"error": "A collection with that name already exists"}), 409
@@ -2205,6 +2246,10 @@ def update_collection(collection_id):
         kwargs["auto_tag"] = data["auto_tag"].strip() or None
     if "position" in data:
         kwargs["position"] = int(data["position"])
+    if "flatten" in data:
+        kwargs["flatten"] = int(data["flatten"])
+    if "use_media_units" in data:
+        kwargs["use_media_units"] = int(data["use_media_units"])
     if kwargs:
         try:
             db.update_collection(collection_id, **kwargs)

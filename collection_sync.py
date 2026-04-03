@@ -70,17 +70,18 @@ def get_download_dir():
     return db.get_setting("download_dir", os.path.expanduser("~/ia-downloads"))
 
 
-def _resolve_filename(file_row):
+def _resolve_filename(file_row, flatten=True):
     """Determine the filename that should appear in a collection.
 
     If the file has been processed and has a ``processed_filename``,
     use that.  Otherwise fall back to the original manifest ``name``.
 
-    Returns only the leaf name (no subdirectory components) — the library
-    flattens all archive directory structures into a single level.
+    When ``flatten`` is True (default), returns only the leaf name (no
+    subdirectory components).  When False, returns the full relative path
+    preserving the original archive directory structure.
     """
     raw = file_row.get("processed_filename") or file_row["name"]
-    return os.path.basename(raw)
+    return os.path.basename(raw) if flatten else raw
 
 
 def _resolve_filepath(file_row, download_dir):
@@ -124,7 +125,7 @@ def _build_file_list(collection):
     return db.get_collection_files(collection["id"])
 
 
-def _build_media_units(files, download_dir):
+def _build_media_units(files, download_dir, flatten=True, use_media_units=True):
     """Collapse files sharing a ``media_root`` into single directory units.
 
     Returns a list of unit dicts:
@@ -135,6 +136,10 @@ def _build_media_units(files, download_dir):
     **Critical rule:** processed files are always standalone — ``media_root``
     is ignored when ``processed_filename`` is set, because the processor has
     already collapsed multi-file input into a single output.
+
+    When ``use_media_units`` is False, media_root is ignored entirely and
+    all files are treated as standalone.
+    When ``flatten`` is False, display names preserve subdirectory structure.
     """
     units = []
     grouped = defaultdict(list)  # (identifier, media_root) → [file_rows]
@@ -142,11 +147,11 @@ def _build_media_units(files, download_dir):
     for f in files:
         root = f.get("media_root", "")
         is_processed = bool(f.get("processed_filename"))
-        if root and not is_processed:
+        if use_media_units and root and not is_processed:
             grouped[(f["archive_identifier"], root)].append(f)
         else:
             units.append({
-                "display_name": _resolve_filename(f),
+                "display_name": _resolve_filename(f, flatten=flatten),
                 "file_row": f,
                 "is_dir": False,
             })
@@ -276,8 +281,12 @@ def sync_collection(collection_id):
     if not layouts:
         return {"error": "Collection has no layouts configured"}
 
+    flatten = bool(collection.get("flatten", 1))
+    use_media_units = bool(collection.get("use_media_units", 1))
+
     files = _build_file_list(collection)
-    units = _build_media_units(files, download_dir)
+    units = _build_media_units(files, download_dir, flatten=flatten,
+                               use_media_units=use_media_units)
 
     stats = {
         "collection_id": collection_id,
@@ -484,8 +493,12 @@ def preview_collection(collection_id):
     if not layouts:
         return {"rows": [], "total": 0}
 
+    flatten = bool(collection.get("flatten", 1))
+    use_media_units = bool(collection.get("use_media_units", 1))
+
     files = _build_file_list(collection)
-    units = _build_media_units(files, download_dir)
+    units = _build_media_units(files, download_dir, flatten=flatten,
+                               use_media_units=use_media_units)
 
     rows = []
 

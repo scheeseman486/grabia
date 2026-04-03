@@ -525,6 +525,17 @@
             <label>Auto-tag <span class="label-hint">(optional — automatically include archives with this tag)</span>
                 <input type="text" id="collection-autotag-input" placeholder="e.g. xbox">
             </label>
+            <div class="collection-modal-overrides">
+                <h4>Library Overrides</h4>
+                <label class="checkbox-label">
+                    <input type="checkbox" id="collection-flatten-input" checked>
+                    Flatten filenames <span class="label-hint">(strip subdirectory prefixes from symlinks)</span>
+                </label>
+                <label class="checkbox-label">
+                    <input type="checkbox" id="collection-media-units-input" checked>
+                    Group media units <span class="label-hint">(symlink multi-file media as directories)</span>
+                </label>
+            </div>
             <div class="modal-error" id="collection-modal-error"></div>
             <div class="modal-actions">
                 <button class="action-btn" id="btn-collection-modal-cancel">Cancel</button>

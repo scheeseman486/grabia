@@ -513,6 +513,13 @@ def init_db():
     except sqlite3.OperationalError:
         conn.execute("ALTER TABLE archive_files ADD COLUMN media_root TEXT NOT NULL DEFAULT ''")
 
+    # Migration: add library override columns to collections
+    try:
+        conn.execute("SELECT flatten FROM collections LIMIT 1")
+    except sqlite3.OperationalError:
+        conn.execute("ALTER TABLE collections ADD COLUMN flatten INTEGER NOT NULL DEFAULT 1")
+        conn.execute("ALTER TABLE collections ADD COLUMN use_media_units INTEGER NOT NULL DEFAULT 1")
+
     # Queue state settings (download_state, processing_paused, scan_paused)
     conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('download_state', 'stopped')")
     conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('processing_paused', '0')")
@@ -1886,13 +1893,13 @@ def count_pending_processing_jobs():
 
 # ── Collections ──────────────────────────────────────────────────────────
 
-def create_collection(name, file_scope="processed", auto_tag=None):
+def create_collection(name, file_scope="processed", auto_tag=None, flatten=1, use_media_units=1):
     """Create a new collection. Returns the new collection dict."""
     with _db() as conn:
         pos = conn.execute("SELECT COALESCE(MAX(position), -1) + 1 FROM collections").fetchone()[0]
         cur = conn.execute(
-            "INSERT INTO collections (name, file_scope, auto_tag, position, created_at) VALUES (?, ?, ?, ?, ?)",
-            (name, file_scope, auto_tag or None, pos, time.time()),
+            "INSERT INTO collections (name, file_scope, auto_tag, position, created_at, flatten, use_media_units) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (name, file_scope, auto_tag or None, pos, time.time(), flatten, use_media_units),
         )
         conn.commit()
         return get_collection(cur.lastrowid)
@@ -1942,8 +1949,8 @@ def get_collections():
 
 
 def update_collection(collection_id, **kwargs):
-    """Update collection fields. Accepted keys: name, file_scope, auto_tag, position."""
-    allowed = {"name", "file_scope", "auto_tag", "position"}
+    """Update collection fields. Accepted keys: name, file_scope, auto_tag, position, flatten, use_media_units."""
+    allowed = {"name", "file_scope", "auto_tag", "position", "flatten", "use_media_units"}
     updates = []
     params = []
     for key, val in kwargs.items():
