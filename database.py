@@ -924,10 +924,12 @@ def get_archive_files(archive_id, sort="name", sort_dir=None, search=""):
         elif sort == "status":
             order = f"({_EFFECTIVE_STATUS_EXPR}) {direction}, name ASC"
         elif sort == "name_flat":
-            # Sort by leaf filename only, ignoring directory prefixes
-            # SUBSTR after last '/' gives the basename; files without '/' sort normally
-            basename_expr = "CASE WHEN INSTR(name, '/') > 0 THEN SUBSTR(name, LENGTH(name) - LENGTH(REPLACE(name, '/', '')) + 1) ELSE name END"
-            order = f"({basename_expr}) {direction}"
+            # Sort by leaf filename only, ignoring directory prefixes.
+            # RTRIM(name, <all non-slash chars>) strips the basename from
+            # the right, leaving the directory prefix with trailing '/'.
+            # REPLACE then removes that prefix to yield just the basename.
+            basename_expr = "CASE WHEN INSTR(name, '/') > 0 THEN REPLACE(name, RTRIM(name, REPLACE(name, '/', '')), '') ELSE name END"
+            order = f"({basename_expr}) COLLATE NOCASE {direction}"
         else:
             order = f"{col} {direction}"
             if sort != "name":
