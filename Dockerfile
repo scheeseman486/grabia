@@ -44,7 +44,7 @@ COPY templates/ ./templates/
 ADD https://raw.githubusercontent.com/scheeseman486/shitman/main/shitman.py /usr/local/bin/shitman.py
 RUN chmod +x /usr/local/bin/shitman.py
 
-RUN mkdir -p /app/data /app/downloads /tempstorage
+RUN mkdir -p /app/data /app/downloads /app/processed /tempstorage
 
 ENV GRABIA_HOST=0.0.0.0
 ENV GRABIA_PORT=5000

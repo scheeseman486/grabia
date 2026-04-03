@@ -249,7 +249,8 @@ def get_settings():
 @login_required
 def update_settings():
     data = request.json
-    allowed = ["ia_email", "ia_password", "download_dir", "max_retries",
+    allowed = ["ia_email", "ia_password", "download_dir", "processed_dir",
+               "max_retries",
                "retry_delay", "bandwidth_limit", "theme", "files_per_page",
                "speed_schedule", "use_http",
                "confirm_reset_order", "confirm_delete_file",
@@ -281,6 +282,106 @@ def update_settings():
         )
     broadcast_sse("settings_updated", db.get_all_settings())
     return jsonify({"ok": True})
+
+
+@app.route("/api/settings/migrate-processed", methods=["POST"])
+@login_required
+def migrate_processed_files():
+    """Move processed output files from download dirs to the separate processed dir.
+
+    Scans all archives for files with ``processed_filename`` or
+    ``processed_files_json`` set, and moves any matching files/dirs from
+    the download directory to the processed directory, preserving the
+    ``identifier/relative_path`` structure.
+
+    This is a one-time migration for separating processed files from
+    downloads.  It is idempotent — files already in the processed dir
+    are skipped.
+    """
+    import shutil
+
+    download_dir = db.get_download_dir()
+    processed_dir = db.get_processed_dir()
+
+    if os.path.realpath(download_dir) == os.path.realpath(processed_dir):
+        return jsonify({"error": "processed_dir cannot be the same as download_dir"}), 400
+
+    stats = {"moved": 0, "skipped": 0, "errors": 0, "archives": 0}
+
+    with db._db() as conn:
+        archives = conn.execute(
+            "SELECT DISTINCT a.identifier FROM archives a "
+            "JOIN archive_files af ON af.archive_id = a.id "
+            "WHERE af.processing_status = 'processed'"
+        ).fetchall()
+
+    for arch_row in archives:
+        identifier = arch_row["identifier"]
+        src_base = os.path.join(download_dir, identifier)
+        dst_base = os.path.join(processed_dir, identifier)
+
+        if not os.path.isdir(src_base):
+            continue
+
+        stats["archives"] += 1
+
+        # Gather all processed relative paths for this archive
+        processed_paths = set()
+        with db._db() as conn:
+            rows = conn.execute(
+                "SELECT processed_filename, processed_files_json FROM archive_files af "
+                "JOIN archives a ON af.archive_id = a.id "
+                "WHERE a.identifier = ? AND af.processing_status = 'processed'",
+                (identifier,),
+            ).fetchall()
+
+        for row in rows:
+            pf = row["processed_filename"]
+            if pf:
+                processed_paths.add(pf.rstrip("/").rstrip(os.sep))
+            pj = row["processed_files_json"]
+            if pj:
+                try:
+                    for p in json.loads(pj):
+                        if p:
+                            processed_paths.add(p.rstrip("/").rstrip(os.sep))
+                except (json.JSONDecodeError, TypeError):
+                    pass
+
+        for rel_path in processed_paths:
+            src = os.path.join(src_base, rel_path)
+            dst = os.path.join(dst_base, rel_path)
+
+            if not os.path.exists(src):
+                stats["skipped"] += 1
+                continue
+
+            if os.path.exists(dst):
+                stats["skipped"] += 1
+                continue
+
+            try:
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                shutil.move(src, dst)
+                stats["moved"] += 1
+            except OSError as e:
+                log.error("migrate", "Failed to move %s -> %s: %s", src, dst, e)
+                stats["errors"] += 1
+
+        # Clean up empty directories left behind in the download dir
+        if os.path.isdir(src_base):
+            for dirpath, dirnames, filenames in os.walk(src_base, topdown=False):
+                if dirpath == src_base:
+                    continue
+                if not filenames and not dirnames:
+                    try:
+                        os.rmdir(dirpath)
+                    except OSError:
+                        pass
+
+    log.info("migrate", "Migration complete: %d moved, %d skipped, %d errors across %d archives",
+             stats["moved"], stats["skipped"], stats["errors"], stats["archives"])
+    return jsonify({"ok": True, **stats})
 
 
 @app.route("/api/settings/test-credentials", methods=["POST"])
@@ -563,15 +664,35 @@ def _run_single_file_scan(entry):
     download_dir = db.get_setting("download_dir", os.path.expanduser("~/ia-downloads"))
     base_dir = os.path.realpath(os.path.join(download_dir, archive["identifier"]))
 
-    result = _scan_single_file_on_disk(f, base_dir, entry_id=entry["id"])
+    result = _scan_single_file_on_disk(f, base_dir, entry_id=entry["id"], identifier=archive["identifier"])
     db.complete_scan_queue_entry(entry["id"])
     db.recompute_archive_status(archive_id)
     broadcast_sse("queue_update", {"queue_type": "scan", "action": "completed", "entry_id": entry["id"]})
 
 
-def _scan_single_file_on_disk(f, base_dir, entry_id=None):
+def _resolve_processed_file(identifier, rel_path, base_dir):
+    """Locate a processed file, checking the dedicated processed dir first.
+
+    Returns the absolute path to whichever location contains the file,
+    preferring ``processed_dir/identifier/rel_path`` over the legacy
+    location ``base_dir/rel_path`` (where base_dir = download_dir/identifier).
+    """
+    processed_dir = db.get_processed_dir()
+    candidate = os.path.join(processed_dir, identifier, rel_path)
+    if os.path.exists(candidate):
+        return candidate
+    return os.path.join(base_dir, rel_path)
+
+
+def _get_processed_base(identifier):
+    """Return the per-archive processed output directory."""
+    return os.path.realpath(os.path.join(db.get_processed_dir(), identifier))
+
+
+def _scan_single_file_on_disk(f, base_dir, entry_id=None, identifier=None):
     """Check a single manifest file against disk. Updates DB. Returns result status string.
-    If entry_id is provided, broadcasts file-level progress SSE for the hash phase."""
+    If entry_id is provided, broadcasts file-level progress SSE for the hash phase.
+    ``identifier`` is the archive identifier used for processed-dir lookups."""
     file_id = f["id"]
     name = f["name"]
     local_path = os.path.realpath(os.path.join(base_dir, name))
@@ -582,7 +703,12 @@ def _scan_single_file_on_disk(f, base_dir, entry_id=None):
     proc_status = f.get("processing_status") or ""
     if proc_status in ("processed", "failed"):
         pf = f.get("processed_filename", "")
-        pf_path = os.path.join(base_dir, pf) if pf else ""
+        if pf and identifier:
+            pf_path = _resolve_processed_file(identifier, pf, base_dir)
+        elif pf:
+            pf_path = os.path.join(base_dir, pf)
+        else:
+            pf_path = ""
         has_output = pf_path and (os.path.isfile(pf_path) or os.path.isdir(pf_path))
 
         if proc_status == "processed" and has_output:
@@ -617,7 +743,11 @@ def _scan_single_file_on_disk(f, base_dir, entry_id=None):
         # Check for processed version (e.g., game.zip → game.chd)
         base_no_ext = os.path.splitext(name)[0]
         for proc_ext in (".chd", ".cso"):
-            proc_path = os.path.join(base_dir, base_no_ext + proc_ext)
+            proc_rel = base_no_ext + proc_ext
+            if identifier:
+                proc_path = _resolve_processed_file(identifier, proc_rel, base_dir)
+            else:
+                proc_path = os.path.join(base_dir, proc_rel)
             if os.path.isfile(proc_path):
                 db.set_file_download_status(file_id, "completed", downloaded_bytes=os.path.getsize(proc_path))
                 return "matched"
@@ -785,7 +915,8 @@ def _run_archive_scan_entry(entry):
             _finish_archive_scan(archive_id)
         return
 
-    result = _scan_single_file_on_disk(f, base_dir, entry_id=entry["id"])
+    result = _scan_single_file_on_disk(f, base_dir, entry_id=entry["id"],
+                                       identifier=ctx["archive"]["identifier"])
 
     # Update summary
     if result in ctx["summary"]:
@@ -1389,20 +1520,21 @@ def delete_file(file_id):
         has_outputs = False
         if f.get("processing_status") == "processed":
             if archive:
+                ident = archive["identifier"]
                 download_dir = db.get_setting("download_dir", os.path.expanduser("~/ia-downloads"))
-                base_dir = os.path.realpath(os.path.join(download_dir, archive["identifier"]))
+                base_dir = os.path.realpath(os.path.join(download_dir, ident))
                 # Check processed_filename
                 pf = f.get("processed_filename", "")
                 if pf:
-                    pf_abs = os.path.realpath(os.path.join(base_dir, pf.rstrip("/").rstrip(os.sep)))
-                    if pf_abs.startswith(base_dir + os.sep) and (os.path.isfile(pf_abs) or os.path.isdir(pf_abs)):
+                    pf_abs = _resolve_processed_file(ident, pf.rstrip("/").rstrip(os.sep), base_dir)
+                    if os.path.isfile(pf_abs) or os.path.isdir(pf_abs):
                         has_outputs = True
                 # Check processed_files_json entries
                 if not has_outputs and f.get("processed_files_json"):
                     try:
                         for p in json.loads(f["processed_files_json"]):
-                            p_abs = os.path.realpath(os.path.join(base_dir, p.rstrip("/").rstrip(os.sep)))
-                            if p_abs.startswith(base_dir + os.sep) and (os.path.isfile(p_abs) or os.path.isdir(p_abs)):
+                            p_abs = _resolve_processed_file(ident, p.rstrip("/").rstrip(os.sep), base_dir)
+                            if os.path.isfile(p_abs) or os.path.isdir(p_abs):
                                 has_outputs = True
                                 break
                     except (json.JSONDecodeError, TypeError):
@@ -1432,8 +1564,9 @@ def get_processed_tree(file_id):
     if not archive:
         return jsonify({"error": "Archive not found"}), 404
 
+    ident = archive["identifier"]
     download_dir = db.get_setting("download_dir", os.path.expanduser("~/ia-downloads"))
-    base_dir = os.path.realpath(os.path.join(download_dir, archive["identifier"]))
+    base_dir = os.path.realpath(os.path.join(download_dir, ident))
 
     # Build the set of root paths to scan.
     # processed_filename is the primary output (a file, or a folder ending with /).
@@ -1462,9 +1595,12 @@ def get_processed_tree(file_id):
         root_paths = [f["processed_filename"].rstrip("/").rstrip(os.sep)]
 
     # Build tree from disk (verify each entry actually exists)
+    # Check processed_dir first, fall back to download_dir (legacy location)
     def _scan_path(rel_path):
-        abs_path = os.path.realpath(os.path.join(base_dir, rel_path))
-        if not abs_path.startswith(base_dir + os.sep):
+        abs_path = os.path.realpath(_resolve_processed_file(ident, rel_path, base_dir))
+        # Security check: must stay within either base_dir or processed base
+        proc_base = _get_processed_base(ident)
+        if not (abs_path.startswith(base_dir + os.sep) or abs_path.startswith(proc_base + os.sep)):
             return None
         if os.path.isfile(abs_path):
             stat = os.stat(abs_path)
@@ -1533,8 +1669,20 @@ def delete_processed_file(file_id):
     if not archive:
         return jsonify({"error": "Archive not found"}), 404
 
+    ident = archive["identifier"]
     download_dir = db.get_setting("download_dir", os.path.expanduser("~/ia-downloads"))
-    base_dir = os.path.realpath(os.path.join(download_dir, archive["identifier"]))
+    base_dir = os.path.realpath(os.path.join(download_dir, ident))
+    proc_base = _get_processed_base(ident)
+
+    def _safe_delete(rel):
+        """Resolve and delete a processed file from whichever dir it lives in."""
+        abs_p = os.path.realpath(_resolve_processed_file(ident, rel, base_dir))
+        if not (abs_p.startswith(base_dir + os.sep) or abs_p.startswith(proc_base + os.sep)):
+            return
+        if os.path.isfile(abs_p):
+            os.remove(abs_p)
+        elif os.path.isdir(abs_p):
+            shutil.rmtree(abs_p)
 
     if delete_all:
         # Delete every processed output for this file
@@ -1547,13 +1695,7 @@ def delete_processed_file(file_id):
         if not paths_to_delete and f.get("processed_filename"):
             paths_to_delete = [f["processed_filename"]]
         for p in paths_to_delete:
-            p = p.rstrip("/").rstrip(os.sep)
-            abs_p = os.path.realpath(os.path.join(base_dir, p))
-            if abs_p.startswith(base_dir + os.sep):
-                if os.path.isfile(abs_p):
-                    os.remove(abs_p)
-                elif os.path.isdir(abs_p):
-                    shutil.rmtree(abs_p)
+            _safe_delete(p.rstrip("/").rstrip(os.sep))
         # Reset all processing state
         conn = db.get_db()
         conn.execute(
@@ -1565,12 +1707,7 @@ def delete_processed_file(file_id):
         conn.close()
     elif filename:
         # Delete a single processed output
-        proc_path = os.path.realpath(os.path.join(base_dir, filename))
-        if proc_path.startswith(base_dir + os.sep):
-            if os.path.isfile(proc_path):
-                os.remove(proc_path)
-            elif os.path.isdir(proc_path):
-                shutil.rmtree(proc_path)
+        _safe_delete(filename.rstrip("/").rstrip(os.sep))
 
         # Update processed_files_json to remove the deleted entry
         remaining = []
@@ -1632,14 +1769,20 @@ def rename_processed_file(file_id):
     if not archive:
         return jsonify({"error": "Archive not found"}), 404
 
+    ident = archive["identifier"]
     download_dir = db.get_setting("download_dir", os.path.expanduser("~/ia-downloads"))
-    base_dir = os.path.realpath(os.path.join(download_dir, archive["identifier"]))
+    base_dir = os.path.realpath(os.path.join(download_dir, ident))
+    proc_base = _get_processed_base(ident)
 
-    old_abs = os.path.realpath(os.path.join(base_dir, old_path))
+    old_abs = os.path.realpath(_resolve_processed_file(ident, old_path, base_dir))
+    # Construct new path in the same directory where the old file was found
     new_rel = os.path.join(os.path.dirname(old_path), new_name)
-    new_abs = os.path.realpath(os.path.join(base_dir, new_rel))
+    containing_dir = os.path.dirname(old_abs)
+    new_abs = os.path.realpath(os.path.join(containing_dir, new_name))
 
-    if not old_abs.startswith(base_dir + os.sep) or not new_abs.startswith(base_dir + os.sep):
+    if not (old_abs.startswith(base_dir + os.sep) or old_abs.startswith(proc_base + os.sep)):
+        return jsonify({"error": "Invalid path"}), 400
+    if not (new_abs.startswith(base_dir + os.sep) or new_abs.startswith(proc_base + os.sep)):
         return jsonify({"error": "Invalid path"}), 400
 
     if (os.path.isfile(old_abs) or os.path.isdir(old_abs)):
@@ -2531,6 +2674,7 @@ def get_collections_settings():
     return jsonify({
         "collections_dir": collection_sync.get_collections_dir(),
         "download_dir": collection_sync.get_download_dir(),
+        "processed_dir": collection_sync.get_processed_dir(),
     })
 
 

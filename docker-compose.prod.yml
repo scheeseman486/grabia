@@ -7,6 +7,7 @@ services:
     volumes:
       - /mnt/user/appdata/grabia:/app/data
       - /mnt/user/grabia_downloads:/root/ia-downloads
+      - /mnt/user/grabia_processed:/root/ia-processed
       - /mnt/user/grabia_temp:/tempstorage
     environment:
       - GRABIA_PORT=5000

@@ -41,6 +41,7 @@ Docker container and on the Unraid host (same share), and work over SMB
 with Samba's default ``follow symlinks = yes``.
 """
 
+import json
 import os
 import re
 import shutil
@@ -67,7 +68,12 @@ def get_collections_dir():
 
 def get_download_dir():
     """Return the absolute path to the downloads root directory."""
-    return db.get_setting("download_dir", os.path.expanduser("~/ia-downloads"))
+    return db.get_download_dir()
+
+
+def get_processed_dir():
+    """Return the absolute path to the processed-files root directory."""
+    return db.get_processed_dir()
 
 
 def _resolve_filename(file_row, flatten=True):
@@ -76,11 +82,18 @@ def _resolve_filename(file_row, flatten=True):
     If the file has been processed and has a ``processed_filename``,
     use that.  Otherwise fall back to the original manifest ``name``.
 
+    If the unit was expanded from ``processed_files_json``, the
+    ``_extra_processed_path`` key overrides the normal resolution.
+
     When ``flatten`` is True (default), returns only the leaf name (no
     subdirectory components).  When False, returns the full relative path
     preserving the original archive directory structure.
     """
-    raw = file_row.get("processed_filename") or file_row["name"]
+    extra = file_row.get("_extra_processed_path")
+    if extra:
+        raw = extra
+    else:
+        raw = file_row.get("processed_filename") or file_row["name"]
     return os.path.basename(raw) if flatten else raw
 
 
@@ -90,11 +103,39 @@ def _resolve_filepath(file_row, download_dir):
     Uses the full relative path (including subdirectories) to locate the
     file, even though ``_resolve_filename`` strips subdirectories for
     display purposes.
+
+    If the unit was expanded from ``processed_files_json``, the
+    ``_extra_processed_path`` key overrides the normal resolution.
+
+    For processed files, checks the separate ``processed_dir`` first,
+    falling back to the legacy location inside ``download_dir``.
     """
     identifier = file_row["archive_identifier"]
-    # Use full path for target resolution, not the flattened display name
+    # Expanded multi-output entry takes precedence
+    extra = file_row.get("_extra_processed_path")
+    if extra:
+        return _resolve_processed_path(identifier, extra, download_dir)
     raw = file_row.get("processed_filename") or file_row["name"]
+    if file_row.get("processed_filename"):
+        return _resolve_processed_path(identifier, raw, download_dir)
+    # Unprocessed file — always in download_dir
     return os.path.join(download_dir, identifier, raw)
+
+
+def _resolve_processed_path(identifier, rel_path, download_dir):
+    """Locate a processed file, checking ``processed_dir`` first.
+
+    Processed outputs may live in either the dedicated processed directory
+    (new layout) or alongside downloads (legacy).  This function checks the
+    processed dir first and falls back to download_dir so both old and
+    migrated archives work transparently.
+    """
+    processed_dir = get_processed_dir()
+    candidate = os.path.join(processed_dir, identifier, rel_path)
+    if os.path.exists(candidate):
+        return candidate
+    # Legacy fallback — processed file alongside downloads
+    return os.path.join(download_dir, identifier, rel_path)
 
 
 def _alphabetical_bucket(filename):
@@ -150,11 +191,30 @@ def _build_media_units(files, download_dir, flatten=True, use_media_units=True):
         if use_media_units and root and not is_processed:
             grouped[(f["archive_identifier"], root)].append(f)
         else:
+            # Primary entry (processed_filename or original name)
             units.append({
                 "display_name": _resolve_filename(f, flatten=flatten),
                 "file_row": f,
                 "is_dir": False,
             })
+            # Expand additional processed outputs from processed_files_json
+            if is_processed and f.get("processed_files_json"):
+                primary = f.get("processed_filename", "")
+                try:
+                    extra_files = json.loads(f["processed_files_json"])
+                except (json.JSONDecodeError, TypeError):
+                    extra_files = []
+                for extra_path in extra_files:
+                    if not extra_path or extra_path == primary:
+                        continue
+                    # Create a shallow copy with override key for path resolution
+                    expanded = dict(f)
+                    expanded["_extra_processed_path"] = extra_path
+                    units.append({
+                        "display_name": os.path.basename(extra_path) if flatten else extra_path,
+                        "file_row": expanded,
+                        "is_dir": False,
+                    })
 
     for (identifier, root), group_files in grouped.items():
         units.append({

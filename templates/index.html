@@ -689,6 +689,10 @@
                             <label>Download Directory
                                 <input type="text" id="set-download-dir" placeholder="/path/to/downloads">
                             </label>
+                            <label>Processed Files Directory
+                                <input type="text" id="set-processed-dir" placeholder="(auto: sibling &quot;processed&quot; folder)">
+                                <small>Where processed outputs are stored. Leave blank to auto-create a <code>processed/</code> folder next to your downloads.</small>
+                            </label>
                             <h4 class="settings-subheading">Parallel Downloads</h4>
                             <p class="settings-desc">Control how many files download simultaneously. Per-node limits prevent overloading individual IA servers; total limits cap overall connections.</p>
                             <label>Max Connections per Server
@@ -850,6 +854,15 @@
                                 <input type="text" id="set-debug-log-file" placeholder="Console only (no file)">
                                 <small>Also write debug output to a file. Leave blank for console-only.</small>
                             </label>
+                        </div>
+                        <hr class="settings-divider">
+                        <h3>Maintenance</h3>
+                        <div class="settings-form">
+                            <div class="maintenance-action">
+                                <p class="settings-desc">Move processed output files from download directories to the separate processed files directory. This is a one-time migration — files already in the processed directory are skipped.</p>
+                                <button class="action-btn" id="btn-migrate-processed">Migrate Processed Files</button>
+                                <p class="settings-desc" id="migrate-processed-result" style="display:none;"></p>
+                            </div>
                         </div>
                     </div>
                 </div>

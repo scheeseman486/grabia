@@ -634,6 +634,24 @@ def get_all_settings():
         return {row["key"]: row["value"] for row in rows}
 
 
+def get_download_dir():
+    """Return the absolute path to the downloads root directory."""
+    return get_setting("download_dir", os.path.expanduser("~/ia-downloads"))
+
+
+def get_processed_dir():
+    """Return the absolute path to the processed-files root directory.
+
+    Uses the ``processed_dir`` setting if set; otherwise places
+    ``processed/`` as a sibling to the download directory.
+    """
+    explicit = get_setting("processed_dir")
+    if explicit:
+        return explicit
+    download_dir = get_download_dir()
+    return os.path.join(os.path.dirname(download_dir), "processed")
+
+
 def set_setting(key, value):
     with _db() as conn:
         conn.execute(

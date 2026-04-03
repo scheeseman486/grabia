@@ -313,8 +313,10 @@ def _build_job_context(job):
     profile_options = json.loads(profile.get("options_json", "{}"))
     merged_options = {**profile_options, **options_override}
 
-    download_dir = db.get_setting("download_dir", os.path.expanduser("~/ia-downloads"))
+    download_dir = db.get_download_dir()
     archive_dir = os.path.join(download_dir, archive["identifier"])
+    processed_dir = db.get_processed_dir()
+    output_dir = os.path.join(processed_dir, archive["identifier"])
 
     return {
         "job": job,
@@ -325,6 +327,7 @@ def _build_job_context(job):
         "processor_cls": processor_cls,
         "merged_options": merged_options,
         "archive_dir": archive_dir,
+        "output_dir": output_dir,
         "act_job_id": act_job_id,
     }
 
@@ -338,6 +341,7 @@ def _process_single_entry(entry, ctx):
     processor_cls = ctx["processor_cls"]
     profile = ctx["profile"]
     archive_dir = ctx["archive_dir"]
+    output_dir = ctx["output_dir"]
 
     file_id = entry["file_id"]
     file_info = db.get_file(file_id)
@@ -386,7 +390,9 @@ def _process_single_entry(entry, ctx):
         if not os.path.isfile(file_path):
             raise ProcessingError(f"File not found: {file_path}")
 
-        result = processor.process(file_path, archive_dir)
+        # Ensure the per-archive output directory exists
+        os.makedirs(output_dir, exist_ok=True)
+        result = processor.process(file_path, output_dir)
 
         if result.get("skipped"):
             reason = result.get("reason", "Not processable")

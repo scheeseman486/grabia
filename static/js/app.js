@@ -3148,6 +3148,7 @@
             ia_email: $("#set-ia-email").value,
             ia_password: $("#set-ia-password").value,
             download_dir: $("#set-download-dir").value,
+            processed_dir: $("#set-processed-dir").value,
             max_retries: $("#set-max-retries").value,
             retry_delay: $("#set-retry-delay").value,
             sse_update_rate: $("#set-sse-update-rate").value,
@@ -3178,6 +3179,7 @@
             $("#set-ia-pw-hint").textContent = s.ia_password_set ? "(password is set; leave blank to keep)" : "";
             $("#ia-test-result").textContent = "";
             $("#set-download-dir").value = s.download_dir || "";
+            $("#set-processed-dir").value = s.processed_dir || "";
             $("#set-max-retries").value = s.max_retries || "3";
             $("#set-retry-delay").value = s.retry_delay || "5";
             $("#set-sse-update-rate").value = s.sse_update_rate || "500";
@@ -3247,6 +3249,7 @@
             ia_email: $("#set-ia-email").value,
             ia_password: $("#set-ia-password").value,
             download_dir: $("#set-download-dir").value,
+            processed_dir: $("#set-processed-dir").value,
             max_retries: $("#set-max-retries").value,
             retry_delay: $("#set-retry-delay").value,
             sse_update_rate: $("#set-sse-update-rate").value,
@@ -5814,6 +5817,23 @@
         $("#btn-settings-back-bottom").addEventListener("click", closeSettings);
         $("#btn-test-credentials").addEventListener("click", testCredentials);
         $("#btn-change-password").addEventListener("click", changePassword);
+        $("#btn-migrate-processed").addEventListener("click", async () => {
+            const btn = $("#btn-migrate-processed");
+            const result = $("#migrate-processed-result");
+            btn.disabled = true;
+            btn.textContent = "Migrating...";
+            result.style.display = "none";
+            try {
+                const r = await api("POST", "/api/settings/migrate-processed");
+                result.textContent = `Done: ${r.moved} moved, ${r.skipped} skipped, ${r.errors} errors across ${r.archives} archives.`;
+                result.style.display = "block";
+            } catch (e) {
+                result.textContent = "Migration failed: " + e.message;
+                result.style.display = "block";
+            }
+            btn.disabled = false;
+            btn.textContent = "Migrate Processed Files";
+        });
         // Tab switching
         $$(".settings-tab").forEach((tab) => {
             tab.addEventListener("click", () => switchTab(tab.dataset.tab));
