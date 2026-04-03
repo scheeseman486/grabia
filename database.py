@@ -2036,8 +2036,12 @@ def get_collection_files(collection_id):
 # ── Collection-Archive relationships ──────────────────────────────────
 
 def add_archive_to_collection(collection_id, archive_id):
-    """Add an archive to a collection. Returns True if added, False if already present."""
+    """Add an archive to a collection. Returns True if added, False if already present.
+    Raises ValueError if the archive doesn't exist."""
     with _db() as conn:
+        # Verify the archive exists first
+        if not conn.execute("SELECT 1 FROM archives WHERE id = ?", (archive_id,)).fetchone():
+            raise ValueError(f"Archive {archive_id} not found")
         try:
             conn.execute(
                 "INSERT INTO collection_archives (collection_id, archive_id) VALUES (?, ?)",

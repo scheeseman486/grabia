@@ -5624,20 +5624,26 @@
 
     // --- Add Archives Modal ---
 
-    function openAddArchivesModal() {
+    async function openAddArchivesModal() {
         if (!currentCollectionId) return;
         const listEl = $("#add-archives-list");
         const searchEl = $("#add-archives-search");
         searchEl.value = "";
         listEl.innerHTML = "";
 
+        // Fetch the full collection data to get all archive IDs (manual + auto-tag)
+        let collectionArchiveIds = new Set();
+        try {
+            const coll = await api("GET", `/api/collections/${currentCollectionId}`);
+            if (coll.archives) {
+                for (const a of coll.archives) collectionArchiveIds.add(a.id);
+            }
+        } catch (e) { /* proceed with empty set */ }
+
         function render(filter = "") {
             listEl.innerHTML = "";
             const lf = filter.toLowerCase();
-            // Get the collection's current archive IDs from the rendered detail
-            const currentArchiveEls = $$("#collection-archives [data-remove-archive]");
-            const currentIds = new Set();
-            currentArchiveEls.forEach((el) => currentIds.add(parseInt(el.dataset.removeArchive)));
+            const currentIds = collectionArchiveIds;
 
             for (const a of archives) {
                 if (lf && !(a.identifier || "").toLowerCase().includes(lf) && !(a.title || "").toLowerCase().includes(lf)) continue;
@@ -5666,6 +5672,7 @@
             const aid = parseInt(btn.dataset.addArchive);
             try {
                 await api("POST", `/api/collections/${currentCollectionId}/archives`, { archive_id: aid });
+                collectionArchiveIds.add(aid);
                 const item = btn.closest(".add-archive-item");
                 btn.replaceWith(Object.assign(document.createElement("span"), { className: "add-archive-badge", textContent: "Added" }));
                 if (item) item.classList.add("in-collection");
