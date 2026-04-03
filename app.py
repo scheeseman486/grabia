@@ -825,6 +825,120 @@ def _update_scan_progress(archive_id):
     # Progress is reported via SSE scan_progress events only (no notification updates)
 
 
+def _detect_media_units(archive_id):
+    """Auto-detect multi-file media units for an archive after scan completes.
+
+    Analyses file names by directory and applies heuristics:
+    - Folder with .cue + .bin files → media unit
+    - Folder with .gdi + track files → media unit
+    - Folder with one playable file + metadata (.txt, .nfo, .jpg, etc.) → media unit
+    - Single files without siblings → standalone (no media_root)
+
+    Only sets media_root on files that don't already have one (preserves manual overrides)
+    and only on unprocessed files (processed files are always standalone).
+    """
+    with db._db() as conn:
+        rows = conn.execute(
+            """SELECT id, name, processing_status, media_root
+               FROM archive_files
+               WHERE archive_id = ? AND origin = 'manifest'""",
+            (archive_id,),
+        ).fetchall()
+
+    if not rows:
+        return
+
+    # Group files by their parent directory
+    from collections import defaultdict
+    by_dir = defaultdict(list)  # dir_path → [(file_id, basename, processing_status, media_root)]
+    for r in rows:
+        name = r["name"]
+        parent = os.path.dirname(name)
+        by_dir[parent].append((r["id"], os.path.basename(name), r["processing_status"], r["media_root"]))
+
+    METADATA_EXTS = {".txt", ".nfo", ".jpg", ".jpeg", ".png", ".pdf", ".xml",
+                     ".htm", ".html", ".bmp", ".gif", ".svg"}
+    updates = []  # (file_id, media_root)
+
+    for dir_path, files in by_dir.items():
+        if not dir_path:
+            # Root-level files — check for CUE+BIN pairs at the root
+            _detect_cue_bin_pairs(files, "", updates)
+            continue
+
+        # Skip files already assigned or processed
+        eligible = [(fid, bn, ps, mr) for fid, bn, ps, mr in files
+                    if not mr and ps != "processed"]
+        if not eligible:
+            continue
+
+        basenames_lower = {bn.lower() for _, bn, _, _ in files}
+        exts = {os.path.splitext(bn)[1].lower() for _, bn, _, _ in files}
+
+        # Heuristic 1: CUE+BIN set
+        has_cue = any(e == ".cue" for e in exts)
+        has_bin = any(e == ".bin" for e in exts)
+        if has_cue and has_bin:
+            for fid, bn, ps, mr in eligible:
+                updates.append((fid, dir_path))
+            continue
+
+        # Heuristic 2: GDI + track files
+        has_gdi = any(e == ".gdi" for e in exts)
+        has_raw = any(e in (".raw", ".bin") for e in exts)
+        if has_gdi and has_raw:
+            for fid, bn, ps, mr in eligible:
+                updates.append((fid, dir_path))
+            continue
+
+        # Heuristic 3: one playable file + metadata
+        non_meta = [(fid, bn) for fid, bn, ps, mr in eligible
+                    if os.path.splitext(bn)[1].lower() not in METADATA_EXTS]
+        meta_only = [(fid, bn) for fid, bn, ps, mr in eligible
+                     if os.path.splitext(bn)[1].lower() in METADATA_EXTS]
+        if len(non_meta) == 1 and meta_only:
+            for fid, bn, ps, mr in eligible:
+                updates.append((fid, dir_path))
+            continue
+
+    if updates:
+        db.set_media_root_bulk(archive_id, updates)
+        log.info("scan", "Auto-detected %d media unit file(s) in %s", len(updates), archive_id)
+
+
+def _detect_cue_bin_pairs(files, dir_path, updates):
+    """Detect CUE+BIN pairs among root-level files and group them."""
+    import re
+    from collections import defaultdict
+    cue_files = {}  # stem_lower → (fid, basename)
+    bin_files = defaultdict(list)  # stem_lower → [(fid, basename)]
+
+    for fid, bn, ps, mr in files:
+        if mr or ps == "processed":
+            continue
+        ext = os.path.splitext(bn)[1].lower()
+        stem = os.path.splitext(bn)[0].lower()
+        if ext == ".cue":
+            cue_files[stem] = (fid, bn)
+        elif ext == ".bin":
+            # BIN files often have " (Track XX)" suffix — strip it to match CUE
+            clean = stem
+            track_match = re.match(r"^(.+?)\s*\(track\s*\d+\)$", stem, re.IGNORECASE)
+            if track_match:
+                clean = track_match.group(1).strip().lower()
+            bin_files[clean].append((fid, bn))
+
+    # For each CUE with matching BINs, group them under a synthetic media_root
+    for stem, (cue_fid, cue_bn) in cue_files.items():
+        matching_bins = bin_files.get(stem, [])
+        if matching_bins:
+            # Use the CUE name (without extension) as the media_root
+            media_root = os.path.join(dir_path, os.path.splitext(cue_bn)[0]) if dir_path else os.path.splitext(cue_bn)[0]
+            updates.append((cue_fid, media_root))
+            for bin_fid, _ in matching_bins:
+                updates.append((bin_fid, media_root))
+
+
 def _finish_archive_scan(archive_id):
     """Complete an archive scan group: unknown file discovery, summary, cleanup."""
     ctx = _scan_current_archive
@@ -903,6 +1017,9 @@ def _finish_archive_scan(archive_id):
                     )
                 conn.commit()
             log.debug("scan", "%d unknown files found on disk", len(unknown_files))
+
+    # Auto-detect media units from directory structure
+    _detect_media_units(archive_id)
 
     db.recompute_archive_file_count(archive_id)
     db.recompute_archive_status(archive_id)
@@ -2281,6 +2398,42 @@ def get_collection_files(collection_id):
         return jsonify({"error": "Collection not found"}), 404
     files = db.get_collection_files(collection_id)
     return jsonify(files)
+
+
+@app.route("/api/collections/<int:collection_id>/preview", methods=["GET"])
+@login_required
+def get_collection_preview(collection_id):
+    """Return a flat row array previewing what sync would produce."""
+    result = collection_sync.preview_collection(collection_id)
+    if "error" in result:
+        return jsonify(result), 404
+    return jsonify(result)
+
+
+# ── Media Units ──────────────────────────────────────────────────────────
+
+@app.route("/api/archives/<int:archive_id>/media-units", methods=["GET"])
+@login_required
+def get_archive_media_units(archive_id):
+    """Return media unit groups for an archive."""
+    return jsonify(db.get_media_units(archive_id))
+
+
+@app.route("/api/files/media-root", methods=["POST"])
+@login_required
+def set_files_media_root():
+    """Set media_root for a list of file IDs.
+
+    Body: {"file_ids": [1, 2, 3], "media_root": "Some Folder"}
+    To clear (split): {"file_ids": [1, 2, 3], "media_root": ""}
+    """
+    data = request.get_json(force=True)
+    file_ids = data.get("file_ids", [])
+    media_root = data.get("media_root", "")
+    if not file_ids:
+        return jsonify({"error": "No file_ids provided"}), 400
+    count = db.set_media_root(file_ids, media_root)
+    return jsonify({"ok": True, "updated": count})
 
 
 # ── Archive Tags ─────────────────────────────────────────────────────────

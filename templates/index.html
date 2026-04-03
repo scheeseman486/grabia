@@ -201,6 +201,7 @@
                     <label for="file-sort">Sort by</label>
                     <select id="file-sort">
                         <option value="name">Name</option>
+                        <option value="name_flat">Name (flat)</option>
                         <option value="size">Size</option>
                         <option value="modified">Modified</option>
                         <option value="status">Status</option>
@@ -281,6 +282,15 @@
             <div class="collection-section">
                 <h3>Archives</h3>
                 <div class="collection-archives" id="collection-archives"></div>
+            </div>
+
+            <!-- Library Preview -->
+            <div class="collection-section" id="collection-preview-section" style="display:none">
+                <h3>Library Preview</h3>
+                <div class="collection-preview-wrap" id="collection-preview-wrap">
+                    <div id="collection-preview-list"></div>
+                </div>
+                <p class="collection-preview-hint" id="collection-preview-hint"></p>
             </div>
 
             <!-- Sync Status -->

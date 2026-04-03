@@ -68,6 +68,14 @@
     let alScrollRAF = null;         // requestAnimationFrame handle
     let alLastRange = null;         // { start, end } of last rendered range
 
+    // --- Collection Preview Virtual Scroll State ---
+    const CP_ROW_HEIGHT = 32;       // px per preview row
+    const CP_OVERSCAN = 15;
+    let cpRows = [];                // flat preview rows from API
+    let cpExpandedDirs = new Set(); // expanded directory unit display_names
+    let cpScrollRAF = null;
+    let cpLastRange = null;
+
     // --- Notifications ---
     let notifications = [];
     let notifIdCounter = 0;
@@ -1953,7 +1961,7 @@
     }
 
     const SORT_COL_MAP = { "col-name": "name", "col-size": "size", "col-modified": "modified", "col-status": "status" };
-    const SORT_DEFAULTS = { name: "asc", size: "desc", modified: "desc", status: "asc", priority: "asc" };
+    const SORT_DEFAULTS = { name: "asc", name_flat: "asc", size: "desc", modified: "desc", status: "asc", priority: "asc" };
 
     function updateSortArrows() {
         // Text column headers
@@ -2868,6 +2876,53 @@
         );
     }
 
+    async function batchSetMediaRoot(files) {
+        // Determine a common parent directory, or use the first file's directory
+        const dirs = new Set(files.map(f => {
+            const parts = f.name.split("/");
+            return parts.length > 1 ? parts.slice(0, -1).join("/") : "";
+        }));
+        // Use the common directory if there is exactly one; otherwise use the first file's stem
+        let mediaRoot;
+        if (dirs.size === 1 && [...dirs][0]) {
+            mediaRoot = [...dirs][0];
+        } else {
+            // Use the basename of the first file (without extension) as the unit name
+            const first = files[0].name;
+            const base = first.split("/").pop();
+            const stem = base.replace(/\.[^.]+$/, "");
+            mediaRoot = stem;
+        }
+        try {
+            await api("POST", "/api/files/media-root", {
+                file_ids: files.map(f => f.id),
+                media_root: mediaRoot,
+            });
+            // Update in-memory
+            for (const f of files) {
+                const vsf = vsFiles.find(v => v.id === f.id);
+                if (vsf) vsf.media_root = mediaRoot;
+            }
+            addNotification(`Grouped ${files.length} files as media unit "${mediaRoot}"`, "info");
+        } catch (e) {
+            addNotification("Failed to set media root: " + e.message, "error");
+        }
+    }
+
+    async function batchClearMediaRoot() {
+        const ids = Array.from(selectedFileIds);
+        try {
+            await api("POST", "/api/files/media-root", { file_ids: ids, media_root: "" });
+            for (const id of ids) {
+                const vsf = vsFiles.find(v => v.id === id);
+                if (vsf) vsf.media_root = "";
+            }
+            addNotification(`Split ${ids.length} file(s) from media unit`, "info");
+        } catch (e) {
+            addNotification("Failed to clear media root: " + e.message, "error");
+        }
+    }
+
     function updateFileRow(fileId, updates) {
         // Update in-memory data so virtual scroll re-renders stay current
         const vsFile = vsFiles.find(f => f.id === fileId);
@@ -3407,11 +3462,24 @@
             return f && f.queue_position != null;
         });
 
+        // Media unit context items
+        const selectedFiles = [...selectedFileIds].map(id => vsFiles.find(f => f.id === id)).filter(Boolean);
+        const anyHasMediaRoot = selectedFiles.some(f => f.media_root);
+        const allHaveMediaRoot = selectedFiles.length > 0 && selectedFiles.every(f => f.media_root);
+        const mediaItems = [];
+        if (n >= 2 && !allHaveMediaRoot) {
+            mediaItems.push({ label: `Group as media unit (${n})`, action: () => batchSetMediaRoot(selectedFiles) });
+        }
+        if (anyHasMediaRoot) {
+            mediaItems.push({ label: "Split media unit", action: () => batchClearMediaRoot() });
+        }
+
         showContextMenu(e, [
             { label: allQueued ? `Unqueue (${n})` : `Queue (${n})`, action: batchQueueFiles },
             { label: "Scan", action: batchScanFiles },
             { label: "Process", action: batchProcessFiles },
             { label: "Retry", action: batchRetryFiles },
+            ...(mediaItems.length ? [{ separator: true }, ...mediaItems] : []),
             { separator: true },
             { label: `Delete (${n})`, action: batchDeleteFiles, danger: true },
             { separator: true },
@@ -5260,6 +5328,8 @@
             const coll = await api("GET", `/api/collections/${id}`);
             renderCollectionDetail(coll);
             showPage("page-collection-detail");
+            // Load preview asynchronously (don't block detail rendering)
+            loadCollectionPreview(id);
         } catch (e) {
             alert("Failed to load collection: " + e.message);
         }
@@ -5337,7 +5407,146 @@
 
     function closeCollectionDetail() {
         currentCollectionId = null;
+        cpRows = [];
+        cpExpandedDirs = new Set();
+        cpLastRange = null;
         openCollections();
+    }
+
+    // --- Collection Preview ---
+
+    async function loadCollectionPreview(collectionId) {
+        const section = $("#collection-preview-section");
+        const wrap = $("#collection-preview-wrap");
+        const hint = $("#collection-preview-hint");
+        const listEl = $("#collection-preview-list");
+
+        try {
+            const result = await api("GET", `/api/collections/${collectionId}/preview`);
+            cpRows = result.rows || [];
+            cpExpandedDirs = new Set();
+            cpLastRange = null;
+
+            if (cpRows.length === 0) {
+                section.style.display = "none";
+                return;
+            }
+
+            section.style.display = "";
+            hint.textContent = `${cpRows.filter(r => r.type === "file" || r.type === "dir_unit").length} entries across ${cpRows.filter(r => r.type === "layout_header").length} layout(s)`;
+
+            // Build the flat visible rows (expanding dir_units as needed)
+            cpRenderVisible();
+
+            // Attach scroll handler
+            wrap.onscroll = () => {
+                if (cpScrollRAF) return;
+                cpScrollRAF = requestAnimationFrame(() => {
+                    cpScrollRAF = null;
+                    cpRenderVisible();
+                });
+            };
+        } catch (e) {
+            section.style.display = "none";
+        }
+    }
+
+    function cpGetVisibleRows() {
+        // Build the flat row list, inserting children for expanded dir_units
+        const rows = [];
+        for (const row of cpRows) {
+            rows.push(row);
+            if (row.type === "dir_unit" && cpExpandedDirs.has(row.display_name + "|" + row.archive_identifier)) {
+                for (const child of (row.children || [])) {
+                    rows.push({
+                        type: "dir_child",
+                        depth: row.depth + 1,
+                        display_name: child.name,
+                        size: child.size || 0,
+                        archive_identifier: row.archive_identifier,
+                        is_dir: false,
+                    });
+                }
+            }
+        }
+        return rows;
+    }
+
+    function cpRenderVisible() {
+        const wrap = $("#collection-preview-wrap");
+        const listEl = $("#collection-preview-list");
+        const allRows = cpGetVisibleRows();
+        const totalRows = allRows.length;
+        const totalHeight = totalRows * CP_ROW_HEIGHT;
+
+        const scrollTop = wrap.scrollTop;
+        const viewHeight = wrap.clientHeight;
+
+        let startRow = Math.floor(scrollTop / CP_ROW_HEIGHT) - CP_OVERSCAN;
+        let endRow = Math.ceil((scrollTop + viewHeight) / CP_ROW_HEIGHT) + CP_OVERSCAN;
+        startRow = Math.max(0, startRow);
+        endRow = Math.min(totalRows - 1, endRow);
+
+        if (cpLastRange && cpLastRange.start === startRow && cpLastRange.end === endRow) return;
+        cpLastRange = { start: startRow, end: endRow };
+
+        const savedScroll = wrap.scrollTop;
+        listEl.innerHTML = "";
+        listEl.style.height = totalHeight + "px";
+        listEl.style.position = "relative";
+
+        for (let i = startRow; i <= endRow; i++) {
+            const row = allRows[i];
+            const div = document.createElement("div");
+            div.className = "collection-preview-row";
+            div.style.position = "absolute";
+            div.style.top = (i * CP_ROW_HEIGHT) + "px";
+            div.style.left = "0";
+            div.style.right = "0";
+            div.style.height = CP_ROW_HEIGHT + "px";
+            div.style.paddingLeft = (12 + row.depth * 20) + "px";
+
+            if (row.type === "layout_header") {
+                div.classList.add("layout-header");
+                div.innerHTML = `<span class="preview-name">${esc(row.name)} <span style="font-weight:400;opacity:0.5">${esc(row.layout_type)}</span></span>`;
+            } else if (row.type === "bucket_header") {
+                div.classList.add("bucket-header");
+                div.innerHTML = `<span class="preview-name">${esc(row.name)}/</span>`;
+            } else if (row.type === "dir_unit") {
+                const key = row.display_name + "|" + row.archive_identifier;
+                const expanded = cpExpandedDirs.has(key);
+                const arrow = expanded ? "▾" : "▸";
+                div.innerHTML = `
+                    <span class="preview-icon">📁</span>
+                    <span class="preview-name" style="cursor:pointer" data-toggle-dir="${esc(key)}">${arrow} ${esc(row.display_name)}/</span>
+                    <span class="preview-archive">${esc(row.archive_identifier)}</span>
+                `;
+                div.querySelector("[data-toggle-dir]").addEventListener("click", () => {
+                    if (cpExpandedDirs.has(key)) cpExpandedDirs.delete(key);
+                    else cpExpandedDirs.add(key);
+                    cpLastRange = null;
+                    cpRenderVisible();
+                });
+            } else if (row.type === "dir_child") {
+                div.innerHTML = `
+                    <span class="preview-icon" style="opacity:0.3">📄</span>
+                    <span class="preview-name">${esc(row.display_name)}</span>
+                    <span class="preview-size">${formatBytes(row.size || 0)}</span>
+                `;
+            } else {
+                // file
+                div.innerHTML = `
+                    <span class="preview-icon">📄</span>
+                    <span class="preview-name">${esc(row.display_name)}</span>
+                    <span class="preview-archive">${esc(row.archive_identifier)}</span>
+                    <span class="preview-size">${formatBytes(row.size || 0)}</span>
+                `;
+            }
+
+            listEl.appendChild(div);
+        }
+
+        wrap.scrollTop = savedScroll;
     }
 
     // --- Collection CRUD Modals ---

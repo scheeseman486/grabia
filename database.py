@@ -507,6 +507,12 @@ def init_db():
         conn.execute("ALTER TABLE archives ADD COLUMN manifest_json TEXT DEFAULT NULL")
         conn.execute("ALTER TABLE archives ADD COLUMN manifest_fetched_at REAL DEFAULT NULL")
 
+    # Migration: add media_root column for multi-file media unit grouping
+    try:
+        conn.execute("SELECT media_root FROM archive_files LIMIT 1")
+    except sqlite3.OperationalError:
+        conn.execute("ALTER TABLE archive_files ADD COLUMN media_root TEXT NOT NULL DEFAULT ''")
+
     # Queue state settings (download_state, processing_paused, scan_paused)
     conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('download_state', 'stopped')")
     conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('processing_paused', '0')")
@@ -863,6 +869,7 @@ def set_archive_status(archive_id, status):
 
 _FILE_SORT_MAP = {
     "name": ("name", "ASC"),
+    "name_flat": ("name", "ASC"),  # basename-only sort; handled specially below
     "size": ("size", "DESC"),
     "modified": ("mtime", "DESC"),
     "status": ("download_status", "ASC"),
@@ -891,6 +898,11 @@ def get_archive_files(archive_id, sort="name", sort_dir=None, search=""):
             order = f"(queue_position IS NULL) ASC, queue_position {direction}, name ASC"
         elif sort == "status":
             order = f"({_EFFECTIVE_STATUS_EXPR}) {direction}, name ASC"
+        elif sort == "name_flat":
+            # Sort by leaf filename only, ignoring directory prefixes
+            # SUBSTR after last '/' gives the basename; files without '/' sort normally
+            basename_expr = "CASE WHEN INSTR(name, '/') > 0 THEN SUBSTR(name, LENGTH(name) - LENGTH(REPLACE(name, '/', '')) + 1) ELSE name END"
+            order = f"({basename_expr}) {direction}"
         else:
             order = f"{col} {direction}"
             if sort != "name":
@@ -1522,6 +1534,51 @@ def get_all_processed_files(archive_id):
                 except (json.JSONDecodeError, TypeError):
                     pass
         return names
+
+
+def set_media_root(file_ids, media_root):
+    """Set the media_root for a list of file IDs."""
+    if not file_ids:
+        return 0
+    with _db() as conn:
+        placeholders = ",".join("?" * len(file_ids))
+        cur = conn.execute(
+            f"UPDATE archive_files SET media_root = ? WHERE id IN ({placeholders})",
+            [media_root] + list(file_ids),
+        )
+        conn.commit()
+        return cur.rowcount
+
+
+def get_media_units(archive_id):
+    """Return distinct media_root values (non-empty) for an archive,
+    along with the count of files in each unit."""
+    with _db() as conn:
+        rows = conn.execute(
+            """SELECT media_root, COUNT(*) as file_count
+               FROM archive_files
+               WHERE archive_id = ? AND media_root != ''
+               GROUP BY media_root
+               ORDER BY media_root""",
+            (archive_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def set_media_root_bulk(archive_id, file_media_roots):
+    """Bulk-set media_root for files in an archive.
+
+    ``file_media_roots`` is a list of (file_id, media_root) tuples.
+    Used by the auto-detection heuristics after a scan completes.
+    """
+    if not file_media_roots:
+        return
+    with _db() as conn:
+        conn.executemany(
+            "UPDATE archive_files SET media_root = ? WHERE id = ? AND archive_id = ?",
+            [(mr, fid, archive_id) for fid, mr in file_media_roots],
+        )
+        conn.commit()
 
 
 def get_file(file_id):

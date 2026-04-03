@@ -75,19 +75,25 @@ def _resolve_filename(file_row):
 
     If the file has been processed and has a ``processed_filename``,
     use that.  Otherwise fall back to the original manifest ``name``.
+
+    Returns only the leaf name (no subdirectory components) — the library
+    flattens all archive directory structures into a single level.
     """
-    return file_row.get("processed_filename") or file_row["name"]
+    raw = file_row.get("processed_filename") or file_row["name"]
+    return os.path.basename(raw)
 
 
 def _resolve_filepath(file_row, download_dir):
     """Return the absolute path to the real file on disk.
 
-    Processed files live in the same archive subdirectory as the
-    originals.
+    Uses the full relative path (including subdirectories) to locate the
+    file, even though ``_resolve_filename`` strips subdirectories for
+    display purposes.
     """
     identifier = file_row["archive_identifier"]
-    filename = _resolve_filename(file_row)
-    return os.path.join(download_dir, identifier, filename)
+    # Use full path for target resolution, not the flattened display name
+    raw = file_row.get("processed_filename") or file_row["name"]
+    return os.path.join(download_dir, identifier, raw)
 
 
 def _alphabetical_bucket(filename):
@@ -118,9 +124,51 @@ def _build_file_list(collection):
     return db.get_collection_files(collection["id"])
 
 
-def _compute_layout_mapping(layout, files):
-    """Compute a mapping of ``{relative_dir: [(filename, file_row), ...]}``
+def _build_media_units(files, download_dir):
+    """Collapse files sharing a ``media_root`` into single directory units.
+
+    Returns a list of unit dicts:
+      - Standalone files: ``{display_name, file_row, is_dir: False}``
+      - Media root dirs:  ``{display_name, file_row, is_dir: True,
+        target_dir, children: [file_row, ...]}``
+
+    **Critical rule:** processed files are always standalone — ``media_root``
+    is ignored when ``processed_filename`` is set, because the processor has
+    already collapsed multi-file input into a single output.
+    """
+    units = []
+    grouped = defaultdict(list)  # (identifier, media_root) → [file_rows]
+
+    for f in files:
+        root = f.get("media_root", "")
+        is_processed = bool(f.get("processed_filename"))
+        if root and not is_processed:
+            grouped[(f["archive_identifier"], root)].append(f)
+        else:
+            units.append({
+                "display_name": _resolve_filename(f),
+                "file_row": f,
+                "is_dir": False,
+            })
+
+    for (identifier, root), group_files in grouped.items():
+        units.append({
+            "display_name": os.path.basename(root),
+            "file_row": group_files[0],  # representative for archive_identifier etc.
+            "is_dir": True,
+            "target_dir": os.path.join(download_dir, identifier, root),
+            "children": group_files,
+        })
+
+    return units
+
+
+def _compute_layout_mapping(layout, units):
+    """Compute a mapping of ``{relative_dir: [(display_name, unit), ...]}``
     for a given layout type.
+
+    Accepts media units (from ``_build_media_units``) rather than raw
+    file rows.
 
     ``relative_dir`` is relative to the layout root, e.g. ``""`` for flat,
     ``"A"`` for alphabetical, ``"xbox-redump-1"`` for by_archive.
@@ -128,29 +176,30 @@ def _compute_layout_mapping(layout, files):
     layout_type = layout["type"]
     mapping = defaultdict(list)
 
-    for f in files:
-        display_name = _resolve_filename(f)
+    for unit in units:
+        display_name = unit["display_name"]
         if layout_type == "flat":
-            mapping[""].append((display_name, f))
+            mapping[""].append((display_name, unit))
         elif layout_type == "alphabetical":
             bucket = _alphabetical_bucket(display_name)
-            mapping[bucket].append((display_name, f))
+            mapping[bucket].append((display_name, unit))
         elif layout_type == "by_archive":
-            mapping[f["archive_identifier"]].append((display_name, f))
+            mapping[unit["file_row"]["archive_identifier"]].append((display_name, unit))
         else:
             # Unknown layout type — treat as flat
-            mapping[""].append((display_name, f))
+            mapping[""].append((display_name, unit))
 
     return mapping
 
 
 def _resolve_conflicts(mapping):
-    """Detect duplicate filenames within each directory bucket and
+    """Detect duplicate display names within each directory bucket and
     resolve by prefixing the archive identifier.
 
-    Modifies ``mapping`` in place — entries become
-    ``(display_name, file_row)`` where ``display_name`` may have been
-    changed to ``[identifier] filename``.
+    Modifies ``mapping`` in place — entries are ``(display_name, unit)``
+    where ``display_name`` may be changed to ``[identifier] name``.
+
+    Works with both standalone files and directory media units.
 
     Returns the number of conflicts resolved.
     """
@@ -158,19 +207,20 @@ def _resolve_conflicts(mapping):
     for subdir, entries in mapping.items():
         # Group by display name
         by_name = defaultdict(list)
-        for display_name, file_row in entries:
-            by_name[display_name].append(file_row)
+        for display_name, unit in entries:
+            by_name[display_name].append(unit)
 
         # Rebuild entries, prefixing where there are clashes
         new_entries = []
-        for display_name, rows in by_name.items():
-            if len(rows) == 1:
-                new_entries.append((display_name, rows[0]))
+        for display_name, units in by_name.items():
+            if len(units) == 1:
+                new_entries.append((display_name, units[0]))
             else:
-                conflicts += len(rows)
-                for row in rows:
-                    prefixed = f"[{row['archive_identifier']}] {display_name}"
-                    new_entries.append((prefixed, row))
+                conflicts += len(units)
+                for unit in units:
+                    identifier = unit["file_row"]["archive_identifier"]
+                    prefixed = f"[{identifier}] {display_name}"
+                    new_entries.append((prefixed, unit))
         mapping[subdir] = new_entries
 
     return conflicts
@@ -227,6 +277,7 @@ def sync_collection(collection_id):
         return {"error": "Collection has no layouts configured"}
 
     files = _build_file_list(collection)
+    units = _build_media_units(files, download_dir)
 
     stats = {
         "collection_id": collection_id,
@@ -253,30 +304,42 @@ def sync_collection(collection_id):
         }
 
         # Compute desired symlinks for this layout
-        mapping = _compute_layout_mapping(layout, files)
+        mapping = _compute_layout_mapping(layout, units)
         layout_stats["conflicts"] = _resolve_conflicts(mapping)
 
-        # Build set of desired symlink paths (absolute) → target paths
-        desired = {}  # link_path → target_path
+        # Build set of desired symlink paths (absolute) → (target_path, is_dir)
+        desired = {}  # link_path → (target_path, is_dir)
         for subdir, entries in mapping.items():
             if subdir:
                 link_parent = os.path.join(layout_dir, _safe_name(subdir))
             else:
                 link_parent = layout_dir
 
-            for display_name, file_row in entries:
+            for display_name, unit in entries:
                 link_path = os.path.join(link_parent, display_name)
-                target_path = _resolve_filepath(file_row, download_dir)
-                desired[link_path] = target_path
+                if unit["is_dir"]:
+                    target_path = unit["target_dir"]
+                else:
+                    target_path = _resolve_filepath(unit["file_row"], download_dir)
+                desired[link_path] = (target_path, unit["is_dir"])
 
         # Collect existing symlinks under this layout dir
+        # Check both files and directories — directory symlinks appear in dirnames
         existing = set()
         if os.path.isdir(layout_dir):
-            for dirpath, _dirnames, filenames in os.walk(layout_dir):
+            for dirpath, dirnames, filenames in os.walk(layout_dir):
                 for fname in filenames:
                     full = os.path.join(dirpath, fname)
                     if os.path.islink(full):
                         existing.add(full)
+                # Directory symlinks: os.walk lists them in dirnames but
+                # won't recurse into them (they're symlinks).  Check each.
+                for dname in list(dirnames):
+                    full = os.path.join(dirpath, dname)
+                    if os.path.islink(full):
+                        existing.add(full)
+                        # Don't recurse into symlinked dirs
+                        dirnames.remove(dname)
 
         # Remove stale symlinks (exist on disk but not in desired set)
         for link_path in existing - set(desired.keys()):
@@ -287,7 +350,7 @@ def sync_collection(collection_id):
                 layout_stats["errors"].append(f"Remove {link_path}: {e}")
 
         # Create or update symlinks
-        for link_path, target_path in desired.items():
+        for link_path, (target_path, is_dir) in desired.items():
             rel_target = _compute_relative_symlink(link_path, target_path)
 
             if os.path.islink(link_path):
@@ -311,12 +374,19 @@ def sync_collection(collection_id):
                 layout_stats["errors"].append(f"Mkdir {parent}: {e}")
                 continue
 
-            # Verify the target file actually exists before linking
-            if not os.path.isfile(target_path):
-                layout_stats["errors"].append(
-                    f"Target missing: {target_path} (skipping symlink)"
-                )
-                continue
+            # Verify the target actually exists before linking
+            if is_dir:
+                if not os.path.isdir(target_path):
+                    layout_stats["errors"].append(
+                        f"Target dir missing: {target_path} (skipping symlink)"
+                    )
+                    continue
+            else:
+                if not os.path.isfile(target_path):
+                    layout_stats["errors"].append(
+                        f"Target missing: {target_path} (skipping symlink)"
+                    )
+                    continue
 
             try:
                 os.symlink(rel_target, link_path)
@@ -383,6 +453,94 @@ def delete_collection_files(collection_id):
             log.info("collections", "Deleted collection directory: %s", coll_dir)
         except OSError as e:
             log.error("collections", "Failed to delete collection dir %s: %s", coll_dir, e)
+
+
+def preview_collection(collection_id):
+    """Compute what a collection sync would produce, without touching disk.
+
+    Returns a flat list of rows suitable for the virtual-scroll preview UI::
+
+        [
+            {"type": "layout_header", "depth": 0, "name": "A-Z", "layout_type": "alphabetical"},
+            {"type": "bucket_header", "depth": 1, "name": "A"},
+            {"type": "file", "depth": 2, "display_name": "Ape Escape.chd",
+             "is_dir": False, "archive_identifier": "redump-psx"},
+            {"type": "dir_unit", "depth": 2, "display_name": "Armored Core",
+             "is_dir": True, "archive_identifier": "redump-psx",
+             "children": [{"name": "Armored Core.cue"}, ...]},
+            ...
+        ]
+
+    Shares the same pipeline as ``sync_collection``:
+    ``_build_file_list → _build_media_units → _compute_layout_mapping
+    → _resolve_conflicts``, then serialises to flat rows.
+    """
+    collection = db.get_collection(collection_id)
+    if not collection:
+        return {"error": f"Collection {collection_id} not found"}
+
+    download_dir = get_download_dir()
+    layouts = db.get_collection_layouts(collection_id)
+    if not layouts:
+        return {"rows": [], "total": 0}
+
+    files = _build_file_list(collection)
+    units = _build_media_units(files, download_dir)
+
+    rows = []
+
+    for layout in layouts:
+        mapping = _compute_layout_mapping(layout, units)
+        _resolve_conflicts(mapping)
+
+        rows.append({
+            "type": "layout_header",
+            "depth": 0,
+            "name": layout["name"],
+            "layout_type": layout["type"],
+        })
+
+        # Sort buckets: alphabetical order for bucket names
+        for subdir in sorted(mapping.keys()):
+            entries = mapping[subdir]
+            if subdir:
+                rows.append({
+                    "type": "bucket_header",
+                    "depth": 1,
+                    "name": subdir,
+                })
+                entry_depth = 2
+            else:
+                entry_depth = 1
+
+            # Sort entries by display name within each bucket
+            for display_name, unit in sorted(entries, key=lambda e: e[0].lower()):
+                if unit["is_dir"]:
+                    children = []
+                    for child in unit.get("children", []):
+                        children.append({
+                            "name": os.path.basename(child["name"]),
+                            "size": child.get("size", 0),
+                        })
+                    rows.append({
+                        "type": "dir_unit",
+                        "depth": entry_depth,
+                        "display_name": display_name,
+                        "is_dir": True,
+                        "archive_identifier": unit["file_row"]["archive_identifier"],
+                        "children": sorted(children, key=lambda c: c["name"].lower()),
+                    })
+                else:
+                    rows.append({
+                        "type": "file",
+                        "depth": entry_depth,
+                        "display_name": display_name,
+                        "is_dir": False,
+                        "archive_identifier": unit["file_row"]["archive_identifier"],
+                        "size": unit["file_row"].get("size", 0),
+                    })
+
+    return {"rows": rows, "total": len(rows)}
 
 
 def _remove_empty_dirs(root):
