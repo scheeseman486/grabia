@@ -513,6 +513,8 @@ class DownloadManager:
             activity.log(None, "success", f"Downloaded {filename}",
                          archive_id=archive_id, file_id=file_id, category="download")
             activity.flush()
+            # Auto-process: queue this file for processing if the archive has a profile set
+            self._try_auto_process(archive_id, file_id)
         elif skip_event.is_set() and not self._stop_event.is_set():
             # File was skipped/dequeued mid-download — keep partial bytes on disk
             partial = 0
@@ -732,6 +734,23 @@ class DownloadManager:
             for chunk in iter(lambda: f.read(8192), b""):
                 md5.update(chunk)
         return md5.hexdigest() == expected_md5
+
+    def _try_auto_process(self, archive_id, file_id):
+        """If the archive has an auto-process profile, queue this file for processing.
+
+        Called after each file completes downloading.  If a processing job is
+        already running for this archive the file is appended to it; otherwise
+        a new job is created.
+        """
+        try:
+            archive = db.get_archive(archive_id)
+            if not archive or not archive.get("processing_profile_id"):
+                return
+            profile_id = archive["processing_profile_id"]
+            from processing_worker import auto_process_file
+            auto_process_file(archive_id, profile_id, file_id)
+        except Exception as e:
+            log.warning("Auto-process error for file %s: %s", file_id, e)
 
     def _check_archive_completion(self, archive_id):
         """Recompute archive status after a file finishes downloading.

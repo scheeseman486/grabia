@@ -2216,6 +2216,17 @@ def process_archive(archive_id):
     return jsonify({"ok": True, "queued": queued})
 
 
+@app.route("/api/archives/<int:archive_id>/auto-process", methods=["POST"])
+@login_required
+def set_auto_process(archive_id):
+    """Set or clear the auto-process profile for an archive."""
+    data = request.json or {}
+    profile_id = data.get("profile_id")  # None to disable
+    db.set_archive_processing_profile(archive_id, profile_id)
+    broadcast_sse("archive_updated", {"id": archive_id, "processing_profile_id": profile_id})
+    return jsonify({"ok": True})
+
+
 @app.route("/api/archives/<int:archive_id>/process/cancel", methods=["POST"])
 @login_required
 def cancel_processing(archive_id):

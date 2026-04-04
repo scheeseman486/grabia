@@ -115,6 +115,58 @@ def queue_archive_processing(archive_id, profile_id, file_ids=None, options_over
     return True, pending > 1
 
 
+def auto_process_file(archive_id, profile_id, file_id):
+    """Queue a single file for auto-processing after download.
+
+    If a processing job is already active for this archive, the file is
+    appended to it (the worker will pick it up naturally).  Otherwise a
+    new job is created.  The file is silently skipped if its extension
+    doesn't match the processor's input types.
+
+    Returns True if the file was queued, False otherwise.
+    """
+    profile = db.get_processing_profile(profile_id)
+    if not profile:
+        return False
+
+    processor_cls = get_processor(profile.get("processor_type"))
+    if not processor_cls:
+        return False
+
+    # Check extension compatibility
+    file_info = db.get_file(file_id)
+    if not file_info:
+        return False
+    ext = os.path.splitext(file_info["name"])[1].lower()
+    if ext not in set(processor_cls.input_extensions):
+        return False
+
+    options_json = json.loads(profile.get("options_json", "{}")) if profile.get("options_json") else {}
+
+    existing = db.get_active_processing_job_for_archive(archive_id)
+    if existing:
+        # Append to the running/pending job
+        job_id = existing["id"]
+        db.add_processing_queue_entries_batch(job_id, [
+            (file_id, archive_id, profile_id, options_json),
+        ])
+        db.set_file_processing_status(file_id, "queued", processor_type=profile["processor_type"])
+        # Guard against a narrow race: the job may have finalised between our
+        # check and the insert.  Re-verify and fall through to new-job creation
+        # if that happened (the orphaned queue entry is harmless).
+        still_active = db.get_active_processing_job_for_archive(archive_id)
+        if still_active and still_active["id"] == job_id:
+            _broadcast("queue_changed", {"queue_type": "processing", "count": 1, "archive_id": archive_id})
+            _wake_event.set()
+            return True
+        # Job was finalised — reset the file and fall through
+        db.set_file_processing_status(file_id, "", processor_type=profile["processor_type"])
+
+    # No active job — create a new one for just this file
+    ok, _ = queue_archive_processing(archive_id, profile_id, file_ids=[file_id])
+    return ok
+
+
 def cancel_current_processing():
     """Cancel whatever is currently being processed (if anything).
     Used by the 'Cancel and Remove All' action."""

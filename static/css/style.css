@@ -958,6 +958,26 @@ main {
     border: 1px solid var(--border);
     flex-wrap: wrap;
 }
+.detail-controls-sep {
+    width: 1px;
+    height: 24px;
+    background: var(--border);
+    flex-shrink: 0;
+}
+.detail-auto-process {
+    font-size: 13px;
+    padding: 0;
+    white-space: nowrap;
+}
+.auto-process-profile-select {
+    font-size: 13px;
+    padding: 3px 6px;
+    border-radius: 4px;
+    border: 1px solid var(--border);
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    max-width: 180px;
+}
 
 .sort-control {
     display: flex;

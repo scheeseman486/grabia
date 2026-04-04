@@ -764,7 +764,18 @@
         });
 
         es.addEventListener("archive_added", () => { refreshArchives(); refreshQueueCount(); });
-        es.addEventListener("archive_updated", () => { refreshArchives(); refreshQueueCount(); });
+        es.addEventListener("archive_updated", (e) => {
+            refreshArchives(); refreshQueueCount();
+            // Sync auto-process controls if viewing the updated archive
+            try {
+                const data = JSON.parse(e.data);
+                if (data.id && data.id === currentArchiveId && data.processing_profile_id !== undefined) {
+                    const archive = archives.find(a => a.id === data.id);
+                    if (archive) archive.processing_profile_id = data.processing_profile_id;
+                    updateAutoProcessControls(currentArchiveId);
+                }
+            } catch (_) {}
+        });
         es.addEventListener("archive_removed", () => { refreshArchives(); refreshQueueCount(); });
         // archives_reordered is no longer sent (archives sorted client-side)
         es.addEventListener("groups_changed", () => refreshGroups());
@@ -1957,6 +1968,44 @@
         await loadFiles();
         updateScanButton();
         loadArchiveTagsAndCollections(id);
+        updateAutoProcessControls(id);
+    }
+
+    async function updateAutoProcessControls(archiveId) {
+        const toggle = $("#auto-process-toggle");
+        const select = $("#auto-process-profile");
+        if (!toggle || !select) return;
+
+        const archive = archives.find(a => a.id === archiveId);
+        const currentProfileId = archive ? archive.processing_profile_id : null;
+
+        // Populate profile dropdown
+        const profiles = await loadProcessingProfiles();
+        select.innerHTML = "";
+        for (const p of profiles) {
+            const o = document.createElement("option");
+            o.value = p.id;
+            o.textContent = p.name;
+            select.appendChild(o);
+        }
+
+        if (profiles.length === 0) {
+            // No profiles — disable both controls
+            toggle.checked = false;
+            toggle.disabled = true;
+            select.style.display = "none";
+            return;
+        }
+
+        toggle.disabled = false;
+        if (currentProfileId) {
+            toggle.checked = true;
+            select.value = currentProfileId;
+            select.style.display = "";
+        } else {
+            toggle.checked = false;
+            select.style.display = "none";
+        }
     }
 
     function closeDetail() {
@@ -4030,14 +4079,12 @@
 
         const archiveName = getArchiveName(currentArchiveId);
         $("#process-archive-info").textContent = `Process files in "${archiveName}"`;
-        $("#process-auto-future").checked = false;
         $("#modal-process-archive").classList.add("open");
     }
 
     async function confirmProcessArchive() {
         const profileId = parseInt($("#process-profile-select").value);
         const options = collectOptions($("#process-profile-options"));
-        const autoProcess = $("#process-auto-future").checked;
         const fileIds = pendingBatchProcessIds || undefined;
         pendingBatchProcessIds = null;
 
@@ -4050,7 +4097,7 @@
         let queued = 0;
         for (const aid of archiveIds) {
             try {
-                const body = { profile_id: profileId, options, auto_process: autoProcess };
+                const body = { profile_id: profileId, options };
                 if (fileIds) body.file_ids = fileIds;
                 const resp = await api("POST", `/api/archives/${aid}/process`, body);
                 if (resp.queued) queued++;
@@ -6012,6 +6059,30 @@
         $("#btn-scan-files").addEventListener("click", scanExistingFiles);
         $("#btn-process-all-files").addEventListener("click", openProcessArchiveModal);
         $("#btn-clear-changes").addEventListener("click", clearChanges);
+
+        // Auto-process controls in detail-controls
+        $("#auto-process-toggle").addEventListener("change", async () => {
+            if (!currentArchiveId) return;
+            const checked = $("#auto-process-toggle").checked;
+            const select = $("#auto-process-profile");
+            if (checked) {
+                select.style.display = "";
+                const profileId = parseInt(select.value);
+                if (profileId) {
+                    await api("POST", `/api/archives/${currentArchiveId}/auto-process`, { profile_id: profileId });
+                }
+            } else {
+                select.style.display = "none";
+                await api("POST", `/api/archives/${currentArchiveId}/auto-process`, { profile_id: null });
+            }
+        });
+        $("#auto-process-profile").addEventListener("change", async () => {
+            if (!currentArchiveId || !$("#auto-process-toggle").checked) return;
+            const profileId = parseInt($("#auto-process-profile").value);
+            if (profileId) {
+                await api("POST", `/api/archives/${currentArchiveId}/auto-process`, { profile_id: profileId });
+            }
+        });
 
         // Process Archive modal
         $("#btn-process-cancel").addEventListener("click", () => $("#modal-process-archive").classList.remove("open"));
