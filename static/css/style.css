@@ -2841,13 +2841,16 @@ details[open] > .collection-archives-summary::before {
 .folder-archive .folder-icon { color: var(--text-muted); }
 .folder-archive .folder-name { color: var(--text); }
 
-/* Processed folder — distinct accent colour */
+/* Processed folder / processed file row — distinct accent colour */
 .folder-processed { background: rgba(52, 152, 219, 0.04); }
 .folder-processed td { border-left: 3px solid rgba(52, 152, 219, 0.35) !important; }
 .folder-processed .folder-icon { color: #3498db; }
 .folder-processed .folder-name { color: #3498db; font-style: italic; }
 .folder-processed .folder-count { color: #5dade2; }
 .folder-processed:hover td { background: rgba(52, 152, 219, 0.08); }
+/* Inline folder-toggle/icon in merged processed file rows */
+.folder-processed .folder-toggle { display: inline-flex; align-items: center; justify-content: center; width: 16px; height: 16px; margin-right: 2px; flex-shrink: 0; }
+.folder-processed .folder-icon { margin-right: 6px; flex-shrink: 0; }
 
 /* Processed file rows (inside .processed folders) */
 .pfile-row td { padding-top: 4px !important; padding-bottom: 4px !important; }

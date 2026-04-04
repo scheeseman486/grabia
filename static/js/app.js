@@ -2353,11 +2353,12 @@
      * Flatten tree into row descriptors respecting expand/collapse state.
      * Returns array of:
      *   { type: "folder",    path, name, depth, fileCount, folderType: "archive"|"processed", sourceFileId? }
-     *   { type: "file",      file, depth }
+     *   { type: "file",      file, depth, processedPath?, processedExpanded? }
      *   { type: "divider" }
      *
-     * Processed files with status "processed" inject a ".processed" virtual folder
-     * directly after their file row (if expanded).
+     * Processed files are merged with their .processed folder — the file row itself
+     * becomes expandable (with chevron + folder icon).  Processed children appear
+     * directly after the file row when expanded.
      */
     function vsFlattenTree(tree, isPriority) {
         const rows = [];
@@ -2394,19 +2395,16 @@
                 }
             }
             for (const f of node.files) {
-                rows.push({ type: "file", file: f, depth });
-                // If this file is processed, inject a .processed virtual folder
+                // If this file is processed, mark it as expandable inline
                 if (f.processing_status === "processed") {
                     const processedPath = "__processed__" + f.id;
                     const expanded = vsExpandedFolders.has(processedPath);
-                    rows.push({
-                        type: "folder", path: processedPath, name: f.name + ".processed",
-                        depth: depth + 1, fileCount: -1, folderType: "processed",
-                        sourceFileId: f.id,
-                    });
+                    rows.push({ type: "file", file: f, depth, processedPath, processedExpanded: expanded });
                     if (expanded && vsProcessedCache[f.id]) {
-                        flattenProcessedTree(vsProcessedCache[f.id], depth + 2, rows);
+                        flattenProcessedTree(vsProcessedCache[f.id], depth + 1, rows);
                     }
+                } else {
+                    rows.push({ type: "file", file: f, depth });
                 }
             }
         }
@@ -2539,10 +2537,14 @@
     }
 
     // Build a single file <tr> element with all cells and event listeners.
-    function buildFileRow(f, isPriority, queuedFiles, lastQueuedIdx, depth) {
+    function buildFileRow(f, isPriority, queuedFiles, lastQueuedIdx, depth, desc) {
         const tr = document.createElement("tr");
         tr.dataset.fileId = f.id;
         if (isFlashing(tr)) tr.classList.add("queue-flash");
+
+        // Processed files get the processed-folder styling
+        const hasProcessedFolder = desc && desc.processedPath;
+        if (hasProcessedFolder) tr.classList.add("folder-processed");
 
         if (f.change_status) tr.className += (tr.className ? " " : "") + "file-row-" + f.change_status;
 
@@ -2605,8 +2607,12 @@
         const indent = (depth || 0) * 20;
         // Show only leaf filename when tree view provides folder context
         const displayName = (depth != null && depth > 0) ? f.name.replace(/\\/g, "/").split("/").pop() : f.name;
+        // Processed files get a chevron + folder icon prefix
+        const procChevron = hasProcessedFolder
+            ? `<span class="folder-toggle">${desc.processedExpanded ? CHEVRON_DOWN : CHEVRON_RIGHT}</span>${FOLDER_ICON_PROCESSED}`
+            : "";
         html += `<td class="col-name"><div class="file-name-wrap" style="padding-left:${indent}px">` +
-            unknownGrip +
+            unknownGrip + procChevron +
             renderFileName(displayName, sourceDeleted ? "file-name-deleted" : f.downloaded ? "file-name-downloaded" : "") + changeIcon +
             `<span class="file-actions">` +
             renameBtn + processBtn + rescanBtn + deleteBtn +
@@ -2695,10 +2701,36 @@
         if (procStatus === "processed") {
             tr.classList.add("processed-expandable");
         }
+        // Processed files: single click on chevron/toggle expands processed tree
+        if (hasProcessedFolder) {
+            const toggleEl = tr.querySelector(".folder-toggle");
+            if (toggleEl) {
+                toggleEl.style.cursor = "pointer";
+                toggleEl.addEventListener("click", async (e) => {
+                    e.stopPropagation();
+                    if (desc.processedExpanded) {
+                        vsExpandedFolders.delete(desc.processedPath);
+                    } else {
+                        vsExpandedFolders.add(desc.processedPath);
+                        // Lazy-load processed tree
+                        if (!vsProcessedCache[f.id]) {
+                            try {
+                                const data = await api("GET", `/api/files/${f.id}/processed-tree`);
+                                vsProcessedCache[f.id] = data.tree || [];
+                            } catch (err) {
+                                vsProcessedCache[f.id] = [];
+                            }
+                        }
+                    }
+                    vsInvalidateDescriptors();
+                    vsRenderVisible();
+                });
+            }
+        }
         // All manifest files can be expanded to show tags (and processed output if applicable)
         if (f.origin === "manifest" || procStatus === "processed") {
             tr.addEventListener("dblclick", (e) => {
-                if (e.target.closest("button, .file-error-hint, .file-actions, .queue-toggle")) return;
+                if (e.target.closest("button, .file-error-hint, .file-actions, .queue-toggle, .folder-toggle")) return;
                 toggleFileDetail(tr, f, isPriority);
             });
         }
@@ -2767,7 +2799,7 @@
             } else if (desc.type === "pfile") {
                 fileListEl.appendChild(buildProcessedFileRow(desc));
             } else {
-                const tr = buildFileRow(desc.file, isPriority, queuedFiles, lastQueuedIdx, desc.depth);
+                const tr = buildFileRow(desc.file, isPriority, queuedFiles, lastQueuedIdx, desc.depth, desc);
                 fileListEl.appendChild(tr);
             }
         }
@@ -2901,7 +2933,7 @@
             inheritedTags = tagData.inherited || [];
         } catch (e) { /* silent */ }
 
-        // Tags section only — processed output is now shown inline as .processed folder
+        // Tags section only — processed output is shown inline via expandable file row
         const cellHtml = buildFileTagsHtml(f.id, ownTags, inheritedTags);
 
         detailTr.innerHTML = `<td colspan="${colCount}" class="file-detail-cell">${cellHtml}</td>`;
