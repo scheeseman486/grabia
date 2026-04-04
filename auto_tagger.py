@@ -17,9 +17,9 @@
 
 """Auto-tagger — extracts structured tags from filenames.
 
-Parses parenthetical tokens from ROM/media filenames and maps them to
-normalised tags using TAG_KEY.txt as a lookup table plus dynamic pattern
-matching for revisions, versions, dates, etc.
+Parses parenthetical and bracket tokens from ROM/media filenames and maps
+them to normalised tags using TAG_KEY.txt as a lookup table.  Both static
+mappings and user-editable regex patterns are loaded from TAG_KEY.txt.
 """
 
 import os
@@ -63,27 +63,86 @@ def sanitise_tag(tag):
 # TAG_KEY.txt loader
 # ---------------------------------------------------------------------------
 
-_tag_key = None  # cached lookup dict
+_tag_key = None       # cached static lookup dict
+_tag_patterns = None  # cached list of (compiled_regex, tag_template) tuples
+
+# Regex to parse a pattern line:  /REGEX/FLAGS > tag_template
+_RE_PATTERN_LINE = re.compile(r'^/(.+)/([a-zA-Z]*)\s+>\s+(.+)$')
+
+# Regex to find template placeholders like {0}, {1}, {1:lower}
+_RE_TEMPLATE_VAR = re.compile(r'\{(\d+)(?::(\w+))?\}')
+
+
+def _build_regex_flags(flag_str):
+    """Convert a flag string like 'i' to re module flags."""
+    flags = 0
+    for ch in flag_str:
+        if ch == 'i':
+            flags |= re.IGNORECASE
+    return flags
+
+
+def _expand_template(template, match):
+    """Expand a tag template using regex match groups.
+
+    Supports {0} for full match, {1}..{N} for capture groups,
+    and modifiers like {1:lower}.
+    """
+    def replacer(m):
+        idx = int(m.group(1))
+        modifier = m.group(2)
+        try:
+            val = match.group(idx) if idx > 0 else match.group(0)
+        except IndexError:
+            val = ""
+        if val is None:
+            val = ""
+        if modifier == "lower":
+            val = val.lower()
+        elif modifier == "upper":
+            val = val.upper()
+        return val
+
+    return _RE_TEMPLATE_VAR.sub(replacer, template)
 
 
 def load_tag_key(path=None):
-    """Load TAG_KEY.txt into a case-insensitive lookup dict.
+    """Load TAG_KEY.txt into a case-insensitive lookup dict and regex patterns.
 
     Returns dict mapping lowercase pattern -> list of tag strings.
+    Also populates the _tag_patterns list with (compiled_re, template) tuples.
     """
-    global _tag_key
+    global _tag_key, _tag_patterns
     if path is None:
         path = os.path.join(os.path.dirname(__file__), "TAG_KEY.txt")
+
     lookup = {}
+    patterns = []
+
     if not os.path.isfile(path):
         log.warning("TAG_KEY.txt not found at %s", path)
         _tag_key = lookup
+        _tag_patterns = patterns
         return lookup
+
     with open(path, "r", encoding="utf-8") as f:
-        for line in f:
+        for lineno, line in enumerate(f, 1):
             line = line.strip()
             if not line or line.startswith("#"):
                 continue
+
+            # Check if this is a regex pattern line: /regex/flags > template
+            pm = _RE_PATTERN_LINE.match(line)
+            if pm:
+                regex_str, flags_str, template = pm.group(1), pm.group(2), pm.group(3).strip()
+                try:
+                    compiled = re.compile(regex_str, _build_regex_flags(flags_str))
+                    patterns.append((compiled, template))
+                except re.error as e:
+                    log.warning("TAG_KEY.txt line %d: bad regex /%s/: %s", lineno, regex_str, e)
+                continue
+
+            # Otherwise it's a static mapping: PATTERN > tag1, tag2
             if " > " not in line:
                 continue
             pattern_part, tags_part = line.split(" > ", 1)
@@ -92,7 +151,10 @@ def load_tag_key(path=None):
             tags = [t for t in tags if t]
             if pattern and tags:
                 lookup[pattern] = tags
+
+    log.info("TAG_KEY loaded: %d static mappings, %d regex patterns", len(lookup), len(patterns))
     _tag_key = lookup
+    _tag_patterns = patterns
     return lookup
 
 
@@ -104,79 +166,67 @@ def _get_tag_key():
     return _tag_key
 
 
-# ---------------------------------------------------------------------------
-# Dynamic pattern matchers
-# ---------------------------------------------------------------------------
+def _get_tag_patterns():
+    """Return cached regex patterns, loading if necessary."""
+    global _tag_patterns
+    if _tag_patterns is None:
+        load_tag_key()
+    return _tag_patterns
 
-_RE_REV = re.compile(r'^rev\s+([a-z0-9]+)$', re.IGNORECASE)
-_RE_VERSION = re.compile(r'^v(\d+(?:\.\d+)+)$', re.IGNORECASE)
-_RE_ALT_NUM = re.compile(r'^alt\s+(\d+)$', re.IGNORECASE)
-_RE_DATE_DASHED = re.compile(r'^(\d{4})-(\d{2})-([0-9xX]{2})$')
-_RE_DATE_COMPACT = re.compile(r'^(\d{4})(\d{2})(\d{2})$')
-_RE_DISC = re.compile(r'^dis[ck]\s+(\d+)$', re.IGNORECASE)
-_RE_SIDE = re.compile(r'^side\s+([a-z])$', re.IGNORECASE)
-_RE_TRACK = re.compile(r'^track\s+(\d+)$', re.IGNORECASE)
 
+# ---------------------------------------------------------------------------
+# Dynamic pattern matching (from TAG_KEY.txt regex rules)
+# ---------------------------------------------------------------------------
 
 def _try_dynamic_match(token):
-    """Try dynamic regex patterns on a token. Returns list of tags or None."""
-    m = _RE_REV.match(token)
-    if m:
-        return [f"alt:rev_{m.group(1).lower()}"]
+    """Try regex patterns from TAG_KEY.txt on a token.
 
-    m = _RE_VERSION.match(token)
-    if m:
-        return [f"version:{m.group(1)}"]
-
-    m = _RE_ALT_NUM.match(token)
-    if m:
-        return [f"alt:{m.group(1)}"]
-
-    m = _RE_DATE_DASHED.match(token)
-    if m:
-        return [f"date:{m.group(0).lower()}"]
-
-    m = _RE_DATE_COMPACT.match(token)
-    if m:
-        year, month, day = m.group(1), m.group(2), m.group(3)
-        return [f"date:{year}-{month}-{day}"]
-
-    m = _RE_DISC.match(token)
-    if m:
-        return [f"disc:{m.group(1)}"]
-
-    m = _RE_SIDE.match(token)
-    if m:
-        return [f"side:{m.group(1).lower()}"]
-
-    m = _RE_TRACK.match(token)
-    if m:
-        return [f"track:{m.group(1)}"]
-
+    Returns list of tags or None.
+    """
+    patterns = _get_tag_patterns()
+    for compiled_re, template in patterns:
+        m = compiled_re.match(token)
+        if m:
+            expanded = _expand_template(template, m)
+            tag = sanitise_tag(expanded)
+            if tag:
+                return [tag]
     return None
 
 
 # ---------------------------------------------------------------------------
-# Parenthetical token extraction
+# Token extraction from filenames
 # ---------------------------------------------------------------------------
 
+# Match both parentheses (...) and square brackets [...]
 _RE_PARENS = re.compile(r'\(([^)]+)\)')
+_RE_BRACKETS = re.compile(r'\[([^\]]+)\]')
 
 
 def _extract_tokens(filename):
-    """Extract all parenthesised token groups from a filename.
+    """Extract all parenthesised and bracketed token groups from a filename.
 
     Returns a flat list of individual tokens (comma-separated groups are split).
     """
     basename = os.path.splitext(os.path.basename(filename))[0]
     tokens = []
+
+    # Parenthesised tokens: (USA, Europe) -> ["USA", "Europe"]
     for m in _RE_PARENS.finditer(basename):
         group = m.group(1)
-        # Split comma-separated values: "USA, Europe" -> ["USA", "Europe"]
         for part in group.split(","):
             part = part.strip()
             if part:
                 tokens.append(part)
+
+    # Square bracket tokens: [b] [!] [T+Eng] -> ["b", "!", "T+Eng"]
+    for m in _RE_BRACKETS.finditer(basename):
+        group = m.group(1)
+        for part in group.split(","):
+            part = part.strip()
+            if part:
+                tokens.append(part)
+
     return tokens
 
 
@@ -187,8 +237,9 @@ def _extract_tokens(filename):
 def parse_file_tags(filename):
     """Extract structured tags from a filename.
 
-    Parses parenthetical tokens and resolves them against TAG_KEY.txt
-    and dynamic patterns. Returns a deduplicated list of tag strings.
+    Parses parenthetical and bracket tokens and resolves them against
+    TAG_KEY.txt static mappings and regex patterns.
+    Returns a deduplicated list of tag strings.
 
     Args:
         filename: File name or path (only basename is used)
@@ -203,13 +254,13 @@ def parse_file_tags(filename):
     for token in tokens:
         token_lower = token.strip().lower()
 
-        # 1. Exact match in TAG_KEY
+        # 1. Exact match in static TAG_KEY
         if token_lower in key:
             for t in key[token_lower]:
                 tags.add(t)
             continue
 
-        # 2. Dynamic pattern match
+        # 2. Regex pattern match (from TAG_KEY.txt [Patterns] section)
         dynamic = _try_dynamic_match(token)
         if dynamic:
             for t in dynamic:

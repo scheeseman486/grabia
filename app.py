@@ -2739,7 +2739,8 @@ def get_all_tags():
 @login_required
 def trigger_auto_tag(archive_id):
     """Trigger auto-tagging for an archive (re-parses all filenames)."""
-    from auto_tagger import auto_tag_archive
+    from auto_tagger import auto_tag_archive, load_tag_key
+    load_tag_key()  # reload TAG_KEY.txt so edits take effect immediately
     auto_tag_archive(archive_id)
     return jsonify({"ok": True, "tags": db.get_archive_tags(archive_id)})
 
@@ -2752,7 +2753,8 @@ def trigger_auto_tag_files():
     file_ids = data.get("file_ids", [])
     if not file_ids:
         return jsonify({"error": "No file_ids provided"}), 400
-    from auto_tagger import auto_tag_files
+    from auto_tagger import auto_tag_files, load_tag_key
+    load_tag_key()  # reload TAG_KEY.txt so edits take effect immediately
     tagged = auto_tag_files(file_ids)
     return jsonify({"ok": True, "tagged": tagged})
 
