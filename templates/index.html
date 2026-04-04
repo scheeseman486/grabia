@@ -906,8 +906,8 @@
                         <h3>Maintenance</h3>
                         <div class="settings-form">
                             <div class="maintenance-action">
-                                <p class="settings-desc">Move processed output files from download directories to the separate processed files directory. This is a one-time migration — files already in the processed directory are skipped.</p>
-                                <button class="action-btn" id="btn-migrate-processed">Migrate Processed Files</button>
+                                <p class="settings-desc">Rename old-style folders to the new <code>.processed</code> naming convention. For example, <code>GameName/</code> becomes <code>GameName.zip.processed/</code>. Updates both the on-disk folder and the database records. Already-renamed folders are skipped.</p>
+                                <button class="action-btn" id="btn-migrate-processed">Migrate Processed Folders</button>
                                 <p class="settings-desc" id="migrate-processed-result" style="display:none;"></p>
                             </div>
                         </div>

@@ -1517,13 +1517,11 @@ class ExtractProcessor(BaseProcessor):
                 return {"skipped": True, "reason": "Archive is empty"}
 
             # Determine output location:
-            # Single file  -> extract alongside the archive
-            # Multiple files -> extract into a subfolder named after the archive
-            if len(extracted) == 1:
-                dest_dir = download_dir
-            else:
-                dest_dir = os.path.join(download_dir, base_name)
-                os.makedirs(dest_dir, exist_ok=True)
+            # Extract into a .processed subfolder named after the source archive.
+            # This keeps processed contents grouped and visually distinct in the file list.
+            archive_basename = os.path.basename(file_path)  # e.g. "archive.zip"
+            dest_dir = os.path.join(download_dir, archive_basename + ".processed")
+            os.makedirs(dest_dir, exist_ok=True)
 
             created = []
             all_relative = []  # paths relative to download_dir for DB tracking
@@ -1557,11 +1555,8 @@ class ExtractProcessor(BaseProcessor):
             if not created:
                 return {"skipped": True, "reason": "No files extracted"}
 
-            # Primary display name: the folder if multi-file, the file if single
-            if len(extracted) == 1:
-                processed_filename = all_relative[0]
-            else:
-                processed_filename = base_name + os.sep
+            # Primary display name: always the .processed folder
+            processed_filename = archive_basename + ".processed" + os.sep
 
             return {
                 "processed_filename": processed_filename,

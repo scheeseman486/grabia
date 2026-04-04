@@ -2827,6 +2827,35 @@ details[open] > .collection-archives-summary::before {
 }
 .file-detail-row { height: auto !important; }
 .file-detail-cell { padding: 0 !important; border: none !important; background: var(--bg-alt); }
+
+/* ── Folder rows ─────────────────────────────────────────────────────── */
+.folder-row { cursor: pointer; user-select: none; }
+.folder-row td { padding-top: 6px !important; padding-bottom: 6px !important; }
+.folder-row:hover td { background: var(--bg-alt); }
+.folder-row .folder-toggle { display: inline-flex; align-items: center; justify-content: center; width: 16px; height: 16px; margin-right: 2px; flex-shrink: 0; }
+.folder-row .folder-icon { margin-right: 6px; flex-shrink: 0; }
+.folder-row .folder-name { font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.folder-row .folder-count { margin-left: 8px; font-size: 11px; color: var(--text-muted); font-weight: 400; }
+
+/* Archive folder — default folder colour */
+.folder-archive .folder-icon { color: var(--text-muted); }
+.folder-archive .folder-name { color: var(--text); }
+
+/* Processed folder — distinct accent colour */
+.folder-processed { background: rgba(52, 152, 219, 0.04); }
+.folder-processed td { border-left: 3px solid rgba(52, 152, 219, 0.35) !important; }
+.folder-processed .folder-icon { color: #3498db; }
+.folder-processed .folder-name { color: #3498db; font-style: italic; }
+.folder-processed .folder-count { color: #5dade2; }
+.folder-processed:hover td { background: rgba(52, 152, 219, 0.08); }
+
+/* Processed file rows (inside .processed folders) */
+.pfile-row td { padding-top: 4px !important; padding-bottom: 4px !important; }
+.pfile-row .pfile-icon { margin-right: 6px; color: var(--text-muted); flex-shrink: 0; }
+.pfile-row .pfile-name { color: var(--text-muted); font-size: 13px; }
+
+/* Chevron animation */
+.folder-chevron { transition: transform 0.15s ease; }
 .tag-input {
     border: 1px solid var(--border);
     background: var(--bg);

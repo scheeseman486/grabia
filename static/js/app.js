@@ -61,6 +61,11 @@
     let vsScrollRAF = null;         // requestAnimationFrame handle for scroll
     let vsLastRange = null;         // { start, end } of last rendered range
 
+    // --- File Tree State ---
+    let vsExpandedFolders = new Set();     // expanded folder paths (e.g. "DOOM WADs")
+    let vsProcessedCache = {};             // file_id -> processed tree children (lazy loaded)
+    let vsRowDescriptorsCache = null;      // cached flattened row descriptors
+
     // --- Activity Log Virtual Scroll State ---
     const AL_ROW_HEIGHT = 37;       // px per activity log row
     const AL_OVERSCAN = 15;         // extra rows rendered above/below viewport
@@ -1966,6 +1971,9 @@
         vsFiles = [];
         vsLastRange = null;
         vsExpandedIds.clear();
+        vsExpandedFolders.clear();
+        vsProcessedCache = {};
+        vsInvalidateDescriptors();
         $("#file-sort").value = "name";
         $("#file-search").value = "";
         $(".file-table-wrap").scrollTop = 0;
@@ -2045,6 +2053,7 @@
             vsFiles = data.files;
             vsAllQueued = data.all_queued;
             vsExpandedIds.clear();
+            vsInvalidateDescriptors();
             renderFiles(data);
             if (data.progress) updateDetailProgressFromData(data.progress);
         } catch (e) {
@@ -2306,27 +2315,231 @@
 
     // --- Virtual-scrolled file list ---
 
-    // Build a "virtual row" descriptor for each logical row (files + divider).
-    // Returns an array of { type, file?, idx? } objects.
-    function vsGetRowDescriptors(files, isPriority) {
-        const rows = [];
-        const hasQueued = isPriority && files.some(f => f.queue_position != null);
-        const hasUnqueued = isPriority && files.some(f => f.queue_position == null);
-        const needsDivider = hasQueued && hasUnqueued;
-        let dividerInserted = false;
-        for (let i = 0; i < files.length; i++) {
-            const f = files[i];
-            if (needsDivider && !dividerInserted && f.queue_position == null) {
-                dividerInserted = true;
-                rows.push({ type: "divider" });
+    // ── File tree building ──────────────────────────────────────────────
+
+    /**
+     * Build a tree structure from flat file paths.
+     * Returns { folders: { name: treeNode }, files: [file, ...] }
+     * where treeNode = { name, path, folders, files, fileCount }
+     */
+    function vsBuildTree(files) {
+        const root = { name: "", path: "", folders: {}, files: [], fileCount: 0 };
+        for (const f of files) {
+            const parts = f.name.replace(/\\/g, "/").split("/");
+            let node = root;
+            // Walk path segments — last part is the filename
+            for (let i = 0; i < parts.length - 1; i++) {
+                const seg = parts[i];
+                if (!node.folders[seg]) {
+                    const folderPath = node.path ? node.path + "/" + seg : seg;
+                    node.folders[seg] = { name: seg, path: folderPath, folders: {}, files: [], fileCount: 0 };
+                }
+                node = node.folders[seg];
             }
-            rows.push({ type: "file", file: f, idx: i });
+            node.files.push(f);
         }
+        // Count total files recursively
+        function countFiles(n) {
+            let c = n.files.length;
+            for (const sub of Object.values(n.folders)) c += countFiles(sub);
+            n.fileCount = c;
+            return c;
+        }
+        countFiles(root);
+        return root;
+    }
+
+    /**
+     * Flatten tree into row descriptors respecting expand/collapse state.
+     * Returns array of:
+     *   { type: "folder",    path, name, depth, fileCount, folderType: "archive"|"processed", sourceFileId? }
+     *   { type: "file",      file, depth }
+     *   { type: "divider" }
+     *
+     * Processed files with status "processed" inject a ".processed" virtual folder
+     * directly after their file row (if expanded).
+     */
+    function vsFlattenTree(tree, isPriority) {
+        const rows = [];
+
+        // Priority mode: queued/divider/unqueued at root (no tree nesting)
+        if (isPriority) {
+            const hasQueued = vsFiles.some(f => f.queue_position != null);
+            const hasUnqueued = vsFiles.some(f => f.queue_position == null);
+            const needsDivider = hasQueued && hasUnqueued;
+            let dividerInserted = false;
+            for (const f of vsFiles) {
+                if (needsDivider && !dividerInserted && f.queue_position == null) {
+                    dividerInserted = true;
+                    rows.push({ type: "divider" });
+                }
+                rows.push({ type: "file", file: f, depth: 0 });
+            }
+            return rows;
+        }
+
+        // Normal mode: recursive tree flattening
+        function flattenNode(node, depth) {
+            // Sort folders alphabetically, then files in current order
+            const folderNames = Object.keys(node.folders).sort((a, b) => a.localeCompare(b, undefined, { sensitivity: "base" }));
+            for (const fname of folderNames) {
+                const sub = node.folders[fname];
+                const expanded = vsExpandedFolders.has(sub.path);
+                rows.push({
+                    type: "folder", path: sub.path, name: sub.name,
+                    depth, fileCount: sub.fileCount, folderType: "archive",
+                });
+                if (expanded) {
+                    flattenNode(sub, depth + 1);
+                }
+            }
+            for (const f of node.files) {
+                rows.push({ type: "file", file: f, depth });
+                // If this file is processed, inject a .processed virtual folder
+                if (f.processing_status === "processed") {
+                    const processedPath = "__processed__" + f.id;
+                    const expanded = vsExpandedFolders.has(processedPath);
+                    rows.push({
+                        type: "folder", path: processedPath, name: f.name + ".processed",
+                        depth: depth + 1, fileCount: -1, folderType: "processed",
+                        sourceFileId: f.id,
+                    });
+                    if (expanded && vsProcessedCache[f.id]) {
+                        flattenProcessedTree(vsProcessedCache[f.id], depth + 2, rows);
+                    }
+                }
+            }
+        }
+
+        flattenNode(tree, 0);
         return rows;
     }
 
+    /**
+     * Flatten a processed tree (from /api/files/{id}/processed-tree) into rows.
+     */
+    function flattenProcessedTree(treeNodes, depth, rows) {
+        for (const node of treeNodes) {
+            if (node.type === "dir") {
+                const dirPath = "__pdir__" + node.path;
+                const expanded = vsExpandedFolders.has(dirPath);
+                rows.push({
+                    type: "folder", path: dirPath, name: node.name,
+                    depth, fileCount: node.children ? node.children.length : 0,
+                    folderType: "processed",
+                });
+                if (expanded && node.children) {
+                    flattenProcessedTree(node.children, depth + 1, rows);
+                }
+            } else {
+                rows.push({
+                    type: "pfile", name: node.name, size: node.size,
+                    mtime: node.mtime, ppath: node.path, depth,
+                });
+            }
+        }
+    }
+
+    /**
+     * Build row descriptors from current vsFiles array.
+     * Caches result in vsRowDescriptorsCache; invalidated by folder toggle or data reload.
+     */
+    function vsGetRowDescriptors(files, isPriority) {
+        if (vsRowDescriptorsCache) return vsRowDescriptorsCache;
+        const tree = vsBuildTree(files);
+        const rows = vsFlattenTree(tree, isPriority);
+        vsRowDescriptorsCache = rows;
+        return rows;
+    }
+
+    /** Invalidate cached row descriptors (call after folder toggle, data reload, etc.) */
+    function vsInvalidateDescriptors() {
+        vsRowDescriptorsCache = null;
+        vsLastRange = null;
+    }
+
+    // SVG icons for folders
+    const FOLDER_ICON_ARCHIVE = `<svg class="folder-icon" viewBox="0 0 16 16" width="14" height="14"><path d="M14 4H8L6.5 2.5h-5l-.5.5v10l.5.5h13l.5-.5V4.5L14 4zM13 12H2V4h4l1.5 1.5H13V12z" fill="currentColor"/></svg>`;
+    const FOLDER_ICON_PROCESSED = `<svg class="folder-icon" viewBox="0 0 16 16" width="14" height="14"><path d="M14 4H8L6.5 2.5h-5l-.5.5v10l.5.5h13l.5-.5V4.5L14 4z" fill="currentColor" opacity="0.85"/><path d="M6 8l2 2.5L10 8" fill="none" stroke="var(--bg)" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+    const CHEVRON_RIGHT = `<svg class="folder-chevron" viewBox="0 0 16 16" width="12" height="12"><path d="M6 4l4 4-4 4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+    const CHEVRON_DOWN = `<svg class="folder-chevron" viewBox="0 0 16 16" width="12" height="12"><path d="M4 6l4 4 4-4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+
+    /**
+     * Build a folder <tr> element.
+     * desc = { type: "folder", path, name, depth, fileCount, folderType, sourceFileId? }
+     */
+    function buildFolderRow(desc, isPriority) {
+        const tr = document.createElement("tr");
+        tr.className = "folder-row folder-" + desc.folderType;
+        tr.dataset.folderPath = desc.path;
+        const expanded = vsExpandedFolders.has(desc.path);
+        if (expanded) tr.classList.add("expanded");
+
+        const indent = desc.depth * 20;
+        const chevron = expanded ? CHEVRON_DOWN : CHEVRON_RIGHT;
+        const icon = desc.folderType === "processed" ? FOLDER_ICON_PROCESSED : FOLDER_ICON_ARCHIVE;
+        const countBadge = desc.fileCount >= 0 ? `<span class="folder-count">${desc.fileCount}</span>` : "";
+        const nameHtml = escapeHtml(desc.name);
+
+        let html = "";
+        if (isPriority) html += '<td class="col-grip"></td>';
+        html += '<td class="col-queue"></td>';
+        html += `<td class="col-name"><div class="file-name-wrap" style="padding-left:${indent}px">` +
+            `<span class="folder-toggle">${chevron}</span>${icon}` +
+            `<span class="folder-name">${nameHtml}</span>${countBadge}` +
+            `</div></td>`;
+        html += '<td class="col-size"></td>';
+        html += '<td class="col-modified"></td>';
+        html += '<td class="col-status"></td>';
+        if (isPriority) html += '<td class="col-priority"></td>';
+        tr.innerHTML = html;
+
+        // Click anywhere on the row toggles expand/collapse
+        tr.addEventListener("click", async () => {
+            if (expanded) {
+                vsExpandedFolders.delete(desc.path);
+            } else {
+                vsExpandedFolders.add(desc.path);
+                // Lazy-load processed tree if this is a processed folder
+                if (desc.folderType === "processed" && desc.sourceFileId && !vsProcessedCache[desc.sourceFileId]) {
+                    try {
+                        const data = await api("GET", `/api/files/${desc.sourceFileId}/processed-tree`);
+                        vsProcessedCache[desc.sourceFileId] = data.tree || [];
+                    } catch (e) {
+                        vsProcessedCache[desc.sourceFileId] = [];
+                    }
+                }
+            }
+            vsInvalidateDescriptors();
+            vsRenderVisible();
+        });
+
+        return tr;
+    }
+
+    /**
+     * Build a processed-file <tr> (file inside a .processed folder).
+     * desc = { type: "pfile", name, size, mtime, ppath, depth }
+     */
+    function buildProcessedFileRow(desc) {
+        const tr = document.createElement("tr");
+        tr.className = "pfile-row";
+        const indent = desc.depth * 20;
+        const fileIcon = `<svg class="pfile-icon" viewBox="0 0 16 16" width="13" height="13"><path d="M3 1h6l4 4v10H3V1zm6 0v4h4" fill="none" stroke="currentColor" stroke-width="1.2"/></svg>`;
+        const nameHtml = escapeHtml(desc.name);
+        let html = '<td class="col-queue"></td>';
+        html += `<td class="col-name"><div class="file-name-wrap" style="padding-left:${indent}px">` +
+            `${fileIcon}<span class="file-name pfile-name">${nameHtml}</span>` +
+            `</div></td>`;
+        html += `<td class="col-size" style="text-align:right">${desc.size > 0 ? formatBytes(desc.size) : ""}</td>`;
+        html += `<td class="col-modified">${desc.mtime ? formatDate(desc.mtime) : ""}</td>`;
+        html += '<td class="col-status"></td>';
+        tr.innerHTML = html;
+        return tr;
+    }
+
     // Build a single file <tr> element with all cells and event listeners.
-    function buildFileRow(f, isPriority, queuedFiles, lastQueuedIdx) {
+    function buildFileRow(f, isPriority, queuedFiles, lastQueuedIdx, depth) {
         const tr = document.createElement("tr");
         tr.dataset.fileId = f.id;
         if (isFlashing(tr)) tr.classList.add("queue-flash");
@@ -2389,9 +2602,12 @@
               `<div class="grip-dots"><span></span><span></span></div>` +
               `<div class="grip-dots"><span></span><span></span></div></div>`
             : "";
-        html += `<td class="col-name"><div class="file-name-wrap">` +
+        const indent = (depth || 0) * 20;
+        // Show only leaf filename when tree view provides folder context
+        const displayName = (depth != null && depth > 0) ? f.name.replace(/\\/g, "/").split("/").pop() : f.name;
+        html += `<td class="col-name"><div class="file-name-wrap" style="padding-left:${indent}px">` +
             unknownGrip +
-            renderFileName(f.name, sourceDeleted ? "file-name-deleted" : f.downloaded ? "file-name-downloaded" : "") + changeIcon +
+            renderFileName(displayName, sourceDeleted ? "file-name-deleted" : f.downloaded ? "file-name-downloaded" : "") + changeIcon +
             `<span class="file-actions">` +
             renameBtn + processBtn + rescanBtn + deleteBtn +
             `</span></div></td>`;
@@ -2546,8 +2762,12 @@
                 divTr.className = "queue-divider-row";
                 divTr.innerHTML = `<td colspan="${getColspan()}"><div class="queue-divider"><span>Not queued</span></div></td>`;
                 fileListEl.appendChild(divTr);
+            } else if (desc.type === "folder") {
+                fileListEl.appendChild(buildFolderRow(desc, isPriority));
+            } else if (desc.type === "pfile") {
+                fileListEl.appendChild(buildProcessedFileRow(desc));
             } else {
-                const tr = buildFileRow(desc.file, isPriority, queuedFiles, lastQueuedIdx);
+                const tr = buildFileRow(desc.file, isPriority, queuedFiles, lastQueuedIdx, desc.depth);
                 fileListEl.appendChild(tr);
             }
         }
@@ -2681,63 +2901,8 @@
             inheritedTags = tagData.inherited || [];
         } catch (e) { /* silent */ }
 
-        let cellHtml = "";
-
-        // Tags section (always shown for manifest files)
-        cellHtml += buildFileTagsHtml(f.id, ownTags, inheritedTags);
-
-        // Processed output section (only if file has processed output)
-        const procStatus = (f.processing_status || "").toLowerCase();
-        if (procStatus === "processed") {
-            let tree = [];
-            try {
-                const data = await api("GET", `/api/files/${f.id}/processed-tree`);
-                tree = data.tree || [];
-            } catch (e) {
-                let outputFiles = [];
-                if (f.processed_files_json) {
-                    try { outputFiles = JSON.parse(f.processed_files_json); } catch (e2) {}
-                }
-                if (outputFiles.length === 0 && f.processed_filename) {
-                    outputFiles = [f.processed_filename];
-                }
-                tree = outputFiles.map((p) => ({ name: p, path: p, type: "file", size: 0 }));
-            }
-
-            if (tree.length > 0) {
-                function buildTreeHtml(nodes, depth) {
-                    let html = `<ul class="processed-tree" style="padding-left:${depth > 0 ? 16 : 0}px">`;
-                    for (const node of nodes) {
-                        const icon = node.type === "dir"
-                            ? `<svg class="ptree-icon" viewBox="0 0 16 16" width="13" height="13"><path d="M14 4H8L6.5 2.5h-5l-.5.5v10l.5.5h13l.5-.5V4.5L14 4zM13 12H2V4h4l1.5 1.5H13V12z" fill="currentColor"/></svg>`
-                            : `<svg class="ptree-icon" viewBox="0 0 16 16" width="13" height="13"><path d="M3 1h6l4 4v10H3V1zm6 0v4h4" fill="none" stroke="currentColor" stroke-width="1.2"/></svg>`;
-                        const sizeStr = node.size != null && node.size > 0 ? `<span class="ptree-size">${formatBytes(node.size)}</span>` : `<span class="ptree-size"></span>`;
-                        const mtimeStr = node.mtime ? `<span class="ptree-mtime">${new Date(node.mtime * 1000).toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" })}</span>` : `<span class="ptree-mtime"></span>`;
-                        const nameHtml = renderPtreeName(node.name);
-                        html += `<li class="ptree-node" data-path="${escapeHtml(node.path)}" data-type="${node.type}" data-name="${escapeHtml(node.name)}">` +
-                            `<div class="ptree-row">${icon}${nameHtml}` +
-                            `<span class="ptree-actions">` +
-                            `<button class="ptree-btn" data-ptree-action="rename" title="Rename"><svg viewBox="0 0 16 16" width="11" height="11"><path d="M12.15 2.85a1.2 1.2 0 00-1.7 0L3.5 9.8l-.8 3.5 3.5-.8 6.95-6.95a1.2 1.2 0 000-1.7z" fill="none" stroke="currentColor" stroke-width="1.3"/></svg></button>` +
-                            `<button class="ptree-btn ptree-btn-danger" data-ptree-action="delete" title="Delete"><svg viewBox="0 0 16 16" width="11" height="11"><path d="M5.5 2h5M3 4h10M6 4v8m4-8v8M4.5 4l.5 9h6l.5-9" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/></svg></button>` +
-                            `</span>${sizeStr}${mtimeStr}</div>`;
-                        if (node.type === "dir" && node.children && node.children.length > 0) {
-                            html += buildTreeHtml(node.children, depth + 1);
-                        }
-                        html += "</li>";
-                    }
-                    html += "</ul>";
-                    return html;
-                }
-
-                cellHtml += `<div class="processed-tree-wrap">` +
-                    `<div class="processed-tree-header">` +
-                    `<span class="processed-tree-label">Processed output</span>` +
-                    `<button class="ptree-delete-all" data-file-id="${f.id}" title="Delete all processed files">Delete all</button>` +
-                    `</div>` +
-                    buildTreeHtml(tree, 0) +
-                    `</div>`;
-            }
-        }
+        // Tags section only — processed output is now shown inline as .processed folder
+        const cellHtml = buildFileTagsHtml(f.id, ownTags, inheritedTags);
 
         detailTr.innerHTML = `<td colspan="${colCount}" class="file-detail-cell">${cellHtml}</td>`;
 
@@ -2748,7 +2913,6 @@
                 const fileId = btn.dataset.fileId;
                 const tag = btn.dataset.tag;
                 await api("DELETE", `/api/files/${fileId}/tags/${encodeURIComponent(tag)}`);
-                // Refresh the tags section
                 refreshFileTagsInRow(detailTr, fileId);
             });
         });
@@ -2765,45 +2929,6 @@
                     tagInput.value = "";
                     refreshFileTagsInRow(detailTr, fileId);
                 }
-            });
-        }
-
-        // Processed tree handlers
-        detailTr.querySelectorAll(".ptree-btn").forEach((btn) => {
-            btn.addEventListener("click", (e) => {
-                e.stopPropagation();
-                const li = btn.closest(".ptree-node");
-                const path = li.dataset.path;
-                const name = li.dataset.name;
-                const action = btn.dataset.ptreeAction;
-                if (action === "delete") {
-                    confirmAction("confirm_delete_processed", "Delete Processed File", `Delete &ldquo;${escapeHtml(name)}&rdquo;?`, () => {
-                        api("POST", `/api/files/${f.id}/delete-processed`, { filename: path }).then(() => {
-                            addNotification(`Deleted "${name}"`, "info");
-                            detailTr.remove();
-                            tr.classList.remove("expanded");
-                            loadFiles();
-                        }).catch((e2) => addNotification("Delete failed: " + e2.message, "error"));
-                    }, { confirmText: "Delete" });
-                } else if (action === "rename") {
-                    startProcessedRename(li, f.id, path, name);
-                }
-            });
-        });
-
-        // Delete all button
-        const deleteAllBtn = detailTr.querySelector(".ptree-delete-all");
-        if (deleteAllBtn) {
-            deleteAllBtn.addEventListener("click", (e) => {
-                e.stopPropagation();
-                confirmAction("confirm_delete_processed", "Delete All Processed Files", "Delete all processed output files for this item?", () => {
-                    api("POST", `/api/files/${f.id}/delete-processed`, { delete_all: true }).then(() => {
-                        addNotification("Deleted all processed files", "info");
-                        detailTr.remove();
-                        tr.classList.remove("expanded");
-                        loadFiles();
-                    }).catch((e2) => addNotification("Delete failed: " + e2.message, "error"));
-                }, { confirmText: "Delete All" });
             });
         }
 
@@ -6259,14 +6384,14 @@
             result.style.display = "none";
             try {
                 const r = await api("POST", "/api/settings/migrate-processed");
-                result.textContent = `Done: ${r.moved} moved, ${r.skipped} skipped, ${r.errors} errors across ${r.archives} archives.`;
+                result.textContent = `Done: ${r.renamed} renamed, ${r.skipped} skipped, ${r.errors} errors across ${r.archives} archives.`;
                 result.style.display = "block";
             } catch (e) {
                 result.textContent = "Migration failed: " + e.message;
                 result.style.display = "block";
             }
             btn.disabled = false;
-            btn.textContent = "Migrate Processed Files";
+            btn.textContent = "Migrate Processed Folders";
         });
         // Tab switching
         $$(".settings-tab").forEach((tab) => {
