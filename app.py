@@ -287,31 +287,34 @@ def update_settings():
 @app.route("/api/settings/migrate-processed", methods=["POST"])
 @login_required
 def migrate_processed_folders():
-    """Rename old-style folders to the new .processed naming convention.
+    """Move all processed output into ``.processed`` folders.
 
-    Old format:  ``processed_dir/identifier/GameName/``     (base_name without extension)
-    New format:  ``processed_dir/identifier/GameName.zip.processed/``  (source filename + .processed)
+    Handles two cases:
 
-    Also checks download_dir for legacy locations.  Updates both the on-disk
-    folder name and the DB records (processed_filename + processed_files_json).
-    Idempotent — already-renamed folders are skipped.
+    1. **Extract processor** (folder-style output):
+       Old: ``identifier/GameName/``  →  New: ``identifier/GameName.zip.processed/``
+
+    2. **CHD / CISO / other processors** (loose file output):
+       Old: ``identifier/GameName.chd``  →  New: ``identifier/GameName.zip.processed/GameName.chd``
+
+    Checks both processed_dir and download_dir for each file.  Updates DB
+    records (processed_filename + processed_files_json).  Idempotent — files
+    already inside a ``.processed`` folder are skipped.
     """
     import shutil
 
     download_dir = db.get_download_dir()
     processed_dir = db.get_processed_dir()
 
-    stats = {"renamed": 0, "skipped": 0, "errors": 0, "archives": 0}
+    stats = {"migrated": 0, "skipped": 0, "errors": 0, "archives": 0}
 
     with db._db() as conn:
-        # Get all extract-processor files with a folder-style processed_filename
         rows = conn.execute(
             "SELECT af.id, af.name, af.processed_filename, af.processed_files_json, "
-            "       a.identifier "
+            "       af.processor_type, a.identifier "
             "FROM archive_files af "
             "JOIN archives a ON af.archive_id = a.id "
             "WHERE af.processing_status = 'processed' "
-            "  AND af.processor_type = 'extract' "
             "  AND af.processed_filename != ''"
         ).fetchall()
 
@@ -319,87 +322,147 @@ def migrate_processed_folders():
 
     for row in rows:
         file_id = row["id"]
-        source_name = row["name"]            # e.g. "3D Lemmings Winterland (Europe).7z"
-        old_pf = row["processed_filename"]   # e.g. "3D Lemmings Winterland (Europe)/"
+        source_name = row["name"]              # e.g. "Game (USA).zip"
+        old_pf = row["processed_filename"]     # e.g. "Game (USA).chd" or "Game (USA)/"
         identifier = row["identifier"]
+        processor_type = row["processor_type"] or ""
 
-        # Build the expected new folder name: source_name + ".processed/"
-        # source_name may include subdirs (e.g. "sub/file.zip") — use just the basename
-        source_basename = os.path.basename(source_name)  # "file.7z"
-        new_folder = source_basename + ".processed"
-        new_pf = new_folder + os.sep
+        # Build the target .processed folder name from the source filename
+        source_basename = os.path.basename(source_name)    # "Game (USA).zip"
+        proc_folder = source_basename + ".processed"       # "Game (USA).zip.processed"
+        proc_folder_pf = proc_folder + os.sep              # "Game (USA).zip.processed/"
 
-        # Already migrated?
-        if old_pf.rstrip("/").rstrip(os.sep).endswith(".processed"):
+        # Already migrated?  (processed_filename already lives inside a .processed folder)
+        old_pf_clean = old_pf.rstrip("/").rstrip(os.sep)
+        if old_pf_clean.endswith(".processed") or (os.sep + proc_folder) in old_pf or ("/" + proc_folder) in old_pf or old_pf.startswith(proc_folder + os.sep) or old_pf.startswith(proc_folder + "/"):
             stats["skipped"] += 1
             continue
-
-        old_folder = old_pf.rstrip("/").rstrip(os.sep)  # "3D Lemmings Winterland (Europe)"
 
         if identifier not in seen_archives:
             seen_archives.add(identifier)
             stats["archives"] += 1
 
-        # Find the old folder on disk (check processed_dir first, then download_dir)
-        old_abs = None
+        # Determine the base directory where the files live
         base_dir = None
         for candidate_base in [
             os.path.join(processed_dir, identifier),
             os.path.join(download_dir, identifier),
         ]:
-            candidate = os.path.join(candidate_base, old_folder)
-            if os.path.isdir(candidate):
-                old_abs = candidate
+            candidate = os.path.join(candidate_base, old_pf_clean)
+            if os.path.exists(candidate):
                 base_dir = candidate_base
                 break
 
-        if not old_abs:
+        if not base_dir:
             stats["skipped"] += 1
             continue
 
-        new_abs = os.path.join(base_dir, new_folder)
+        proc_folder_abs = os.path.join(base_dir, proc_folder)
 
-        # Already renamed on disk?
-        if os.path.exists(new_abs):
-            stats["skipped"] += 1
-            continue
+        # --- Case 1: Extract processor (old_pf is a folder) ---
+        is_folder = old_pf.endswith("/") or old_pf.endswith(os.sep) or os.path.isdir(os.path.join(base_dir, old_pf_clean))
 
-        # Rename the folder on disk
-        try:
-            os.rename(old_abs, new_abs)
-        except OSError as e:
-            log.error("migrate", "Failed to rename %s -> %s: %s", old_abs, new_abs, e)
-            stats["errors"] += 1
-            continue
-
-        # Update DB records: processed_filename and processed_files_json
-        new_files_json = ""
-        old_pj = row["processed_files_json"]
-        if old_pj:
+        if is_folder:
+            old_abs = os.path.join(base_dir, old_pf_clean)
+            if os.path.exists(proc_folder_abs):
+                stats["skipped"] += 1
+                continue
             try:
-                old_files = json.loads(old_pj)
-                new_files = []
-                for p in old_files:
-                    if p.startswith(old_folder + "/") or p.startswith(old_folder + os.sep):
-                        new_files.append(new_folder + p[len(old_folder):])
-                    else:
-                        new_files.append(p)
-                new_files_json = json.dumps(new_files)
-            except (json.JSONDecodeError, TypeError):
-                pass
+                os.rename(old_abs, proc_folder_abs)
+            except OSError as e:
+                log.error("migrate", "Failed to rename folder %s -> %s: %s", old_abs, proc_folder_abs, e)
+                stats["errors"] += 1
+                continue
 
-        with db._db() as conn:
-            conn.execute(
-                "UPDATE archive_files SET processed_filename = ?, processed_files_json = ? "
-                "WHERE id = ?",
-                (new_pf, new_files_json, file_id),
-            )
-            conn.commit()
+            # Update processed_files_json paths
+            old_folder = old_pf_clean
+            new_files_json = ""
+            old_pj = row["processed_files_json"]
+            if old_pj:
+                try:
+                    old_files = json.loads(old_pj)
+                    new_files = []
+                    for p in old_files:
+                        if p.startswith(old_folder + "/") or p.startswith(old_folder + os.sep):
+                            new_files.append(proc_folder + p[len(old_folder):])
+                        else:
+                            new_files.append(proc_folder + os.sep + p)
+                    new_files_json = json.dumps(new_files)
+                except (json.JSONDecodeError, TypeError):
+                    pass
 
-        stats["renamed"] += 1
+            with db._db() as conn:
+                conn.execute(
+                    "UPDATE archive_files SET processed_filename = ?, processed_files_json = ? "
+                    "WHERE id = ?",
+                    (proc_folder_pf, new_files_json, file_id),
+                )
+                conn.commit()
 
-    log.info("migrate", "Processed folder migration complete: %d renamed, %d skipped, %d errors across %d archives",
-             stats["renamed"], stats["skipped"], stats["errors"], stats["archives"])
+        # --- Case 2: Non-folder output (CHD, CISO, etc.) ---
+        else:
+            # Gather all output files from processed_files_json (or just the primary)
+            output_files = []
+            if row["processed_files_json"]:
+                try:
+                    output_files = json.loads(row["processed_files_json"])
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            if not output_files:
+                output_files = [old_pf_clean]
+
+            # Create the .processed folder
+            try:
+                os.makedirs(proc_folder_abs, exist_ok=True)
+            except OSError as e:
+                log.error("migrate", "Failed to create folder %s: %s", proc_folder_abs, e)
+                stats["errors"] += 1
+                continue
+
+            # Move each output file into the .processed folder
+            moved_files = []
+            had_error = False
+            for rel in output_files:
+                rel_clean = rel.rstrip("/").rstrip(os.sep)
+                old_abs = os.path.join(base_dir, rel_clean)
+                if not os.path.isfile(old_abs):
+                    # Also check the other base dir
+                    alt_base = os.path.join(download_dir, identifier) if base_dir != os.path.join(download_dir, identifier) else os.path.join(processed_dir, identifier)
+                    old_abs = os.path.join(alt_base, rel_clean)
+                    if not os.path.isfile(old_abs):
+                        moved_files.append(rel_clean)  # Keep as-is if not found
+                        continue
+
+                fname = os.path.basename(rel_clean)
+                new_abs = os.path.join(proc_folder_abs, fname)
+                try:
+                    shutil.move(old_abs, new_abs)
+                    moved_files.append(proc_folder + os.sep + fname)
+                except OSError as e:
+                    log.error("migrate", "Failed to move %s -> %s: %s", old_abs, new_abs, e)
+                    had_error = True
+                    moved_files.append(rel_clean)  # Keep old path on failure
+
+            if had_error:
+                stats["errors"] += 1
+                continue
+
+            # Update DB: primary processed_filename is now the folder
+            new_primary = proc_folder + os.sep + os.path.basename(old_pf_clean)
+            new_files_json = json.dumps(moved_files) if moved_files else ""
+
+            with db._db() as conn:
+                conn.execute(
+                    "UPDATE archive_files SET processed_filename = ?, processed_files_json = ? "
+                    "WHERE id = ?",
+                    (new_primary, new_files_json, file_id),
+                )
+                conn.commit()
+
+        stats["migrated"] += 1
+
+    log.info("migrate", "Processed folder migration complete: %d migrated, %d skipped, %d errors across %d archives",
+             stats["migrated"], stats["skipped"], stats["errors"], stats["archives"])
     return jsonify({"ok": True, **stats})
 
 

@@ -6384,14 +6384,14 @@
             result.style.display = "none";
             try {
                 const r = await api("POST", "/api/settings/migrate-processed");
-                result.textContent = `Done: ${r.renamed} renamed, ${r.skipped} skipped, ${r.errors} errors across ${r.archives} archives.`;
+                result.textContent = `Done: ${r.migrated} migrated, ${r.skipped} skipped, ${r.errors} errors across ${r.archives} archives.`;
                 result.style.display = "block";
             } catch (e) {
                 result.textContent = "Migration failed: " + e.message;
                 result.style.display = "block";
             }
             btn.disabled = false;
-            btn.textContent = "Migrate Processed Folders";
+            btn.textContent = "Migrate to .processed Folders";
         });
         // Tab switching
         $$(".settings-tab").forEach((tab) => {
