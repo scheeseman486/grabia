@@ -80,10 +80,13 @@
     let notifications = [];
     let notifIdCounter = 0;
 
-    function addNotification(message, type = "info") {
+    function addNotification(message, type = "info", { file_id, archive_id } = {}) {
         // Create a server-side notification; add from response immediately
         // (SSE notification_created will be deduped by ID check)
-        api("POST", "/api/notifications", { message, type }).then((notif) => {
+        const body = { message, type };
+        if (file_id) body.file_id = file_id;
+        if (archive_id) body.archive_id = archive_id;
+        api("POST", "/api/notifications", body).then((notif) => {
             if (!notifications.find(n => n.id === notif.id)) {
                 notifications.unshift(notif);
                 renderNotifBadge();
@@ -144,11 +147,15 @@
         list.innerHTML = "";
         notifications.forEach((n) => {
             const div = document.createElement("div");
-            div.className = "notif-item notif-" + n.type;
+            const isClickable = !!(n.file_id);
+            div.className = "notif-item notif-" + n.type + (isClickable ? " notif-clickable" : "");
             const notifTime = n.created_at ? new Date(n.created_at * 1000) : (n.time || new Date());
             const ago = formatTimeAgo(notifTime);
             const viewLogHtml = n.job_id
                 ? `<button class="notif-view-log" data-job-id="${n.job_id}">View Log</button>`
+                : "";
+            const goToFileHtml = isClickable
+                ? `<button class="notif-view-log notif-goto-file" data-file-id="${n.file_id}">Show in Queue</button>`
                 : "";
             div.innerHTML = `
                 <div class="notif-content">
@@ -156,6 +163,7 @@
                     <span class="notif-time-row">
                         <span class="notif-time">${ago}</span>
                         ${viewLogHtml}
+                        ${goToFileHtml}
                     </span>
                 </div>
                 <button class="notif-dismiss" data-notif-id="${n.id}" title="Dismiss">
@@ -167,13 +175,34 @@
                 e.stopPropagation();
                 removeNotification(n.id);
             });
-            const viewLogBtn = div.querySelector(".notif-view-log");
+            const viewLogBtn = div.querySelector(".notif-view-log:not(.notif-goto-file)");
             if (viewLogBtn) {
                 viewLogBtn.addEventListener("click", (e) => {
                     e.stopPropagation();
                     const jobId = parseInt(viewLogBtn.dataset.jobId);
                     $("#notif-popup").classList.remove("open");
                     openActivityLog({ job_id: jobId });
+                });
+            }
+            const gotoBtn = div.querySelector(".notif-goto-file");
+            if (gotoBtn) {
+                gotoBtn.addEventListener("click", (e) => {
+                    e.stopPropagation();
+                    const fileId = parseInt(gotoBtn.dataset.fileId);
+                    $("#notif-popup").classList.remove("open");
+                    openQueues("download").then(() => {
+                        scrollToQueueItemAndFlash("download", { fileId });
+                    });
+                });
+            }
+            // Clicking the notification body itself also navigates to the file
+            if (isClickable) {
+                div.addEventListener("click", () => {
+                    const fileId = n.file_id;
+                    $("#notif-popup").classList.remove("open");
+                    openQueues("download").then(() => {
+                        scrollToQueueItemAndFlash("download", { fileId });
+                    });
                 });
             }
             list.appendChild(div);
@@ -595,6 +624,7 @@
 
         es.addEventListener("file_error", (e) => {
             const data = JSON.parse(e.data);
+            updateFileRow(data.file_id, { download_status: "failed" });
             // Remove from active downloads (queue_update event handles queue data removal)
             activeDownloads = activeDownloads.filter(d => d.file_id !== data.file_id);
             currentDownloadInfo = activeDownloads.length > 0 ? activeDownloads[0] : null;
@@ -604,7 +634,7 @@
             const fname = data.filename || "Unknown file";
             const archive = data.identifier || "";
             const detail = data.error || "Unknown error";
-            addNotification(`Download error: ${fname}${archive ? " (" + archive + ")" : ""} — ${detail}`, "error");
+            addNotification(`Download error: ${fname}${archive ? " (" + archive + ")" : ""} — ${detail}`, "error", { file_id: data.file_id });
         });
 
         es.addEventListener("file_failed", (e) => {
@@ -620,7 +650,7 @@
             _refreshActivityIfVisible();
             const fname = data.filename || "Unknown file";
             const archive = data.identifier || "";
-            addNotification(`Download failed: ${fname}${archive ? " (" + archive + ")" : ""} — retries exhausted`, "error");
+            addNotification(`Download failed: ${fname}${archive ? " (" + archive + ")" : ""} — retries exhausted`, "error", { file_id: data.file_id });
         });
 
         es.addEventListener("file_skipped", (e) => {
@@ -643,6 +673,8 @@
                 activeDownloads.push({ file_id: data.file_id, filename: data.filename, downloaded: 0, size: 0, speed: 0 });
                 currentDownloadInfo = activeDownloads[0];
             }
+            // Update file list status immediately
+            updateFileRow(data.file_id, { download_status: "downloading", downloaded_bytes: 0 });
             refreshOngoingActivity();
             if (queueDropdownOpen) loadQueueDropdown();
             startUiTick();

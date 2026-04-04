@@ -2273,9 +2273,11 @@ def create_notification():
     data = request.json or {}
     message = data.get("message", "")
     ntype = data.get("type", "info")
+    file_id = data.get("file_id")
+    archive_id = data.get("archive_id")
     if not message:
         return jsonify({"error": "message is required"}), 400
-    notif_id = db.create_notification(message, type=ntype)
+    notif_id = db.create_notification(message, type=ntype, file_id=file_id, archive_id=archive_id)
     notif = db.get_notification(notif_id)
     broadcast_sse("notification_created", notif)
     return jsonify(notif), 201

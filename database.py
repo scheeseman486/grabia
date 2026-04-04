@@ -140,7 +140,9 @@ def init_db():
             type TEXT NOT NULL DEFAULT 'info',
             created_at REAL NOT NULL,
             dismissed INTEGER NOT NULL DEFAULT 0,
-            job_id INTEGER DEFAULT NULL
+            job_id INTEGER DEFAULT NULL,
+            file_id INTEGER DEFAULT NULL,
+            archive_id INTEGER DEFAULT NULL
         );
 
         CREATE TABLE IF NOT EXISTS processing_jobs (
@@ -498,6 +500,14 @@ def init_db():
         conn.execute("SELECT job_id FROM notifications LIMIT 1")
     except sqlite3.OperationalError:
         conn.execute("ALTER TABLE notifications ADD COLUMN job_id INTEGER DEFAULT NULL")
+        conn.commit()
+
+    # Migration: add file_id and archive_id to notifications for clickable error notifications
+    try:
+        conn.execute("SELECT file_id FROM notifications LIMIT 1")
+    except sqlite3.OperationalError:
+        conn.execute("ALTER TABLE notifications ADD COLUMN file_id INTEGER DEFAULT NULL")
+        conn.execute("ALTER TABLE notifications ADD COLUMN archive_id INTEGER DEFAULT NULL")
         conn.commit()
 
     # Add manifest cache columns to archives
@@ -1719,12 +1729,12 @@ def get_processing_queue_files(archive_id):
 
 # --- Notifications ---
 
-def create_notification(message, type="info", job_id=None):
+def create_notification(message, type="info", job_id=None, file_id=None, archive_id=None):
     """Create a flash notification and return its ID."""
     with _db() as conn:
         conn.execute(
-            "INSERT INTO notifications (message, type, created_at, dismissed, job_id) VALUES (?, ?, ?, 0, ?)",
-            (message, type, time.time(), job_id),
+            "INSERT INTO notifications (message, type, created_at, dismissed, job_id, file_id, archive_id) VALUES (?, ?, ?, 0, ?, ?, ?)",
+            (message, type, time.time(), job_id, file_id, archive_id),
         )
         nid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
         conn.commit()
@@ -1732,8 +1742,8 @@ def create_notification(message, type="info", job_id=None):
 
 
 def update_notification(notif_id, **kwargs):
-    """Update fields on a notification. Supported: message, type, dismissed, job_id."""
-    allowed = {"message", "type", "dismissed", "job_id"}
+    """Update fields on a notification. Supported: message, type, dismissed, job_id, file_id, archive_id."""
+    allowed = {"message", "type", "dismissed", "job_id", "file_id", "archive_id"}
     updates = {k: v for k, v in kwargs.items() if k in allowed}
     if not updates:
         return

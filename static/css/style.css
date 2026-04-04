@@ -2029,6 +2029,9 @@ tr.processed-detail-row td { padding: 0 !important; }
 }
 .notif-item:last-child { border-bottom: none; }
 .notif-item:hover { background: var(--bg-hover); }
+.notif-clickable { cursor: pointer; }
+.notif-clickable .notif-message { text-decoration: underline; text-decoration-color: transparent; transition: text-decoration-color 0.15s; }
+.notif-clickable:hover .notif-message { text-decoration-color: var(--text-secondary); }
 
 .notif-item::before {
     content: '';
