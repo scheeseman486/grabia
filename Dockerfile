@@ -37,6 +37,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY *.py ./
+COPY TAG_KEY.txt ./
 COPY static/ ./static/
 COPY templates/ ./templates/
 
