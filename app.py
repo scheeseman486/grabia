@@ -2744,6 +2744,19 @@ def trigger_auto_tag(archive_id):
     return jsonify({"ok": True, "tags": db.get_archive_tags(archive_id)})
 
 
+@app.route("/api/files/auto-tag", methods=["POST"])
+@login_required
+def trigger_auto_tag_files():
+    """Trigger auto-tagging for specific files by ID."""
+    data = request.get_json(force=True)
+    file_ids = data.get("file_ids", [])
+    if not file_ids:
+        return jsonify({"error": "No file_ids provided"}), 400
+    from auto_tagger import auto_tag_files
+    tagged = auto_tag_files(file_ids)
+    return jsonify({"ok": True, "tagged": tagged})
+
+
 # ── File Tags ──────────────────────────────────────────────────────
 
 @app.route("/api/files/<int:file_id>/tags", methods=["GET"])

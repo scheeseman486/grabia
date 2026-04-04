@@ -1724,6 +1724,18 @@
         updateArchiveBatchActions();
     }
 
+    async function archiveBatchAutoTag() {
+        if (selectedArchiveIds.size === 0) return;
+        let tagged = 0;
+        for (const aid of selectedArchiveIds) {
+            try { await api("POST", `/api/archives/${aid}/auto-tag`); tagged++; } catch (e) {}
+        }
+        addNotification(`Scanned tags for ${tagged} archive(s)`, "info");
+        selectedArchiveIds.clear();
+        updateArchiveBatchActions();
+        if (currentArchiveId) loadArchiveTagsAndCollections(currentArchiveId);
+    }
+
     let pendingBatchArchiveProcessIds = null;
 
     async function archiveBatchProcess() {
@@ -1790,6 +1802,7 @@
         const n = selectedArchiveIds.size;
         showContextMenu(e, [
             { label: "Scan Existing Files", action: archiveBatchScan },
+            { label: "Scan for Tags", action: archiveBatchAutoTag },
             { label: "Process Archive", action: archiveBatchProcess },
             { label: "Retry All Files", action: archiveBatchRetry },
             { separator: true },
@@ -3010,6 +3023,21 @@
         loadFiles();
     }
 
+    async function batchAutoTagFiles() {
+        if (selectedFileIds.size === 0) return;
+        const ids = Array.from(selectedFileIds);
+        try {
+            const result = await api("POST", "/api/files/auto-tag", { file_ids: ids });
+            addNotification(`Scanned tags for ${result.tagged} file(s)`, "info");
+        } catch (e) {
+            addNotification("Tag scan failed: " + e.message, "error");
+        }
+        selectedFileIds.clear();
+        updateBatchActions();
+        updateFileSelectionClasses();
+        if (currentArchiveId) loadArchiveTagsAndCollections(currentArchiveId);
+    }
+
     async function batchProcessFiles() {
         if (!currentArchiveId || selectedFileIds.size === 0) return;
         // Open the process modal with file_ids pre-set
@@ -3660,6 +3688,7 @@
         showContextMenu(e, [
             { label: allQueued ? `Unqueue (${n})` : `Queue (${n})`, action: batchQueueFiles },
             { label: "Scan", action: batchScanFiles },
+            { label: "Scan for Tags", action: batchAutoTagFiles },
             { label: "Process", action: batchProcessFiles },
             { label: "Retry", action: batchRetryFiles },
             ...(mediaItems.length ? [{ separator: true }, ...mediaItems] : []),
@@ -5644,21 +5673,52 @@
     }
 
     function cpGetVisibleRows() {
-        // Build the flat row list, inserting children for expanded dir_units
+        /* Build the flat row list:
+           - Bucket headers become expandable folders (collapsed by default)
+           - Dir_units within expanded buckets also expandable
+           - Hidden rows (inside collapsed folders) are omitted
+        */
         const rows = [];
+        let currentLayoutId = null;
+        let skipDepth = null; // when set, skip rows at this depth or deeper
+
         for (const row of cpRows) {
-            rows.push(row);
-            if (row.type === "dir_unit" && cpExpandedDirs.has(row.display_name + "|" + row.archive_identifier)) {
-                for (const child of (row.children || [])) {
-                    rows.push({
-                        type: "dir_child",
-                        depth: row.depth + 1,
-                        display_name: child.name,
-                        size: child.size || 0,
-                        archive_identifier: row.archive_identifier,
-                        is_dir: false,
-                    });
+            // Track current layout
+            if (row.type === "layout_header") {
+                currentLayoutId = row.layout_id;
+                skipDepth = null;
+                rows.push({ ...row, _layoutId: currentLayoutId });
+                continue;
+            }
+
+            // If we're skipping (inside collapsed folder), check depth
+            if (skipDepth !== null && row.depth >= skipDepth) continue;
+            skipDepth = null; // past the collapsed section
+
+            if (row.type === "bucket_header") {
+                const key = `bucket|${currentLayoutId}|${row.path || row.name}`;
+                const expanded = cpExpandedDirs.has(key);
+                rows.push({ ...row, _layoutId: currentLayoutId, _key: key, _expanded: expanded });
+                if (!expanded) skipDepth = row.depth + 1;
+            } else if (row.type === "dir_unit") {
+                const key = `dir|${row.display_name}|${row.archive_identifier}`;
+                const expanded = cpExpandedDirs.has(key);
+                rows.push({ ...row, _layoutId: currentLayoutId, _key: key, _expanded: expanded });
+                if (expanded) {
+                    for (const child of (row.children || [])) {
+                        rows.push({
+                            type: "dir_child",
+                            depth: row.depth + 1,
+                            display_name: child.name,
+                            size: child.size || 0,
+                            archive_identifier: row.archive_identifier,
+                            is_dir: false,
+                            _layoutId: currentLayoutId,
+                        });
+                    }
                 }
+            } else {
+                rows.push({ ...row, _layoutId: currentLayoutId });
             }
         }
         return rows;
@@ -5687,6 +5747,8 @@
         listEl.style.height = totalHeight + "px";
         listEl.style.position = "relative";
 
+        const selectedLid = currentLayoutId;
+
         for (let i = startRow; i <= endRow; i++) {
             const row = allRows[i];
             const div = document.createElement("div");
@@ -5698,37 +5760,49 @@
             div.style.height = CP_ROW_HEIGHT + "px";
             div.style.paddingLeft = (12 + row.depth * 20) + "px";
 
+            // Highlight rows belonging to the selected layout
+            if (selectedLid && row._layoutId === selectedLid && row.type !== "layout_header") {
+                div.classList.add("cp-highlighted");
+            }
+
             if (row.type === "layout_header") {
                 div.classList.add("layout-header");
-                div.innerHTML = `<span class="preview-name">${esc(row.name)} <span style="font-weight:400;opacity:0.5">${esc(row.layout_type)}</span></span>`;
+                const isActive = selectedLid && row.layout_id === selectedLid;
+                div.innerHTML = `<span class="preview-name">${esc(row.name)} <span style="font-weight:400;opacity:0.5">${esc(row.layout_type)}</span>${isActive ? ' <span style="font-size:10px;opacity:0.6">\u2713 selected</span>' : ""}</span>`;
             } else if (row.type === "bucket_header") {
-                div.classList.add("bucket-header");
-                div.innerHTML = `<span class="preview-name">${esc(row.name)}/</span>`;
+                div.classList.add("bucket-header", "cp-folder");
+                const arrow = row._expanded ? "\u25BE" : "\u25B8";
+                const countStr = row.file_count ? ` <span style="opacity:0.4;font-weight:400">(${row.file_count})</span>` : "";
+                div.innerHTML = `<span class="preview-name">${arrow} ${esc(row.name)}/${countStr}</span>`;
+                div.addEventListener("click", () => {
+                    if (cpExpandedDirs.has(row._key)) cpExpandedDirs.delete(row._key);
+                    else cpExpandedDirs.add(row._key);
+                    cpLastRange = null;
+                    cpRenderVisible();
+                });
             } else if (row.type === "dir_unit") {
-                const key = row.display_name + "|" + row.archive_identifier;
-                const expanded = cpExpandedDirs.has(key);
-                const arrow = expanded ? "▾" : "▸";
+                div.classList.add("cp-folder");
+                const arrow = row._expanded ? "\u25BE" : "\u25B8";
                 div.innerHTML = `
-                    <span class="preview-icon">📁</span>
-                    <span class="preview-name" style="cursor:pointer" data-toggle-dir="${esc(key)}">${arrow} ${esc(row.display_name)}/</span>
+                    <span class="preview-icon">\uD83D\uDCC1</span>
+                    <span class="preview-name" style="cursor:pointer">${arrow} ${esc(row.display_name)}/</span>
                     <span class="preview-archive">${esc(row.archive_identifier)}</span>
                 `;
-                div.querySelector("[data-toggle-dir]").addEventListener("click", () => {
-                    if (cpExpandedDirs.has(key)) cpExpandedDirs.delete(key);
-                    else cpExpandedDirs.add(key);
+                div.addEventListener("click", () => {
+                    if (cpExpandedDirs.has(row._key)) cpExpandedDirs.delete(row._key);
+                    else cpExpandedDirs.add(row._key);
                     cpLastRange = null;
                     cpRenderVisible();
                 });
             } else if (row.type === "dir_child") {
                 div.innerHTML = `
-                    <span class="preview-icon" style="opacity:0.3">📄</span>
+                    <span class="preview-icon" style="opacity:0.3">\uD83D\uDCC4</span>
                     <span class="preview-name">${esc(row.display_name)}</span>
                     <span class="preview-size">${formatBytes(row.size || 0)}</span>
                 `;
             } else {
-                // file
                 div.innerHTML = `
-                    <span class="preview-icon">📄</span>
+                    <span class="preview-icon">\uD83D\uDCC4</span>
                     <span class="preview-name">${esc(row.display_name)}</span>
                     <span class="preview-archive">${esc(row.archive_identifier)}</span>
                     <span class="preview-size">${formatBytes(row.size || 0)}</span>
@@ -5943,12 +6017,62 @@
 
     // --- Layout Editor ---
 
+    let leAvailableTags = []; // cached tag list for editor
+
     async function openLayoutEditor(layoutId) {
         const layout = currentCollectionLayouts.find(l => l.id === layoutId);
         if (!layout) return;
         $("#layout-editor-title").textContent = layout.name;
         $("#modal-layout-editor").style.display = "";
+        // Load available tags for the tag dropdown
+        try { leAvailableTags = await api("GET", "/api/tags"); } catch (e) { leAvailableTags = []; }
+        populateLeTagDropdown();
+        setupLeTypeToggle();
         await refreshLayoutEditorTree(layoutId);
+    }
+
+    function populateLeTagDropdown() {
+        const sel = $("#le-add-tag");
+        sel.innerHTML = '<option value="">— select tag —</option>';
+        // Collect unique parent prefixes
+        const parents = new Set();
+        const standalone = [];
+        for (const t of leAvailableTags) {
+            const idx = t.tag.indexOf(":");
+            if (idx > 0) parents.add(t.tag.substring(0, idx));
+            else standalone.push(t.tag);
+        }
+        if (parents.size > 0) {
+            const grp = document.createElement("optgroup");
+            grp.label = "Parent tags (group by)";
+            for (const p of [...parents].sort()) {
+                const o = document.createElement("option");
+                o.value = p;
+                o.textContent = p + ":*";
+                grp.appendChild(o);
+            }
+            sel.appendChild(grp);
+        }
+        // Add all individual tags
+        const grp2 = document.createElement("optgroup");
+        grp2.label = "Individual tags";
+        for (const t of leAvailableTags) {
+            const o = document.createElement("option");
+            o.value = t.tag;
+            o.textContent = `${t.tag} (${t.count})`;
+            grp2.appendChild(o);
+        }
+        sel.appendChild(grp2);
+    }
+
+    function setupLeTypeToggle() {
+        const typeSel = $("#le-add-type");
+        const tagSel = $("#le-add-tag");
+        typeSel.onchange = () => {
+            const v = typeSel.value;
+            tagSel.style.display = (v === "tag_parent" || v === "tag_value") ? "" : "none";
+        };
+        tagSel.style.display = "none";
     }
 
     async function refreshLayoutEditorTree(layoutId) {
@@ -5970,7 +6094,7 @@
         for (const node of nodes) {
             const div = document.createElement("div");
             div.className = "layout-node-item";
-            div.style.marginLeft = `${depth * 20}px`;
+            div.style.paddingLeft = `${8 + depth * 20}px`;
             const typeLabels = {
                 all: "All Files",
                 alphabetical: "A\u2013Z",
@@ -5978,66 +6102,89 @@
                 tag_value: `Tag: ${node.tag_filter || "?"}`,
                 custom: "Custom",
             };
-            const sortLabel = node.sort_mode === "alphabetical" ? "A\u2013Z sort" : "flat";
+            const sortLabel = node.sort_mode === "alphabetical" ? "A\u2013Z" : "flat";
+            const canAddChild = node.type === "custom";
             div.innerHTML = `
-                <span class="node-name">${esc(node.name)}</span>
+                <span class="node-icon">\uD83D\uDCC1</span>
+                <span class="node-name" data-node-id="${node.id}" title="Double-click to rename">${esc(node.name)}</span>
                 <span class="node-type-badge">${typeLabels[node.type] || node.type}</span>
-                <span class="node-type-badge">${sortLabel}</span>
+                <button class="node-sort-toggle" data-node-id="${node.id}" data-sort="${node.sort_mode}" title="Toggle sort mode">${sortLabel}</button>
+                ${canAddChild ? `<span class="node-add-child" data-parent-id="${node.id}" title="Add sub-folder">+sub</span>` : ""}
                 <div class="node-actions">
-                    <button class="action-btn action-btn-sm" data-edit-node="${node.id}" title="Edit">Edit</button>
                     <button class="action-btn action-btn-sm batch-btn-danger" data-delete-node="${node.id}" title="Delete">&times;</button>
                 </div>
             `;
-            // Edit node handler
-            div.querySelector(`[data-edit-node="${node.id}"]`).addEventListener("click", () => {
-                openEditNodeDialog(layoutId, node);
+            // Inline rename on double-click
+            const nameEl = div.querySelector(`.node-name[data-node-id="${node.id}"]`);
+            nameEl.addEventListener("dblclick", () => {
+                const input = document.createElement("input");
+                input.type = "text";
+                input.className = "node-name-input";
+                input.value = node.name;
+                nameEl.replaceWith(input);
+                input.focus();
+                input.select();
+                const finish = async () => {
+                    const newName = input.value.trim();
+                    if (newName && newName !== node.name) {
+                        await api("PATCH", `/api/layouts/nodes/${node.id}`, { name: newName });
+                    }
+                    refreshLayoutEditorTree(layoutId);
+                };
+                input.addEventListener("blur", finish);
+                input.addEventListener("keydown", (e) => { if (e.key === "Enter") input.blur(); if (e.key === "Escape") { input.value = node.name; input.blur(); } });
             });
-            // Delete node handler
+            // Sort toggle
+            div.querySelector(`.node-sort-toggle[data-node-id="${node.id}"]`).addEventListener("click", async () => {
+                const newSort = node.sort_mode === "flat" ? "alphabetical" : "flat";
+                await api("PATCH", `/api/layouts/nodes/${node.id}`, { sort_mode: newSort });
+                refreshLayoutEditorTree(layoutId);
+            });
+            // Add child (for custom nodes)
+            const addChildBtn = div.querySelector(`[data-parent-id="${node.id}"]`);
+            if (addChildBtn) {
+                addChildBtn.addEventListener("click", () => {
+                    leAddNode(layoutId, node.id);
+                });
+            }
+            // Delete
             div.querySelector(`[data-delete-node="${node.id}"]`).addEventListener("click", async () => {
-                if (!confirm(`Delete node "${node.name}"?`)) return;
+                if (!confirm(`Delete "${node.name}"?`)) return;
                 await api("DELETE", `/api/layouts/nodes/${node.id}`);
                 refreshLayoutEditorTree(layoutId);
             });
             container.appendChild(div);
-            // Render children recursively
             if (node.children && node.children.length > 0) {
                 renderEditorNodes(container, node.children, layoutId, depth + 1);
             }
         }
     }
 
-    async function openAddNodeDialog(layoutId, parentId) {
-        const name = prompt("Folder name:", "New Folder");
-        if (!name) return;
-        const typeStr = prompt("Type (all, alphabetical, tag_parent, tag_value, custom):", "all");
-        if (!typeStr) return;
-        const data = { name, type: typeStr, parent_id: parentId };
-        if (typeStr === "tag_parent" || typeStr === "tag_value") {
-            const tagFilter = prompt("Tag filter (e.g. 'region' or 'region:japan'):", "");
-            data.tag_filter = tagFilter || null;
-        }
-        try {
-            await api("POST", `/api/layouts/${layoutId}/nodes`, data);
-            refreshLayoutEditorTree(layoutId);
-        } catch (e) {
-            alert(e.message);
-        }
-    }
+    async function leAddNode(layoutId, parentId) {
+        const typeSel = $("#le-add-type");
+        const tagSel = $("#le-add-tag");
+        const nameInput = $("#le-add-name");
+        const nodeType = typeSel.value;
+        let tagFilter = null;
+        let name = nameInput.value.trim();
 
-    async function openEditNodeDialog(layoutId, node) {
-        const newName = prompt("Node name:", node.name);
-        if (newName === null) return;
-        const newSort = prompt("Sort mode (flat, alphabetical):", node.sort_mode);
-        if (newSort === null) return;
-        const updates = {};
-        if (newName !== node.name) updates.name = newName;
-        if (newSort !== node.sort_mode) updates.sort_mode = newSort;
-        if (Object.keys(updates).length === 0) return;
+        if (nodeType === "tag_parent" || nodeType === "tag_value") {
+            tagFilter = tagSel.value;
+            if (!tagFilter) { addNotification("Select a tag first", "warning"); return; }
+            if (!name) name = tagFilter;
+        }
+        if (!name) {
+            const defaults = { all: "All Files", alphabetical: "A-Z", custom: "Custom" };
+            name = defaults[nodeType] || "Folder";
+        }
         try {
-            await api("PATCH", `/api/layouts/nodes/${node.id}`, updates);
+            await api("POST", `/api/layouts/${layoutId}/nodes`, {
+                name, type: nodeType, parent_id: parentId || null, tag_filter: tagFilter,
+            });
+            nameInput.value = "";
             refreshLayoutEditorTree(layoutId);
         } catch (e) {
-            alert(e.message);
+            addNotification("Failed to add node: " + e.message, "error");
         }
     }
 
@@ -6217,7 +6364,7 @@
         });
         $("#btn-layout-editor-add-node").addEventListener("click", () => {
             if (!currentLayoutId) return;
-            openAddNodeDialog(currentLayoutId, null);
+            leAddNode(currentLayoutId, null);
         });
         // Tags
         $("#archive-tag-input").addEventListener("keydown", async (e) => {

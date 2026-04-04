@@ -712,6 +712,7 @@ def preview_collection(collection_id):
     rows = []
 
     for layout in layouts:
+        lid = layout["id"]
         mapping = _evaluate_node_tree(layout, units, tag_lookup)
         _resolve_conflicts(mapping)
 
@@ -720,6 +721,7 @@ def preview_collection(collection_id):
             "depth": 0,
             "name": layout["name"],
             "layout_type": layout["type"],
+            "layout_id": lid,
         })
 
         # Sort buckets: alphabetical order for bucket names
@@ -734,6 +736,8 @@ def preview_collection(collection_id):
                     "depth": depth,
                     "name": parts[-1],
                     "path": subdir,
+                    "layout_id": lid,
+                    "file_count": len(entries),
                 })
                 entry_depth = depth + 1
             else:
@@ -755,6 +759,7 @@ def preview_collection(collection_id):
                         "is_dir": True,
                         "archive_identifier": unit["file_row"]["archive_identifier"],
                         "children": sorted(children, key=lambda c: c["name"].lower()),
+                        "layout_id": lid,
                     })
                 else:
                     rows.append({
@@ -764,6 +769,7 @@ def preview_collection(collection_id):
                         "is_dir": False,
                         "archive_identifier": unit["file_row"]["archive_identifier"],
                         "size": unit["file_row"].get("size", 0),
+                        "layout_id": lid,
                     })
 
     return {"rows": rows, "total": len(rows)}

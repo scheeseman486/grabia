@@ -319,8 +319,20 @@
                 <div class="modal modal-wide">
                     <h3>Edit Layout: <span id="layout-editor-title"></span></h3>
                     <div class="layout-editor-tree" id="layout-editor-tree"></div>
-                    <div class="layout-editor-actions">
-                        <button class="action-btn" id="btn-layout-editor-add-node">+ Add Folder</button>
+                    <div class="layout-editor-add-bar">
+                        <span class="le-add-label">Add folder:</span>
+                        <select id="le-add-type" class="le-select">
+                            <option value="all">All Files</option>
+                            <option value="alphabetical">Alphabetical (A–Z)</option>
+                            <option value="tag_parent">By Tag (parent)</option>
+                            <option value="tag_value">Single Tag</option>
+                            <option value="custom">Custom Folder</option>
+                        </select>
+                        <select id="le-add-tag" class="le-select" style="display:none" title="Select tag">
+                            <option value="">— select tag —</option>
+                        </select>
+                        <input type="text" id="le-add-name" class="le-input" placeholder="Name (optional)">
+                        <button class="action-btn action-btn-sm" id="btn-layout-editor-add-node">+ Add</button>
                     </div>
                     <div class="modal-footer">
                         <button class="action-btn" id="btn-layout-editor-close">Close</button>

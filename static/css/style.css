@@ -2449,26 +2449,44 @@ details[open] > .collection-archives-summary::before {
     font-size: 13px;
 }
 /* Layout editor */
-.modal-wide { max-width: 600px; }
+.modal-wide { max-width: 640px; }
 .layout-editor-tree {
     max-height: 400px;
     overflow-y: auto;
     margin: 12px 0;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: var(--bg);
+    padding: 4px;
 }
 .layout-node-item {
     display: flex;
     align-items: center;
-    gap: 8px;
-    padding: 6px 8px;
-    border: 1px solid var(--border);
-    border-radius: 4px;
-    margin-bottom: 4px;
-    background: var(--bg-alt);
+    gap: 6px;
+    padding: 5px 8px;
+    border-radius: 3px;
+    margin-bottom: 2px;
     font-size: 12px;
 }
+.layout-node-item:hover { background: var(--hover-bg, rgba(255,255,255,0.03)); }
+.layout-node-item .node-icon { opacity: 0.5; flex-shrink: 0; }
 .layout-node-item .node-name {
     flex: 1;
     font-weight: 500;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.layout-node-item .node-name-input {
+    flex: 1;
+    font-size: 12px;
+    padding: 1px 4px;
+    border: 1px solid var(--accent);
+    border-radius: 3px;
+    background: var(--bg);
+    color: var(--text);
+    min-width: 60px;
 }
 .layout-node-item .node-type-badge {
     font-size: 10px;
@@ -2476,14 +2494,52 @@ details[open] > .collection-archives-summary::before {
     border-radius: 8px;
     background: var(--border);
     color: var(--text-dim);
+    white-space: nowrap;
 }
+.layout-node-item .node-sort-toggle {
+    font-size: 10px;
+    padding: 1px 6px;
+    border-radius: 8px;
+    background: none;
+    border: 1px solid var(--border);
+    color: var(--text-dim);
+    cursor: pointer;
+    white-space: nowrap;
+}
+.layout-node-item .node-sort-toggle:hover { border-color: var(--accent); color: var(--text); }
 .layout-node-item .node-actions {
     display: flex;
-    gap: 4px;
+    gap: 2px;
+    flex-shrink: 0;
 }
-.layout-editor-actions {
-    margin: 8px 0;
+.layout-node-item .node-actions button { padding: 1px 4px; font-size: 11px; min-height: auto; line-height: 1.2; }
+.node-add-child { opacity: 0.5; cursor: pointer; font-size: 11px; padding: 0 4px; }
+.node-add-child:hover { opacity: 1; }
+/* Add bar */
+.layout-editor-add-bar {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 8px 0;
+    flex-wrap: wrap;
+    font-size: 12px;
 }
+.le-add-label { font-weight: 600; color: var(--text-dim); white-space: nowrap; }
+.le-select, .le-input {
+    padding: 3px 6px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: var(--bg);
+    color: var(--text);
+    font-size: 12px;
+}
+.le-input { width: 120px; }
+.le-input:focus, .le-select:focus { outline: none; border-color: var(--accent); }
+/* Preview highlight for selected layout */
+.collection-preview-row.cp-highlighted { background: rgba(59,130,246,0.08); }
+.collection-preview-row.cp-highlighted.bucket-header { background: rgba(59,130,246,0.12); }
+.collection-preview-row.cp-folder { cursor: pointer; }
+.collection-preview-row.cp-folder:hover { background: rgba(255,255,255,0.04); }
 
 .layout-card {
     display: flex;

@@ -272,3 +272,66 @@ def auto_tag_archive(archive_id):
 
     log.info("Auto-tagged archive %d: %d unique tags from %d files",
              archive_id, len(all_tags), len(files))
+
+
+def auto_tag_files(file_ids):
+    """Re-tag specific files by ID. Clears their auto tags and re-parses.
+
+    Also refreshes archive-level auto tags for affected archives.
+    Returns the number of files tagged.
+    """
+    import database as db
+
+    if not file_ids:
+        return 0
+
+    affected_archives = set()
+    tagged = 0
+
+    for fid in file_ids:
+        f = db.get_file(fid)
+        if not f or f.get("origin") != "manifest":
+            continue
+        db.clear_auto_file_tags(fid)
+        file_tags = parse_file_tags(f["name"])
+        for tag in file_tags:
+            db.add_file_tag(fid, tag, auto=True)
+        affected_archives.add(f["archive_id"])
+        tagged += 1
+
+    # Recompute archive-level auto tags for each affected archive
+    for aid in affected_archives:
+        _refresh_archive_auto_tags(aid)
+
+    return tagged
+
+
+def _refresh_archive_auto_tags(archive_id):
+    """Recompute archive-level auto tags from all file tags in the archive."""
+    import database as db
+
+    db.clear_auto_archive_tags(archive_id)
+
+    archive = db.get_archive(archive_id)
+    if not archive:
+        return
+
+    # Group tag
+    if archive.get("group_id"):
+        groups = db.get_groups() if hasattr(db, 'get_groups') else []
+        group = next((g for g in groups if g["id"] == archive["group_id"]), None)
+        if group:
+            group_tag = sanitise_tag(f"group:{group['name']}")
+            if group_tag:
+                db.add_archive_tag(archive_id, group_tag, auto=True)
+
+    # Bubble up all file auto tags
+    files = db.get_archive_files_all(archive_id)
+    all_tags = set()
+    for f in files:
+        ftags = db.get_file_tags(f["id"])
+        for t in ftags:
+            if t["auto"]:
+                all_tags.add(t["tag"])
+    for tag in all_tags:
+        db.add_archive_tag(archive_id, tag, auto=True)
