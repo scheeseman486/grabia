@@ -1,0 +1,207 @@
+# Grabia Auto-Tag Key
+# Maps filename parenthetical tokens to structured tags.
+# Format: PATTERN > tag1, tag2, ...
+# Patterns are case-insensitive. Tokens are extracted from parentheses in filenames.
+# Tags use parent:child format for categorised tags, or standalone for simple flags.
+# Unknown tokens are tagged as unknown:token_here (lowercased, spaces replaced with _).
+
+# ─── Regions ────────────────────────────────────────────────────────────────
+Japan                   > region:japan
+JP                      > region:japan
+JPN                     > region:japan
+USA                     > region:usa
+US                      > region:usa
+Europe                  > region:europe
+EU                      > region:europe
+EUR                     > region:europe
+World                   > region:world
+Asia                    > region:asia
+Korea                   > region:korea
+KR                      > region:korea
+China                   > region:china
+CN                      > region:china
+Taiwan                  > region:taiwan
+TW                      > region:taiwan
+Hong Kong               > region:hong_kong
+HK                      > region:hong_kong
+Australia               > region:australia
+AU                      > region:australia
+AUS                     > region:australia
+Brazil                  > region:brazil
+BR                      > region:brazil
+BRA                     > region:brazil
+Canada                  > region:canada
+CA                      > region:canada
+CAN                     > region:canada
+France                  > region:france
+FR                      > region:france
+FRA                     > region:france
+Germany                 > region:germany
+DE                      > region:germany
+GER                     > region:germany
+Italy                   > region:italy
+IT                      > region:italy
+ITA                     > region:italy
+Spain                   > region:spain
+ES                      > region:spain
+SPA                     > region:spain
+Netherlands             > region:netherlands
+NL                      > region:netherlands
+Sweden                  > region:sweden
+SE                      > region:sweden
+SWE                     > region:sweden
+Norway                  > region:norway
+NO                      > region:norway
+NOR                     > region:norway
+Denmark                 > region:denmark
+DK                      > region:denmark
+Finland                 > region:finland
+FI                      > region:finland
+Russia                  > region:russia
+RU                      > region:russia
+RUS                     > region:russia
+UK                      > region:uk
+United Kingdom          > region:uk
+Mexico                  > region:mexico
+MX                      > region:mexico
+MEX                     > region:mexico
+India                   > region:india
+IN                      > region:india
+IND                     > region:india
+New Zealand             > region:new_zealand
+NZ                      > region:new_zealand
+Portugal                > region:portugal
+PT                      > region:portugal
+Poland                  > region:poland
+PL                      > region:poland
+Greece                  > region:greece
+GR                      > region:greece
+Ireland                 > region:ireland
+IE                      > region:ireland
+Scandinavia             > region:scandinavia
+
+# ─── Languages ──────────────────────────────────────────────────────────────
+En                      > language:english
+Eng                     > language:english
+English                 > language:english
+Ja                      > language:japanese
+Jp                      > language:japanese
+Japanese                > language:japanese
+Fr                      > language:french
+French                  > language:french
+De                      > language:german
+German                  > language:german
+Es                      > language:spanish
+Spanish                 > language:spanish
+It                      > language:italian
+Italian                 > language:italian
+Pt                      > language:portuguese
+Portuguese              > language:portuguese
+Nl                      > language:dutch
+Dutch                   > language:dutch
+Ko                      > language:korean
+Korean                  > language:korean
+Zh                      > language:chinese
+Chinese                 > language:chinese
+Ru                      > language:russian
+Russian                 > language:russian
+Sv                      > language:swedish
+Swedish                 > language:swedish
+No                      > language:norwegian
+Norwegian               > language:norwegian
+Da                      > language:danish
+Danish                  > language:danish
+Fi                      > language:finnish
+Finnish                 > language:finnish
+Pl                      > language:polish
+Polish                  > language:polish
+El                      > language:greek
+Greek                   > language:greek
+
+# ─── Development Status ─────────────────────────────────────────────────────
+Beta                    > beta
+Alpha                   > alpha
+Proto                   > prototype
+Prototype               > prototype
+Sample                  > sample
+Demo                    > demo
+Preview                 > preview
+Promo                   > promo
+Kiosk                   > kiosk
+Debug                   > debug
+Test                    > test
+
+# ─── Distribution / Legitimacy ──────────────────────────────────────────────
+Pirate                  > pirate
+Bootleg                 > bootleg
+Hack                    > hack
+Aftermarket             > aftermarket
+Homebrew                > homebrew
+Unl                     > unlicensed
+Unlicensed              > unlicensed
+
+# ─── Revisions / Alternates ─────────────────────────────────────────────────
+# Patterns with variable content (handled programmatically, not by exact match):
+# (Rev A) (Rev B) (Rev 1) (Rev 2) etc. > alt:rev_X
+# (v1.0) (v1.1) (V2.0) etc.            > version:X.X
+# (Alt) (Alt 2)                         > alt, alt:2
+Alt                     > alt
+Reprint                 > reprint
+Rerelease               > rerelease
+Re-release              > rerelease
+Virtual Console         > virtual_console
+Switch Online           > switch_online
+Collector's Edition     > collectors_edition
+Limited Edition         > limited_edition
+Special Edition         > special_edition
+GOTY                    > goty
+Game of the Year        > goty
+
+# ─── Date Codes ─────────────────────────────────────────────────────────────
+# Handled programmatically — matches YYYY-MM-DD, YYYY-MM-xx, YYYYMMDD patterns
+# (1992-09-xx)  > date:1992-09-xx
+# (19920901)    > date:1992-09-01
+# (2003-01-15)  > date:2003-01-15
+
+# ─── Media / Physical Format ────────────────────────────────────────────────
+Disc 1                  > disc:1
+Disc 2                  > disc:2
+Disc 3                  > disc:3
+Disc 4                  > disc:4
+Disk 1                  > disc:1
+Disk 2                  > disc:2
+Disk 3                  > disc:3
+Disk 4                  > disc:4
+Side A                  > side:a
+Side B                  > side:b
+Track 1                 > track:1
+Track 2                 > track:2
+Program                 > program
+Data                    > data
+
+# ─── Video Standard ─────────────────────────────────────────────────────────
+NTSC                    > video:ntsc
+PAL                     > video:pal
+SECAM                   > video:secam
+NTSC-J                  > video:ntsc_j
+NTSC-U                  > video:ntsc_u
+NTSC-C                  > video:ntsc_c
+
+# ─── Special Flags ──────────────────────────────────────────────────────────
+SGB Enhanced            > sgb_enhanced
+GB Compatible           > gb_compatible
+GBC Compatible          > gbc_compatible
+NES Compatible          > nes_compatible
+Rumble Version          > rumble
+EDC                     > edc
+No EDC                  > no_edc
+# [b] bad dump, [!] verified, [h] hack etc. — bracket tags handled programmatically
+
+# ─── Notes on Multi-Token Parentheses ───────────────────────────────────────
+# Some parenthetical groups contain comma-separated values:
+#   (USA, Europe) → split into: region:usa, region:europe
+#   (En, Ja)      → split into: language:english, language:japanese
+#   (En, Fr, De)  → split into: language:english, language:french, language:german
+#
+# If a parenthetical contains a mix of regions and languages, each token is
+# resolved independently. Unknown tokens become unknown:token_here.

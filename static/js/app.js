@@ -2465,9 +2465,12 @@
         }
         if (procStatus === "processed") {
             tr.classList.add("processed-expandable");
+        }
+        // All manifest files can be expanded to show tags (and processed output if applicable)
+        if (f.origin === "manifest" || procStatus === "processed") {
             tr.addEventListener("dblclick", (e) => {
                 if (e.target.closest("button, .file-error-hint, .file-actions, .queue-toggle")) return;
-                toggleProcessedDetail(tr, f, isPriority);
+                toggleFileDetail(tr, f, isPriority);
             });
         }
 
@@ -2621,72 +2624,138 @@
         return f.download_status;
     }
 
-    async function toggleProcessedDetail(tr, f, isPriority) {
+    function buildFileTagsHtml(fileId, ownTags, inheritedTags) {
+        let html = `<div class="file-detail-tags" data-file-id="${fileId}">`;
+        html += `<div class="file-detail-tags-label">Tags</div>`;
+        html += `<div class="file-detail-tags-container">`;
+        // Own tags (auto without ×, user with ×)
+        for (const t of ownTags) {
+            const isAuto = t.auto;
+            const cls = "tag-chip" + (isAuto ? " tag-auto" : "");
+            html += `<span class="${cls}">${formatTagHtml(t.tag)}`;
+            if (!isAuto) {
+                html += ` <button class="tag-remove file-tag-remove" data-file-id="${fileId}" data-tag="${esc(t.tag)}">&times;</button>`;
+            }
+            html += `</span>`;
+        }
+        // Inherited tags
+        for (const t of inheritedTags) {
+            html += `<span class="tag-chip tag-inherited" title="Inherited from archive">${formatTagHtml(t.tag)}</span>`;
+        }
+        html += `<input type="text" class="file-tag-input" data-file-id="${fileId}" placeholder="Add tag…">`;
+        html += `</div></div>`;
+        return html;
+    }
+
+    async function toggleFileDetail(tr, f, isPriority) {
         // If already expanded, collapse
         const existing = tr.nextElementSibling;
-        if (existing && existing.classList.contains("processed-detail-row")) {
+        if (existing && existing.classList.contains("file-detail-row")) {
             existing.remove();
             tr.classList.remove("expanded");
             return;
         }
 
-        // Fetch the actual on-disk tree from the server
-        let tree = [];
-        try {
-            const data = await api("GET", `/api/files/${f.id}/processed-tree`);
-            tree = data.tree || [];
-        } catch (e) {
-            // Fallback to DB data
-            let outputFiles = [];
-            if (f.processed_files_json) {
-                try { outputFiles = JSON.parse(f.processed_files_json); } catch (e2) {}
-            }
-            if (outputFiles.length === 0 && f.processed_filename) {
-                outputFiles = [f.processed_filename];
-            }
-            tree = outputFiles.map((p) => ({ name: p, path: p, type: "file", size: 0 }));
-        }
-
-        if (tree.length === 0) return;
-
         const colCount = getColspan();
         const detailTr = document.createElement("tr");
-        detailTr.classList.add("processed-detail-row");
+        detailTr.classList.add("file-detail-row");
 
-        function buildTreeHtml(nodes, depth) {
-            let html = `<ul class="processed-tree" style="padding-left:${depth > 0 ? 16 : 0}px">`;
-            for (const node of nodes) {
-                const icon = node.type === "dir"
-                    ? `<svg class="ptree-icon" viewBox="0 0 16 16" width="13" height="13"><path d="M14 4H8L6.5 2.5h-5l-.5.5v10l.5.5h13l.5-.5V4.5L14 4zM13 12H2V4h4l1.5 1.5H13V12z" fill="currentColor"/></svg>`
-                    : `<svg class="ptree-icon" viewBox="0 0 16 16" width="13" height="13"><path d="M3 1h6l4 4v10H3V1zm6 0v4h4" fill="none" stroke="currentColor" stroke-width="1.2"/></svg>`;
-                const sizeStr = node.size != null && node.size > 0 ? `<span class="ptree-size">${formatBytes(node.size)}</span>` : `<span class="ptree-size"></span>`;
-                const mtimeStr = node.mtime ? `<span class="ptree-mtime">${new Date(node.mtime * 1000).toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" })}</span>` : `<span class="ptree-mtime"></span>`;
-                const nameHtml = renderPtreeName(node.name);
-                html += `<li class="ptree-node" data-path="${escapeHtml(node.path)}" data-type="${node.type}" data-name="${escapeHtml(node.name)}">` +
-                    `<div class="ptree-row">${icon}${nameHtml}` +
-                    `<span class="ptree-actions">` +
-                    `<button class="ptree-btn" data-ptree-action="rename" title="Rename"><svg viewBox="0 0 16 16" width="11" height="11"><path d="M12.15 2.85a1.2 1.2 0 00-1.7 0L3.5 9.8l-.8 3.5 3.5-.8 6.95-6.95a1.2 1.2 0 000-1.7z" fill="none" stroke="currentColor" stroke-width="1.3"/></svg></button>` +
-                    `<button class="ptree-btn ptree-btn-danger" data-ptree-action="delete" title="Delete"><svg viewBox="0 0 16 16" width="11" height="11"><path d="M5.5 2h5M3 4h10M6 4v8m4-8v8M4.5 4l.5 9h6l.5-9" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/></svg></button>` +
-                    `</span>${sizeStr}${mtimeStr}</div>`;
-                if (node.type === "dir" && node.children && node.children.length > 0) {
-                    html += buildTreeHtml(node.children, depth + 1);
+        // Fetch file tags
+        let ownTags = [], inheritedTags = [];
+        try {
+            const tagData = await api("GET", `/api/files/${f.id}/tags`);
+            ownTags = tagData.own || [];
+            inheritedTags = tagData.inherited || [];
+        } catch (e) { /* silent */ }
+
+        let cellHtml = "";
+
+        // Tags section (always shown for manifest files)
+        cellHtml += buildFileTagsHtml(f.id, ownTags, inheritedTags);
+
+        // Processed output section (only if file has processed output)
+        const procStatus = (f.processing_status || "").toLowerCase();
+        if (procStatus === "processed") {
+            let tree = [];
+            try {
+                const data = await api("GET", `/api/files/${f.id}/processed-tree`);
+                tree = data.tree || [];
+            } catch (e) {
+                let outputFiles = [];
+                if (f.processed_files_json) {
+                    try { outputFiles = JSON.parse(f.processed_files_json); } catch (e2) {}
                 }
-                html += "</li>";
+                if (outputFiles.length === 0 && f.processed_filename) {
+                    outputFiles = [f.processed_filename];
+                }
+                tree = outputFiles.map((p) => ({ name: p, path: p, type: "file", size: 0 }));
             }
-            html += "</ul>";
-            return html;
+
+            if (tree.length > 0) {
+                function buildTreeHtml(nodes, depth) {
+                    let html = `<ul class="processed-tree" style="padding-left:${depth > 0 ? 16 : 0}px">`;
+                    for (const node of nodes) {
+                        const icon = node.type === "dir"
+                            ? `<svg class="ptree-icon" viewBox="0 0 16 16" width="13" height="13"><path d="M14 4H8L6.5 2.5h-5l-.5.5v10l.5.5h13l.5-.5V4.5L14 4zM13 12H2V4h4l1.5 1.5H13V12z" fill="currentColor"/></svg>`
+                            : `<svg class="ptree-icon" viewBox="0 0 16 16" width="13" height="13"><path d="M3 1h6l4 4v10H3V1zm6 0v4h4" fill="none" stroke="currentColor" stroke-width="1.2"/></svg>`;
+                        const sizeStr = node.size != null && node.size > 0 ? `<span class="ptree-size">${formatBytes(node.size)}</span>` : `<span class="ptree-size"></span>`;
+                        const mtimeStr = node.mtime ? `<span class="ptree-mtime">${new Date(node.mtime * 1000).toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" })}</span>` : `<span class="ptree-mtime"></span>`;
+                        const nameHtml = renderPtreeName(node.name);
+                        html += `<li class="ptree-node" data-path="${escapeHtml(node.path)}" data-type="${node.type}" data-name="${escapeHtml(node.name)}">` +
+                            `<div class="ptree-row">${icon}${nameHtml}` +
+                            `<span class="ptree-actions">` +
+                            `<button class="ptree-btn" data-ptree-action="rename" title="Rename"><svg viewBox="0 0 16 16" width="11" height="11"><path d="M12.15 2.85a1.2 1.2 0 00-1.7 0L3.5 9.8l-.8 3.5 3.5-.8 6.95-6.95a1.2 1.2 0 000-1.7z" fill="none" stroke="currentColor" stroke-width="1.3"/></svg></button>` +
+                            `<button class="ptree-btn ptree-btn-danger" data-ptree-action="delete" title="Delete"><svg viewBox="0 0 16 16" width="11" height="11"><path d="M5.5 2h5M3 4h10M6 4v8m4-8v8M4.5 4l.5 9h6l.5-9" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/></svg></button>` +
+                            `</span>${sizeStr}${mtimeStr}</div>`;
+                        if (node.type === "dir" && node.children && node.children.length > 0) {
+                            html += buildTreeHtml(node.children, depth + 1);
+                        }
+                        html += "</li>";
+                    }
+                    html += "</ul>";
+                    return html;
+                }
+
+                cellHtml += `<div class="processed-tree-wrap">` +
+                    `<div class="processed-tree-header">` +
+                    `<span class="processed-tree-label">Processed output</span>` +
+                    `<button class="ptree-delete-all" data-file-id="${f.id}" title="Delete all processed files">Delete all</button>` +
+                    `</div>` +
+                    buildTreeHtml(tree, 0) +
+                    `</div>`;
+            }
         }
 
-        let cellHtml = `<div class="processed-tree-wrap">` +
-            `<div class="processed-tree-header">` +
-            `<span class="processed-tree-label">Processed output</span>` +
-            `<button class="ptree-delete-all" data-file-id="${f.id}" title="Delete all processed files">Delete all</button>` +
-            `</div>` +
-            buildTreeHtml(tree, 0) +
-            `</div>`;
-        detailTr.innerHTML = `<td colspan="${colCount}" class="processed-detail-cell">${cellHtml}</td>`;
+        detailTr.innerHTML = `<td colspan="${colCount}" class="file-detail-cell">${cellHtml}</td>`;
 
-        // Attach handlers
+        // File tag remove handlers
+        detailTr.querySelectorAll(".file-tag-remove").forEach((btn) => {
+            btn.addEventListener("click", async (e) => {
+                e.stopPropagation();
+                const fileId = btn.dataset.fileId;
+                const tag = btn.dataset.tag;
+                await api("DELETE", `/api/files/${fileId}/tags/${encodeURIComponent(tag)}`);
+                // Refresh the tags section
+                refreshFileTagsInRow(detailTr, fileId);
+            });
+        });
+
+        // File tag input handler
+        const tagInput = detailTr.querySelector(".file-tag-input");
+        if (tagInput) {
+            tagInput.addEventListener("keydown", async (e) => {
+                if (e.key === "Enter") {
+                    const val = tagInput.value.trim();
+                    if (!val) return;
+                    const fileId = tagInput.dataset.fileId;
+                    await api("POST", `/api/files/${fileId}/tags`, { tag: val });
+                    tagInput.value = "";
+                    refreshFileTagsInRow(detailTr, fileId);
+                }
+            });
+        }
+
+        // Processed tree handlers
         detailTr.querySelectorAll(".ptree-btn").forEach((btn) => {
             btn.addEventListener("click", (e) => {
                 e.stopPropagation();
@@ -2728,6 +2797,36 @@
         tr.after(detailTr);
         tr.classList.add("expanded");
         applyTruncationTooltips(detailTr);
+    }
+
+    async function refreshFileTagsInRow(detailTr, fileId) {
+        try {
+            const tagData = await api("GET", `/api/files/${fileId}/tags`);
+            const container = detailTr.querySelector(`.file-detail-tags[data-file-id="${fileId}"]`);
+            if (!container) return;
+            container.outerHTML = buildFileTagsHtml(fileId, tagData.own || [], tagData.inherited || []);
+            // Re-attach handlers on the new DOM
+            const newContainer = detailTr.querySelector(`.file-detail-tags[data-file-id="${fileId}"]`);
+            newContainer.querySelectorAll(".file-tag-remove").forEach((btn) => {
+                btn.addEventListener("click", async (e) => {
+                    e.stopPropagation();
+                    await api("DELETE", `/api/files/${btn.dataset.fileId}/tags/${encodeURIComponent(btn.dataset.tag)}`);
+                    refreshFileTagsInRow(detailTr, fileId);
+                });
+            });
+            const inp = newContainer.querySelector(".file-tag-input");
+            if (inp) {
+                inp.addEventListener("keydown", async (e) => {
+                    if (e.key === "Enter") {
+                        const val = inp.value.trim();
+                        if (!val) return;
+                        await api("POST", `/api/files/${inp.dataset.fileId}/tags`, { tag: val });
+                        inp.value = "";
+                        refreshFileTagsInRow(detailTr, fileId);
+                    }
+                });
+            }
+        } catch (e) { /* silent */ }
     }
 
     // Track active rename so only one edit box is open at a time
@@ -4149,16 +4248,34 @@
         }
     }
 
+    function formatTagHtml(tagStr) {
+        /* Render parent:child tags with muted prefix */
+        const idx = tagStr.indexOf(":");
+        if (idx > 0) {
+            const parent = tagStr.substring(0, idx + 1);
+            const child = tagStr.substring(idx + 1);
+            return `<span class="tag-parent-prefix">${esc(parent)}</span>${esc(child)}`;
+        }
+        return esc(tagStr);
+    }
+
     function renderArchiveTags(tags, archiveId) {
         const el = $("#archive-tags");
         el.innerHTML = "";
-        for (const tag of tags) {
+        for (const item of tags) {
+            /* item is { tag: string, auto: bool } */
+            const tag = typeof item === "string" ? item : item.tag;
+            const isAuto = typeof item === "object" && item.auto;
             const chip = document.createElement("span");
-            chip.className = "tag-chip";
-            chip.innerHTML = `${esc(tag)} <button class="tag-remove" data-tag="${esc(tag)}">&times;</button>`;
+            chip.className = "tag-chip" + (isAuto ? " tag-auto" : "");
+            let inner = formatTagHtml(tag);
+            if (!isAuto) {
+                inner += ` <button class="tag-remove" data-tag="${esc(tag)}">&times;</button>`;
+            }
+            chip.innerHTML = inner;
             el.appendChild(chip);
         }
-        // Remove tag handler
+        // Remove tag handler (only on user tags)
         el.querySelectorAll(".tag-remove").forEach((btn) => {
             btn.addEventListener("click", async () => {
                 const tag = btn.dataset.tag;
@@ -5417,6 +5534,9 @@
         }
     }
 
+    let currentLayoutId = null;
+    let currentCollectionLayouts = [];
+
     function renderCollectionDetail(coll) {
         $("#collection-detail-title").textContent = coll.name;
         const scopeLabel = { processed: "Processed files", downloaded: "Downloaded files", both: "All files" }[coll.file_scope] || coll.file_scope;
@@ -5426,49 +5546,37 @@
         if (!coll.use_media_units) meta += ` \u2022 media units: off`;
         $("#collection-detail-meta").textContent = meta;
 
-        // Layouts
-        const layoutsEl = $("#collection-layouts");
-        layoutsEl.innerHTML = "";
-        const layouts = coll.layouts || [];
-        if (layouts.length === 0) {
-            layoutsEl.innerHTML = '<p class="empty-hint">No layouts configured. Add a layout to define how files are organized.</p>';
+        // Layout dropdown
+        currentCollectionLayouts = coll.layouts || [];
+        const layoutSelect = $("#collection-layout-select");
+        layoutSelect.innerHTML = "";
+        if (currentCollectionLayouts.length === 0) {
+            layoutSelect.innerHTML = '<option value="">No layouts</option>';
+            currentLayoutId = null;
         } else {
-            for (const layout of layouts) {
-                const div = document.createElement("div");
-                div.className = "layout-card";
-                const typeLabel = { flat: "Flat", alphabetical: "Alphabetical (A\u2013Z)", by_archive: "By Archive" }[layout.type] || layout.type;
-                div.innerHTML = `
-                    <div class="layout-card-info">
-                        <strong>${esc(layout.name)}</strong>
-                        <span class="layout-type-badge">${esc(typeLabel)}</span>
-                    </div>
-                    <div class="layout-card-actions">
-                        <button class="action-btn action-btn-sm" data-edit-layout="${layout.id}" data-name="${esc(layout.name)}" data-type="${layout.type}">Edit</button>
-                        <button class="action-btn action-btn-sm batch-btn-danger" data-delete-layout="${layout.id}">Delete</button>
-                    </div>
-                `;
-                layoutsEl.appendChild(div);
+            for (const layout of currentCollectionLayouts) {
+                const typeLabel = { flat: "Flat", alphabetical: "A\u2013Z", by_archive: "By Archive" }[layout.type] || layout.type;
+                const opt = document.createElement("option");
+                opt.value = layout.id;
+                opt.textContent = `${layout.name} (${typeLabel})`;
+                layoutSelect.appendChild(opt);
             }
-            layoutsEl.addEventListener("click", (e) => {
-                const editBtn = e.target.closest("[data-edit-layout]");
-                if (editBtn) {
-                    editingLayoutId = parseInt(editBtn.dataset.editLayout);
-                    openLayoutModal(editBtn.dataset.name, editBtn.dataset.type);
-                    return;
-                }
-                const delBtn = e.target.closest("[data-delete-layout]");
-                if (delBtn) {
-                    deleteLayout(parseInt(delBtn.dataset.deleteLayout));
-                }
-            });
+            // Preserve selection or pick first
+            if (currentLayoutId && currentCollectionLayouts.some(l => l.id === currentLayoutId)) {
+                layoutSelect.value = currentLayoutId;
+            } else {
+                currentLayoutId = currentCollectionLayouts[0].id;
+                layoutSelect.value = currentLayoutId;
+            }
         }
 
-        // Archives
+        // Archives (collapsible)
+        const collArchives = coll.archives || [];
+        $("#collection-archives-heading").textContent = `Archives (${collArchives.length})`;
         const archivesEl = $("#collection-archives");
         archivesEl.innerHTML = "";
-        const collArchives = coll.archives || [];
         if (collArchives.length === 0) {
-            archivesEl.innerHTML = '<p class="empty-hint">No archives in this collection. Click "Add Archives" to get started.</p>';
+            archivesEl.innerHTML = '<p class="empty-hint">No archives. Click "Add" to get started.</p>';
         } else {
             for (const a of collArchives) {
                 const div = document.createElement("div");
@@ -5833,6 +5941,106 @@
         }
     }
 
+    // --- Layout Editor ---
+
+    async function openLayoutEditor(layoutId) {
+        const layout = currentCollectionLayouts.find(l => l.id === layoutId);
+        if (!layout) return;
+        $("#layout-editor-title").textContent = layout.name;
+        $("#modal-layout-editor").style.display = "";
+        await refreshLayoutEditorTree(layoutId);
+    }
+
+    async function refreshLayoutEditorTree(layoutId) {
+        const treeEl = $("#layout-editor-tree");
+        try {
+            const nodes = await api("GET", `/api/layouts/${layoutId}/nodes`);
+            treeEl.innerHTML = "";
+            if (nodes.length === 0) {
+                treeEl.innerHTML = '<p class="empty-hint">No nodes. Add a folder to get started.</p>';
+                return;
+            }
+            renderEditorNodes(treeEl, nodes, layoutId, 0);
+        } catch (e) {
+            treeEl.innerHTML = `<p class="empty-hint">Error loading nodes: ${esc(e.message)}</p>`;
+        }
+    }
+
+    function renderEditorNodes(container, nodes, layoutId, depth) {
+        for (const node of nodes) {
+            const div = document.createElement("div");
+            div.className = "layout-node-item";
+            div.style.marginLeft = `${depth * 20}px`;
+            const typeLabels = {
+                all: "All Files",
+                alphabetical: "A\u2013Z",
+                tag_parent: `By Tag: ${node.tag_filter || "?"}`,
+                tag_value: `Tag: ${node.tag_filter || "?"}`,
+                custom: "Custom",
+            };
+            const sortLabel = node.sort_mode === "alphabetical" ? "A\u2013Z sort" : "flat";
+            div.innerHTML = `
+                <span class="node-name">${esc(node.name)}</span>
+                <span class="node-type-badge">${typeLabels[node.type] || node.type}</span>
+                <span class="node-type-badge">${sortLabel}</span>
+                <div class="node-actions">
+                    <button class="action-btn action-btn-sm" data-edit-node="${node.id}" title="Edit">Edit</button>
+                    <button class="action-btn action-btn-sm batch-btn-danger" data-delete-node="${node.id}" title="Delete">&times;</button>
+                </div>
+            `;
+            // Edit node handler
+            div.querySelector(`[data-edit-node="${node.id}"]`).addEventListener("click", () => {
+                openEditNodeDialog(layoutId, node);
+            });
+            // Delete node handler
+            div.querySelector(`[data-delete-node="${node.id}"]`).addEventListener("click", async () => {
+                if (!confirm(`Delete node "${node.name}"?`)) return;
+                await api("DELETE", `/api/layouts/nodes/${node.id}`);
+                refreshLayoutEditorTree(layoutId);
+            });
+            container.appendChild(div);
+            // Render children recursively
+            if (node.children && node.children.length > 0) {
+                renderEditorNodes(container, node.children, layoutId, depth + 1);
+            }
+        }
+    }
+
+    async function openAddNodeDialog(layoutId, parentId) {
+        const name = prompt("Folder name:", "New Folder");
+        if (!name) return;
+        const typeStr = prompt("Type (all, alphabetical, tag_parent, tag_value, custom):", "all");
+        if (!typeStr) return;
+        const data = { name, type: typeStr, parent_id: parentId };
+        if (typeStr === "tag_parent" || typeStr === "tag_value") {
+            const tagFilter = prompt("Tag filter (e.g. 'region' or 'region:japan'):", "");
+            data.tag_filter = tagFilter || null;
+        }
+        try {
+            await api("POST", `/api/layouts/${layoutId}/nodes`, data);
+            refreshLayoutEditorTree(layoutId);
+        } catch (e) {
+            alert(e.message);
+        }
+    }
+
+    async function openEditNodeDialog(layoutId, node) {
+        const newName = prompt("Node name:", node.name);
+        if (newName === null) return;
+        const newSort = prompt("Sort mode (flat, alphabetical):", node.sort_mode);
+        if (newSort === null) return;
+        const updates = {};
+        if (newName !== node.name) updates.name = newName;
+        if (newSort !== node.sort_mode) updates.sort_mode = newSort;
+        if (Object.keys(updates).length === 0) return;
+        try {
+            await api("PATCH", `/api/layouts/nodes/${node.id}`, updates);
+            refreshLayoutEditorTree(layoutId);
+        } catch (e) {
+            alert(e.message);
+        }
+    }
+
     // --- Sync ---
 
     async function syncCurrentCollection() {
@@ -5985,6 +6193,32 @@
         $("#btn-layout-modal-save").addEventListener("click", saveLayout);
         $("#layout-name-input").addEventListener("keydown", (e) => { if (e.key === "Enter") saveLayout(); });
         $("#btn-delete-collection").addEventListener("click", deleteCurrentCollection);
+        // Layout selector
+        $("#collection-layout-select").addEventListener("change", (e) => {
+            currentLayoutId = parseInt(e.target.value) || null;
+            if (currentCollectionId) loadCollectionPreview(currentCollectionId);
+        });
+        $("#btn-edit-layout").addEventListener("click", () => {
+            if (!currentLayoutId) return;
+            openLayoutEditor(currentLayoutId);
+        });
+        $("#btn-delete-layout").addEventListener("click", async () => {
+            if (!currentLayoutId || !currentCollectionId) return;
+            confirmAction("confirm_delete_layout", "Delete Layout", "Delete this layout?", async () => {
+                await api("DELETE", `/api/collections/${currentCollectionId}/layouts/${currentLayoutId}`);
+                currentLayoutId = null;
+                openCollectionDetail(currentCollectionId);
+            }, { confirmText: "Delete" });
+        });
+        // Layout editor
+        $("#btn-layout-editor-close").addEventListener("click", () => {
+            $("#modal-layout-editor").style.display = "none";
+            if (currentCollectionId) openCollectionDetail(currentCollectionId);
+        });
+        $("#btn-layout-editor-add-node").addEventListener("click", () => {
+            if (!currentLayoutId) return;
+            openAddNodeDialog(currentLayoutId, null);
+        });
         // Tags
         $("#archive-tag-input").addEventListener("keydown", async (e) => {
             if (e.key === "Enter" && currentArchiveId) {

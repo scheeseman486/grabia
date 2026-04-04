@@ -1329,8 +1329,8 @@ main {
 /* Processed file expandable rows */
 tr.processed-expandable { cursor: pointer; }
 tr.processed-expandable:hover td { background: var(--bg-secondary); }
-tr.processed-detail-row td { padding: 0 !important; }
-.processed-detail-cell {
+tr.processed-detail-row td, tr.file-detail-row td { padding: 0 !important; }
+.processed-detail-cell, .file-detail-cell {
     background: var(--bg-secondary);
     border-top: 1px solid var(--border);
 }
@@ -2400,6 +2400,91 @@ tr.processed-detail-row td { padding: 0 !important; }
     border-bottom: 1px solid var(--border);
 }
 
+/* Collapsible archives section */
+.collection-archives-summary {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    cursor: pointer;
+    font-size: 14px;
+    font-weight: 600;
+    padding: 6px 0;
+    list-style: none;
+    user-select: none;
+}
+.collection-archives-summary::-webkit-details-marker { display: none; }
+.collection-archives-summary::before {
+    content: "\25B8";
+    font-size: 12px;
+    transition: transform 0.15s;
+}
+details[open] > .collection-archives-summary::before {
+    transform: rotate(90deg);
+}
+.action-btn-sm {
+    padding: 2px 8px;
+    font-size: 11px;
+    min-height: auto;
+}
+/* Layout selector row */
+.layout-selector-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+.layout-selector-row label {
+    font-weight: 600;
+    font-size: 13px;
+    color: var(--text-dim);
+}
+.layout-select {
+    flex: 1;
+    max-width: 300px;
+    padding: 4px 8px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: var(--bg);
+    color: var(--text);
+    font-size: 13px;
+}
+/* Layout editor */
+.modal-wide { max-width: 600px; }
+.layout-editor-tree {
+    max-height: 400px;
+    overflow-y: auto;
+    margin: 12px 0;
+}
+.layout-node-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 8px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    margin-bottom: 4px;
+    background: var(--bg-alt);
+    font-size: 12px;
+}
+.layout-node-item .node-name {
+    flex: 1;
+    font-weight: 500;
+}
+.layout-node-item .node-type-badge {
+    font-size: 10px;
+    padding: 1px 6px;
+    border-radius: 8px;
+    background: var(--border);
+    color: var(--text-dim);
+}
+.layout-node-item .node-actions {
+    display: flex;
+    gap: 4px;
+}
+.layout-editor-actions {
+    margin: 8px 0;
+}
+
 .layout-card {
     display: flex;
     align-items: center;
@@ -2627,6 +2712,21 @@ tr.processed-detail-row td { padding: 0 !important; }
     font-size: 11px;
     font-weight: 500;
 }
+.tag-chip.tag-auto {
+    background: rgba(255,255,255,0.08);
+    color: var(--text-dim);
+    border: 1px solid var(--border);
+}
+.tag-chip.tag-inherited {
+    background: transparent;
+    color: var(--text-dim);
+    border: 1px dashed var(--border);
+    font-style: italic;
+}
+.tag-parent-prefix {
+    opacity: 0.55;
+    font-weight: 400;
+}
 .tag-remove {
     background: none;
     border: none;
@@ -2637,6 +2737,40 @@ tr.processed-detail-row td { padding: 0 !important; }
     padding: 0 2px;
 }
 .tag-remove:hover { color: #fff; }
+/* File detail tags section */
+.file-detail-tags {
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--border);
+}
+.file-detail-tags-label {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--text-dim);
+    margin-bottom: 4px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+.file-detail-tags-container {
+    display: flex;
+    gap: 4px;
+    flex-wrap: wrap;
+    align-items: center;
+}
+.file-tag-input {
+    border: 1px solid var(--border);
+    background: var(--bg);
+    color: var(--text);
+    border-radius: 4px;
+    padding: 2px 6px;
+    font-size: 11px;
+    width: 90px;
+}
+.file-tag-input:focus {
+    outline: none;
+    border-color: var(--accent);
+}
+.file-detail-row { height: auto !important; }
+.file-detail-cell { padding: 0 !important; border: none !important; background: var(--bg-alt); }
 .tag-input {
     border: 1px solid var(--border);
     background: var(--bg);

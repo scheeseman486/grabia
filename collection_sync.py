@@ -228,6 +228,147 @@ def _build_media_units(files, download_dir, flatten=True, use_media_units=True):
     return units
 
 
+def _build_file_tag_lookup(collection_id, files=None):
+    """Build a file_id -> set(tags) lookup for all files in a collection.
+
+    Includes own file tags + inherited archive tags + group tags.
+    Also adds a pseudo-tag 'archive:{identifier}' for by_archive grouping.
+
+    If ``files`` is provided, uses that list instead of querying the DB again.
+    """
+    lookup = defaultdict(set)
+    if files is None:
+        files = db.get_collection_files(collection_id)
+    if not files:
+        return lookup
+
+    # Collect all archive IDs and their identifiers
+    archive_info = {}  # archive_id -> identifier
+    file_ids = []
+    for f in files:
+        file_ids.append(f["id"])
+        aid = f["archive_id"]
+        if aid not in archive_info:
+            archive_info[aid] = f.get("archive_identifier", "")
+        # Add archive pseudo-tag
+        lookup[f["id"]].add(f"archive:{f.get('archive_identifier', '')}")
+
+    # Bulk load file tags
+    file_tags = db.get_file_tags_bulk(file_ids)
+    for fid, tags in file_tags.items():
+        for t in tags:
+            lookup[fid].add(t["tag"])
+
+    # Inherited archive-level tags
+    for aid, ident in archive_info.items():
+        archive_tags = db.get_archive_tags(aid)
+        atag_set = {t["tag"] for t in archive_tags}
+        # Apply archive tags to all files of this archive
+        for f in files:
+            if f["archive_id"] == aid:
+                lookup[f["id"]].update(atag_set)
+
+    return lookup
+
+
+def _evaluate_node(node, units, tag_lookup, renames=None):
+    """Recursively evaluate a layout node tree.
+
+    Returns a dict of {relative_path: [(display_name, unit), ...]}
+    where relative_path is relative to this node's directory.
+    """
+    import json as _json
+
+    node_type = node["type"]
+    sort_mode = node.get("sort_mode", "flat")
+    include_untagged = node.get("include_untagged", 1)
+
+    # Parse renames
+    try:
+        node_renames = _json.loads(node.get("renames_json") or "{}") or {}
+    except (ValueError, TypeError):
+        node_renames = {}
+
+    mapping = defaultdict(list)
+
+    if node_type == "all":
+        # All units go into this directory
+        for unit in units:
+            mapping[""].append((unit["display_name"], unit))
+
+    elif node_type == "alphabetical":
+        # A-Z + # buckets
+        for unit in units:
+            bucket = _alphabetical_bucket(unit["display_name"])
+            mapping[bucket].append((unit["display_name"], unit))
+
+    elif node_type == "tag_parent":
+        tag_filter = node.get("tag_filter", "")
+        # Group units by the child values of this parent tag
+        for unit in units:
+            fid = unit["file_row"]["id"]
+            tags = tag_lookup.get(fid, set())
+            matched = False
+            for tag in tags:
+                if ":" in tag:
+                    parent, child = tag.split(":", 1)
+                    if parent == tag_filter:
+                        folder_name = node_renames.get(child, child)
+                        mapping[_safe_name(folder_name)].append((unit["display_name"], unit))
+                        matched = True
+                elif tag_filter == "archive":
+                    # Special case: archive pseudo-tag uses full value
+                    pass  # handled by archive: prefix above
+            # Special handling for archive: pseudo-tag
+            if tag_filter == "archive":
+                ident = unit["file_row"].get("archive_identifier", "unknown")
+                folder_name = node_renames.get(ident, ident)
+                mapping[_safe_name(folder_name)].append((unit["display_name"], unit))
+                matched = True
+            if not matched and include_untagged:
+                mapping["_untagged"].append((unit["display_name"], unit))
+
+    elif node_type == "tag_value":
+        tag_filter = node.get("tag_filter", "")
+        for unit in units:
+            fid = unit["file_row"]["id"]
+            tags = tag_lookup.get(fid, set())
+            if tag_filter in tags:
+                mapping[""].append((unit["display_name"], unit))
+
+    elif node_type == "custom":
+        # Custom node: evaluate children, each gets a subdirectory
+        children = node.get("children", [])
+        for child_node in children:
+            child_name = _safe_name(child_node["name"])
+            child_mapping = _evaluate_node(child_node, units, tag_lookup)
+            for sub_path, entries in child_mapping.items():
+                full_path = os.path.join(child_name, sub_path) if sub_path else child_name
+                mapping[full_path].extend(entries)
+
+    return mapping
+
+
+def _evaluate_node_tree(layout, units, tag_lookup):
+    """Evaluate a layout's node tree to produce a directory mapping.
+
+    Falls back to legacy _compute_layout_mapping if no nodes exist.
+    Returns {relative_dir: [(display_name, unit), ...]}.
+    """
+    nodes = layout.get("nodes", [])
+    if not nodes:
+        return _compute_layout_mapping(layout, units)
+
+    # Start with the root node(s)
+    mapping = defaultdict(list)
+    for root_node in nodes:
+        node_mapping = _evaluate_node(root_node, units, tag_lookup)
+        for path, entries in node_mapping.items():
+            mapping[path].extend(entries)
+
+    return mapping
+
+
 def _compute_layout_mapping(layout, units):
     """Compute a mapping of ``{relative_dir: [(display_name, unit), ...]}``
     for a given layout type.
@@ -348,6 +489,9 @@ def sync_collection(collection_id):
     units = _build_media_units(files, download_dir, flatten=flatten,
                                use_media_units=use_media_units)
 
+    # Build tag lookup for node-based layouts
+    tag_lookup = _build_file_tag_lookup(collection_id, files=files)
+
     stats = {
         "collection_id": collection_id,
         "collection_name": collection["name"],
@@ -372,15 +516,17 @@ def sync_collection(collection_id):
             "errors": [],
         }
 
-        # Compute desired symlinks for this layout
-        mapping = _compute_layout_mapping(layout, units)
+        # Compute desired symlinks for this layout (node-based or legacy)
+        mapping = _evaluate_node_tree(layout, units, tag_lookup)
         layout_stats["conflicts"] = _resolve_conflicts(mapping)
 
         # Build set of desired symlink paths (absolute) → (target_path, is_dir)
         desired = {}  # link_path → (target_path, is_dir)
         for subdir, entries in mapping.items():
             if subdir:
-                link_parent = os.path.join(layout_dir, _safe_name(subdir))
+                # Apply _safe_name to each path component (nested paths may contain /)
+                safe_parts = [_safe_name(p) for p in subdir.replace("\\", "/").split("/") if p]
+                link_parent = os.path.join(layout_dir, *safe_parts) if safe_parts else layout_dir
             else:
                 link_parent = layout_dir
 
@@ -560,10 +706,13 @@ def preview_collection(collection_id):
     units = _build_media_units(files, download_dir, flatten=flatten,
                                use_media_units=use_media_units)
 
+    # Build tag lookup for node-based layouts
+    tag_lookup = _build_file_tag_lookup(collection_id, files=files)
+
     rows = []
 
     for layout in layouts:
-        mapping = _compute_layout_mapping(layout, units)
+        mapping = _evaluate_node_tree(layout, units, tag_lookup)
         _resolve_conflicts(mapping)
 
         rows.append({
@@ -577,12 +726,16 @@ def preview_collection(collection_id):
         for subdir in sorted(mapping.keys()):
             entries = mapping[subdir]
             if subdir:
+                # Support nested paths: split on / or os.sep for depth
+                parts = [p for p in subdir.replace("\\", "/").split("/") if p]
+                depth = len(parts)
                 rows.append({
                     "type": "bucket_header",
-                    "depth": 1,
-                    "name": subdir,
+                    "depth": depth,
+                    "name": parts[-1],
+                    "path": subdir,
                 })
-                entry_depth = 2
+                entry_depth = depth + 1
             else:
                 entry_depth = 1
 

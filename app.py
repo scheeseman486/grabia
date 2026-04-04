@@ -504,6 +504,13 @@ def add_archive():
     )
     db.add_archive_files(archive_id, meta["files"])
 
+    # Auto-tag based on filenames
+    try:
+        from auto_tagger import auto_tag_archive
+        auto_tag_archive(archive_id)
+    except Exception as e:
+        log.warning("Auto-tag failed for archive %d: %s", archive_id, e)
+
     # Apply options from the add modal
     enable = data.get("enable", False)
     select_all = data.get("select_all", True)
@@ -1236,6 +1243,14 @@ def _finish_archive_scan(archive_id):
         "summary": summary,
     })
     broadcast_sse("archive_updated", updated)
+
+    # Auto-tag after scan completes
+    try:
+        from auto_tagger import auto_tag_archive
+        auto_tag_archive(archive_id)
+        log.info("Auto-tagged archive %d after scan", archive_id)
+    except Exception as e:
+        log.warning("Auto-tag failed for archive %d: %s", archive_id, e)
 
     # Clean up
     with _scan_lock:
@@ -2547,6 +2562,53 @@ def delete_collection_layout(collection_id, layout_id):
     return jsonify({"ok": True})
 
 
+# ── Layout Nodes ──────────────────────────────────────────────────────
+
+@app.route("/api/layouts/<int:layout_id>/nodes", methods=["GET"])
+@login_required
+def get_layout_nodes(layout_id):
+    """Return the node tree for a layout."""
+    nodes = db.get_layout_nodes(layout_id)
+    return jsonify(nodes)
+
+
+@app.route("/api/layouts/<int:layout_id>/nodes", methods=["POST"])
+@login_required
+def add_layout_node(layout_id):
+    """Add a node to a layout."""
+    data = request.get_json(force=True)
+    name = data.get("name", "New Folder")
+    node_type = data.get("type", "all")
+    parent_id = data.get("parent_id")
+    tag_filter = data.get("tag_filter")
+    sort_mode = data.get("sort_mode", "flat")
+    include_untagged = data.get("include_untagged", True)
+    renames_json = data.get("renames_json")
+    node = db.add_layout_node(
+        layout_id, name, node_type, parent_id=parent_id,
+        tag_filter=tag_filter, sort_mode=sort_mode,
+        include_untagged=include_untagged, renames_json=renames_json,
+    )
+    return jsonify(node), 201
+
+
+@app.route("/api/layouts/nodes/<int:node_id>", methods=["PATCH"])
+@login_required
+def update_layout_node(node_id):
+    """Update a layout node."""
+    data = request.get_json(force=True)
+    db.update_layout_node(node_id, **data)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/layouts/nodes/<int:node_id>", methods=["DELETE"])
+@login_required
+def delete_layout_node(node_id):
+    """Delete a layout node (cascades to children)."""
+    db.delete_layout_node(node_id)
+    return jsonify({"ok": True})
+
+
 # ── Collection Sync ──────────────────────────────────────────────────────
 
 @app.route("/api/collections/<int:collection_id>/sync", methods=["POST"])
@@ -2671,6 +2733,58 @@ def remove_archive_tag(archive_id, tag):
 def get_all_tags():
     """Return all unique tags with usage counts."""
     return jsonify(db.get_all_tags())
+
+
+@app.route("/api/archives/<int:archive_id>/auto-tag", methods=["POST"])
+@login_required
+def trigger_auto_tag(archive_id):
+    """Trigger auto-tagging for an archive (re-parses all filenames)."""
+    from auto_tagger import auto_tag_archive
+    auto_tag_archive(archive_id)
+    return jsonify({"ok": True, "tags": db.get_archive_tags(archive_id)})
+
+
+# ── File Tags ──────────────────────────────────────────────────────
+
+@app.route("/api/files/<int:file_id>/tags", methods=["GET"])
+@login_required
+def get_file_tags(file_id):
+    """Return tags for a file (own + inherited from archive)."""
+    own_tags = db.get_file_tags(file_id)
+    # Get inherited archive-level tags
+    file_info = db.get_file(file_id)
+    inherited = []
+    if file_info:
+        archive_tags = db.get_archive_tags(file_info["archive_id"])
+        own_tag_set = {t["tag"] for t in own_tags}
+        for at in archive_tags:
+            if at["tag"] not in own_tag_set:
+                inherited.append({"tag": at["tag"], "auto": True, "inherited": True})
+    return jsonify({"own": own_tags, "inherited": inherited})
+
+
+@app.route("/api/files/<int:file_id>/tags", methods=["POST"])
+@login_required
+def add_file_tag(file_id):
+    """Add a user tag to a file. Supports comma-separated tags."""
+    from auto_tagger import sanitise_tag
+    data = request.get_json(force=True)
+    raw = data.get("tag", "")
+    added = []
+    for part in raw.split(","):
+        tag = sanitise_tag(part)
+        if tag:
+            db.add_file_tag(file_id, tag, auto=False)
+            added.append(tag)
+    return jsonify(db.get_file_tags(file_id))
+
+
+@app.route("/api/files/<int:file_id>/tags/<path:tag>", methods=["DELETE"])
+@login_required
+def remove_file_tag(file_id, tag):
+    """Remove a user-added tag from a file."""
+    db.remove_file_tag(file_id, tag)
+    return jsonify(db.get_file_tags(file_id))
 
 
 @app.route("/api/archives/<int:archive_id>/collections", methods=["GET"])

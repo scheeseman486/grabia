@@ -174,8 +174,18 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             archive_id INTEGER NOT NULL,
             tag TEXT NOT NULL,
+            auto INTEGER NOT NULL DEFAULT 0,
             UNIQUE(archive_id, tag),
             FOREIGN KEY (archive_id) REFERENCES archives(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS file_tags (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            file_id INTEGER NOT NULL,
+            tag TEXT NOT NULL,
+            auto INTEGER NOT NULL DEFAULT 0,
+            UNIQUE(file_id, tag),
+            FOREIGN KEY (file_id) REFERENCES archive_files(id) ON DELETE CASCADE
         );
 
         CREATE TABLE IF NOT EXISTS collection_archives (
@@ -194,6 +204,21 @@ def init_db():
             type TEXT NOT NULL DEFAULT 'flat',
             position INTEGER NOT NULL DEFAULT 0,
             FOREIGN KEY (collection_id) REFERENCES collections(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS collection_layout_nodes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            layout_id INTEGER NOT NULL,
+            parent_id INTEGER DEFAULT NULL,
+            position INTEGER NOT NULL DEFAULT 0,
+            name TEXT NOT NULL,
+            type TEXT NOT NULL,
+            tag_filter TEXT DEFAULT NULL,
+            sort_mode TEXT NOT NULL DEFAULT 'flat',
+            renames_json TEXT DEFAULT NULL,
+            include_untagged INTEGER NOT NULL DEFAULT 1,
+            FOREIGN KEY (layout_id) REFERENCES collection_layouts(id) ON DELETE CASCADE,
+            FOREIGN KEY (parent_id) REFERENCES collection_layout_nodes(id) ON DELETE CASCADE
         );
 
         CREATE TABLE IF NOT EXISTS activity_jobs (
@@ -510,6 +535,28 @@ def init_db():
         conn.execute("ALTER TABLE notifications ADD COLUMN archive_id INTEGER DEFAULT NULL")
         conn.commit()
 
+    # Migration: add auto column to archive_tags
+    try:
+        conn.execute("SELECT auto FROM archive_tags LIMIT 1")
+    except sqlite3.OperationalError:
+        conn.execute("ALTER TABLE archive_tags ADD COLUMN auto INTEGER NOT NULL DEFAULT 0")
+        conn.commit()
+
+    # Migration: create file_tags table
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS file_tags (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            file_id INTEGER NOT NULL,
+            tag TEXT NOT NULL,
+            auto INTEGER NOT NULL DEFAULT 0,
+            UNIQUE(file_id, tag),
+            FOREIGN KEY (file_id) REFERENCES archive_files(id) ON DELETE CASCADE
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_file_tags_file ON file_tags(file_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_file_tags_tag ON file_tags(tag)")
+    conn.commit()
+
     # Add manifest cache columns to archives
     try:
         conn.execute("SELECT manifest_json FROM archives LIMIT 1")
@@ -529,6 +576,46 @@ def init_db():
     except sqlite3.OperationalError:
         conn.execute("ALTER TABLE collections ADD COLUMN flatten INTEGER NOT NULL DEFAULT 1")
         conn.execute("ALTER TABLE collections ADD COLUMN use_media_units INTEGER NOT NULL DEFAULT 1")
+
+    # Migration: create collection_layout_nodes table and migrate existing layouts
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS collection_layout_nodes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            layout_id INTEGER NOT NULL,
+            parent_id INTEGER DEFAULT NULL,
+            position INTEGER NOT NULL DEFAULT 0,
+            name TEXT NOT NULL,
+            type TEXT NOT NULL,
+            tag_filter TEXT DEFAULT NULL,
+            sort_mode TEXT NOT NULL DEFAULT 'flat',
+            renames_json TEXT DEFAULT NULL,
+            include_untagged INTEGER NOT NULL DEFAULT 1,
+            FOREIGN KEY (layout_id) REFERENCES collection_layouts(id) ON DELETE CASCADE,
+            FOREIGN KEY (parent_id) REFERENCES collection_layout_nodes(id) ON DELETE CASCADE
+        )
+    """)
+    # Auto-migrate existing layouts that have no nodes yet
+    orphan_layouts = conn.execute("""
+        SELECT l.id, l.type FROM collection_layouts l
+        WHERE NOT EXISTS (SELECT 1 FROM collection_layout_nodes n WHERE n.layout_id = l.id)
+    """).fetchall()
+    for ol in orphan_layouts:
+        lid, ltype = ol["id"], ol["type"]
+        if ltype == "alphabetical":
+            node_type, sort_mode = "alphabetical", "flat"
+        elif ltype == "by_archive":
+            node_type, sort_mode, tag_filter = "tag_parent", "flat", "archive"
+            conn.execute(
+                "INSERT INTO collection_layout_nodes (layout_id, parent_id, position, name, type, tag_filter, sort_mode) VALUES (?, NULL, 0, 'Root', ?, ?, ?)",
+                (lid, node_type, tag_filter, sort_mode),
+            )
+            continue
+        else:
+            node_type, sort_mode = "all", "flat"
+        conn.execute(
+            "INSERT INTO collection_layout_nodes (layout_id, parent_id, position, name, type, sort_mode) VALUES (?, NULL, 0, 'Root', ?, ?)",
+            (lid, node_type, sort_mode),
+        )
 
     # Queue state settings (download_state, processing_paused, scan_paused)
     conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('download_state', 'stopped')")
@@ -1950,9 +2037,12 @@ def get_collection(collection_id):
         ).fetchone()[0]
         # Count total files across archives in this collection
         d["file_count"] = _count_collection_files(conn, collection_id, d["file_scope"], d["auto_tag"])
-        d["layouts"] = [dict(r) for r in conn.execute(
+        layouts = [dict(r) for r in conn.execute(
             "SELECT * FROM collection_layouts WHERE collection_id = ? ORDER BY position", (collection_id,)
         ).fetchall()]
+        for layout in layouts:
+            layout["nodes"] = _get_layout_node_tree(conn, layout["id"])
+        d["layouts"] = layouts
         return d
 
 
@@ -2137,13 +2227,13 @@ def get_collections_for_archive(archive_id):
 
 # ── Archive Tags ──────────────────────────────────────────────────────
 
-def add_archive_tag(archive_id, tag):
+def add_archive_tag(archive_id, tag, auto=False):
     """Add a tag to an archive. Returns True if added, False if already present."""
     with _db() as conn:
         try:
             conn.execute(
-                "INSERT INTO archive_tags (archive_id, tag) VALUES (?, ?)",
-                (archive_id, tag.strip()),
+                "INSERT INTO archive_tags (archive_id, tag, auto) VALUES (?, ?, ?)",
+                (archive_id, tag.strip(), 1 if auto else 0),
             )
             conn.commit()
             return True
@@ -2152,30 +2242,141 @@ def add_archive_tag(archive_id, tag):
 
 
 def remove_archive_tag(archive_id, tag):
-    """Remove a tag from an archive."""
+    """Remove a user-added tag from an archive. Refuses to remove auto tags."""
     with _db() as conn:
         conn.execute(
-            "DELETE FROM archive_tags WHERE archive_id = ? AND tag = ?",
+            "DELETE FROM archive_tags WHERE archive_id = ? AND tag = ? AND auto = 0",
             (archive_id, tag),
         )
         conn.commit()
 
 
+def clear_auto_archive_tags(archive_id):
+    """Remove all auto-generated tags for an archive."""
+    with _db() as conn:
+        conn.execute(
+            "DELETE FROM archive_tags WHERE archive_id = ? AND auto = 1",
+            (archive_id,),
+        )
+        conn.commit()
+
+
 def get_archive_tags(archive_id):
-    """Return list of tag strings for an archive."""
+    """Return list of tag dicts (tag, auto) for an archive."""
     with _db() as conn:
         rows = conn.execute(
-            "SELECT tag FROM archive_tags WHERE archive_id = ? ORDER BY tag",
+            "SELECT tag, auto FROM archive_tags WHERE archive_id = ? ORDER BY tag",
             (archive_id,),
         ).fetchall()
-        return [r["tag"] for r in rows]
+        return [{"tag": r["tag"], "auto": bool(r["auto"])} for r in rows]
 
 
 def get_all_tags():
-    """Return all unique tags with counts."""
+    """Return all unique tags with counts (across both archive and file tags)."""
     with _db() as conn:
         rows = conn.execute(
-            "SELECT tag, COUNT(*) as count FROM archive_tags GROUP BY tag ORDER BY tag"
+            """SELECT tag, SUM(cnt) as count FROM (
+                SELECT tag, COUNT(*) as cnt FROM archive_tags GROUP BY tag
+                UNION ALL
+                SELECT tag, COUNT(*) as cnt FROM file_tags GROUP BY tag
+            ) GROUP BY tag ORDER BY tag"""
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+# ── File Tags ────────────────────────────────────────────────────────
+
+def add_file_tag(file_id, tag, auto=False):
+    """Add a tag to a file. Returns True if added, False if already present."""
+    with _db() as conn:
+        try:
+            conn.execute(
+                "INSERT INTO file_tags (file_id, tag, auto) VALUES (?, ?, ?)",
+                (file_id, tag.strip(), 1 if auto else 0),
+            )
+            conn.commit()
+            return True
+        except sqlite3.IntegrityError:
+            return False
+
+
+def remove_file_tag(file_id, tag):
+    """Remove a user-added tag from a file. Refuses to remove auto tags."""
+    with _db() as conn:
+        conn.execute(
+            "DELETE FROM file_tags WHERE file_id = ? AND tag = ? AND auto = 0",
+            (file_id, tag),
+        )
+        conn.commit()
+
+
+def get_file_tags(file_id):
+    """Return list of tag dicts (tag, auto) for a file."""
+    with _db() as conn:
+        rows = conn.execute(
+            "SELECT tag, auto FROM file_tags WHERE file_id = ? ORDER BY tag",
+            (file_id,),
+        ).fetchall()
+        return [{"tag": r["tag"], "auto": bool(r["auto"])} for r in rows]
+
+
+def get_file_tags_bulk(file_ids):
+    """Bulk fetch file tags. Returns dict of file_id -> list of tag dicts."""
+    if not file_ids:
+        return {}
+    result = {fid: [] for fid in file_ids}
+    with _db() as conn:
+        placeholders = ",".join("?" * len(file_ids))
+        rows = conn.execute(
+            f"SELECT file_id, tag, auto FROM file_tags WHERE file_id IN ({placeholders}) ORDER BY tag",
+            list(file_ids),
+        ).fetchall()
+        for r in rows:
+            result[r["file_id"]].append({"tag": r["tag"], "auto": bool(r["auto"])})
+    return result
+
+
+def clear_auto_file_tags(file_id):
+    """Remove all auto-generated tags for a file."""
+    with _db() as conn:
+        conn.execute(
+            "DELETE FROM file_tags WHERE file_id = ? AND auto = 1",
+            (file_id,),
+        )
+        conn.commit()
+
+
+def clear_auto_file_tags_for_archive(archive_id):
+    """Remove all auto-generated file tags for all files in an archive."""
+    with _db() as conn:
+        conn.execute(
+            """DELETE FROM file_tags WHERE auto = 1 AND file_id IN (
+                SELECT id FROM archive_files WHERE archive_id = ?
+            )""",
+            (archive_id,),
+        )
+        conn.commit()
+
+
+def get_files_by_tag(archive_id, tag):
+    """Return files in an archive matching a tag."""
+    with _db() as conn:
+        rows = conn.execute(
+            """SELECT af.* FROM archive_files af
+               JOIN file_tags ft ON af.id = ft.file_id
+               WHERE af.archive_id = ? AND ft.tag = ?
+               ORDER BY af.name""",
+            (archive_id, tag),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_archive_files_all(archive_id):
+    """Get all files for an archive (no status filter)."""
+    with _db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM archive_files WHERE archive_id = ? ORDER BY name",
+            (archive_id,),
         ).fetchall()
         return [dict(r) for r in rows]
 
@@ -2183,7 +2384,7 @@ def get_all_tags():
 # ── Collection Layouts ────────────────────────────────────────────────
 
 def add_collection_layout(collection_id, name, layout_type="flat"):
-    """Add a layout to a collection. Returns the new layout dict."""
+    """Add a layout to a collection with an auto-created root node. Returns the new layout dict."""
     with _db() as conn:
         pos = conn.execute(
             "SELECT COALESCE(MAX(position), -1) + 1 FROM collection_layouts WHERE collection_id = ?",
@@ -2193,8 +2394,22 @@ def add_collection_layout(collection_id, name, layout_type="flat"):
             "INSERT INTO collection_layouts (collection_id, name, type, position) VALUES (?, ?, ?, ?)",
             (collection_id, name, layout_type, pos),
         )
+        layout_id = cur.lastrowid
+        # Create root node based on layout type
+        if layout_type == "alphabetical":
+            node_type, sort_mode, tag_filter = "alphabetical", "flat", None
+        elif layout_type == "by_archive":
+            node_type, sort_mode, tag_filter = "tag_parent", "flat", "archive"
+        else:
+            node_type, sort_mode, tag_filter = "all", "flat", None
+        conn.execute(
+            """INSERT INTO collection_layout_nodes
+               (layout_id, parent_id, position, name, type, tag_filter, sort_mode)
+               VALUES (?, NULL, 0, 'Root', ?, ?, ?)""",
+            (layout_id, node_type, tag_filter, sort_mode),
+        )
         conn.commit()
-        row = conn.execute("SELECT * FROM collection_layouts WHERE id = ?", (cur.lastrowid,)).fetchone()
+        row = conn.execute("SELECT * FROM collection_layouts WHERE id = ?", (layout_id,)).fetchone()
         return dict(row) if row else None
 
 
@@ -2223,13 +2438,101 @@ def delete_collection_layout(layout_id):
 
 
 def get_collection_layouts(collection_id):
-    """Return layouts for a collection."""
+    """Return layouts for a collection, each including its node tree."""
     with _db() as conn:
         rows = conn.execute(
             "SELECT * FROM collection_layouts WHERE collection_id = ? ORDER BY position",
             (collection_id,),
         ).fetchall()
+        layouts = [dict(r) for r in rows]
+        for layout in layouts:
+            layout["nodes"] = _get_layout_node_tree(conn, layout["id"])
+        return layouts
+
+
+def _get_layout_node_tree(conn, layout_id):
+    """Build a nested tree of layout nodes for a layout."""
+    rows = conn.execute(
+        "SELECT * FROM collection_layout_nodes WHERE layout_id = ? ORDER BY position",
+        (layout_id,),
+    ).fetchall()
+    nodes = [dict(r) for r in rows]
+    by_parent = {}
+    for n in nodes:
+        pid = n["parent_id"]
+        by_parent.setdefault(pid, []).append(n)
+
+    def _build(parent_id):
+        children = by_parent.get(parent_id, [])
+        for c in children:
+            c["children"] = _build(c["id"])
+        return children
+
+    return _build(None)
+
+
+def get_layout_nodes(layout_id):
+    """Return flat list of layout nodes for a layout."""
+    with _db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM collection_layout_nodes WHERE layout_id = ? ORDER BY position",
+            (layout_id,),
+        ).fetchall()
         return [dict(r) for r in rows]
+
+
+def add_layout_node(layout_id, name, node_type, parent_id=None, tag_filter=None,
+                    sort_mode="flat", include_untagged=True, renames_json=None):
+    """Add a node to a layout. Returns the new node dict."""
+    with _db() as conn:
+        pos = conn.execute(
+            "SELECT COALESCE(MAX(position), -1) + 1 FROM collection_layout_nodes WHERE layout_id = ? AND parent_id IS ?",
+            (layout_id, parent_id),
+        ).fetchone()[0]
+        cur = conn.execute(
+            """INSERT INTO collection_layout_nodes
+               (layout_id, parent_id, position, name, type, tag_filter, sort_mode, include_untagged, renames_json)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (layout_id, parent_id, pos, name, node_type, tag_filter, sort_mode,
+             1 if include_untagged else 0, renames_json),
+        )
+        conn.commit()
+        row = conn.execute("SELECT * FROM collection_layout_nodes WHERE id = ?", (cur.lastrowid,)).fetchone()
+        return dict(row) if row else None
+
+
+def update_layout_node(node_id, **kwargs):
+    """Update node fields. Accepted keys: name, type, tag_filter, sort_mode, position, parent_id, renames_json, include_untagged."""
+    allowed = {"name", "type", "tag_filter", "sort_mode", "position", "parent_id", "renames_json", "include_untagged"}
+    updates = []
+    params = []
+    for key, val in kwargs.items():
+        if key in allowed:
+            updates.append(f"{key} = ?")
+            params.append(val)
+    if not updates:
+        return
+    params.append(node_id)
+    with _db() as conn:
+        conn.execute(f"UPDATE collection_layout_nodes SET {', '.join(updates)} WHERE id = ?", params)
+        conn.commit()
+
+
+def delete_layout_node(node_id):
+    """Delete a layout node (cascade deletes children via FK)."""
+    with _db() as conn:
+        conn.execute("DELETE FROM collection_layout_nodes WHERE id = ?", (node_id,))
+        conn.commit()
+
+
+def get_layout_root_node(layout_id):
+    """Return the root node (parent_id IS NULL) of a layout, or None."""
+    with _db() as conn:
+        row = conn.execute(
+            "SELECT * FROM collection_layout_nodes WHERE layout_id = ? AND parent_id IS NULL ORDER BY position LIMIT 1",
+            (layout_id,),
+        ).fetchone()
+        return dict(row) if row else None
 
 
 # ── Queue Overhaul: Batches ──────────────────────────────────────────
