@@ -6180,7 +6180,7 @@
         const layout = currentCollectionLayouts.find(l => l.id === layoutId);
         if (!layout) return;
         $("#layout-editor-title").textContent = layout.name;
-        $("#modal-layout-editor").style.display = "";
+        $("#modal-layout-editor").classList.add("open");
         // Load available tags for the tag dropdown
         try { leAvailableTags = await api("GET", "/api/tags"); } catch (e) { leAvailableTags = []; }
         populateLeTagDropdown();
@@ -6355,7 +6355,7 @@
         if (!layout) return;
         pbLayoutId = layoutId;
         $("#path-builder-title").textContent = layout.name;
-        $("#modal-path-builder").style.display = "";
+        $("#modal-path-builder").classList.add("open");
         // Load available tags
         try { leAvailableTags = await api("GET", "/api/tags"); } catch (e) { leAvailableTags = []; }
         pbSetupAddBar();
@@ -6777,12 +6777,12 @@
         });
         // Layout editor (legacy)
         $("#btn-layout-editor-close").addEventListener("click", () => {
-            $("#modal-layout-editor").style.display = "none";
+            $("#modal-layout-editor").classList.remove("open");
             if (currentCollectionId) openCollectionDetail(currentCollectionId);
         });
         // Path builder (new)
         $("#btn-path-builder-close").addEventListener("click", () => {
-            $("#modal-path-builder").style.display = "none";
+            $("#modal-path-builder").classList.remove("open");
             if (currentCollectionId) openCollectionDetail(currentCollectionId);
         });
         $("#btn-layout-editor-add-node").addEventListener("click", () => {
