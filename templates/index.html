@@ -328,9 +328,10 @@
                             <option value="tag_value">Single Tag</option>
                             <option value="custom">Custom Folder</option>
                         </select>
-                        <select id="le-add-tag" class="le-select" style="display:none" title="Select tag">
-                            <option value="">— select tag —</option>
-                        </select>
+                        <div id="le-tag-picker" class="tag-picker" style="display:none">
+                            <input type="text" id="le-tag-input" class="le-input tag-picker-input" placeholder="Type to search tags..." autocomplete="off">
+                            <div id="le-tag-suggestions" class="tag-suggestions"></div>
+                        </div>
                         <input type="text" id="le-add-name" class="le-input" placeholder="Name (optional)">
                         <button class="action-btn action-btn-sm" id="btn-layout-editor-add-node">+ Add</button>
                     </div>
@@ -364,9 +365,10 @@
                                 <option value="hidden_filter">Hidden filter</option>
                                 <option value="alphabetical">Alphabetical (A-Z)</option>
                             </select>
-                            <select id="pb-add-tag" class="le-select" style="display:none">
-                                <option value="">— select tag —</option>
-                            </select>
+                            <div id="pb-tag-picker" class="tag-picker" style="display:none">
+                                <input type="text" id="pb-tag-input" class="le-input tag-picker-input" placeholder="Type to search tags..." autocomplete="off">
+                                <div id="pb-tag-suggestions" class="tag-suggestions"></div>
+                            </div>
                             <input type="text" id="pb-add-value" class="le-input" placeholder="Value" style="display:none">
                             <button class="action-btn action-btn-sm" id="btn-pb-add-segment" style="display:none">Add</button>
                         </div>

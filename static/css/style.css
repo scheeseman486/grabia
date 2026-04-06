@@ -2536,6 +2536,37 @@ details[open] > .collection-archives-summary::before {
 .le-input { width: 120px; }
 .le-input:focus, .le-select:focus { outline: none; border-color: var(--accent); }
 
+/* ── Tag Picker (autocomplete) ─────────────────────────────────────── */
+.tag-picker { position: relative; display: inline-block; }
+.tag-picker-input { width: 200px; }
+.tag-suggestions {
+    position: absolute; top: 100%; left: 0; z-index: 300;
+    width: 280px; max-height: 260px; overflow-y: auto;
+    background: var(--bg-secondary); border: 1px solid var(--border);
+    border-radius: 6px; box-shadow: 0 4px 12px rgba(0,0,0,.4);
+    margin-top: 2px; display: none;
+}
+.tag-suggestions.visible { display: block; }
+.tag-suggestion {
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 5px 10px; cursor: pointer; font-size: 12px;
+    color: var(--text);
+}
+.tag-suggestion:hover, .tag-suggestion.active {
+    background: var(--accent); color: #fff;
+}
+.tag-suggestion .tag-count {
+    font-size: 11px; opacity: .6; margin-left: 8px;
+}
+.tag-suggestion .tag-parent-badge {
+    font-size: 10px; opacity: .5; margin-left: 4px;
+}
+.tag-suggestions-header {
+    padding: 4px 10px; font-size: 10px; text-transform: uppercase;
+    color: var(--text-dim); letter-spacing: .5px; opacity: .7;
+    border-bottom: 1px solid var(--border);
+}
+
 /* ── Path Builder ───────────────────────────────────────────────────── */
 .path-builder { display: flex; flex-direction: column; gap: 16px; }
 .path-builder-visual {

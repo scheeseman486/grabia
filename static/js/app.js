@@ -6189,47 +6189,18 @@
     }
 
     function populateLeTagDropdown() {
-        const sel = $("#le-add-tag");
-        sel.innerHTML = '<option value="">— select tag —</option>';
-        // Collect unique parent prefixes
-        const parents = new Set();
-        const standalone = [];
-        for (const t of leAvailableTags) {
-            const idx = t.tag.indexOf(":");
-            if (idx > 0) parents.add(t.tag.substring(0, idx));
-            else standalone.push(t.tag);
-        }
-        if (parents.size > 0) {
-            const grp = document.createElement("optgroup");
-            grp.label = "Parent tags (group by)";
-            for (const p of [...parents].sort()) {
-                const o = document.createElement("option");
-                o.value = p;
-                o.textContent = p + ":*";
-                grp.appendChild(o);
-            }
-            sel.appendChild(grp);
-        }
-        // Add all individual tags
-        const grp2 = document.createElement("optgroup");
-        grp2.label = "Individual tags";
-        for (const t of leAvailableTags) {
-            const o = document.createElement("option");
-            o.value = t.tag;
-            o.textContent = `${t.tag} (${t.count})`;
-            grp2.appendChild(o);
-        }
-        sel.appendChild(grp2);
+        initTagPicker($("#le-tag-input"), $("#le-tag-suggestions"), leAvailableTags, null);
     }
 
     function setupLeTypeToggle() {
         const typeSel = $("#le-add-type");
-        const tagSel = $("#le-add-tag");
+        const tagPicker = $("#le-tag-picker");
         typeSel.onchange = () => {
             const v = typeSel.value;
-            tagSel.style.display = (v === "tag_parent" || v === "tag_value") ? "" : "none";
+            tagPicker.style.display = (v === "tag_parent" || v === "tag_value") ? "" : "none";
+            if (tagPicker.style.display === "none") $("#le-tag-input").value = "";
         };
-        tagSel.style.display = "none";
+        tagPicker.style.display = "none";
     }
 
     async function refreshLayoutEditorTree(layoutId) {
@@ -6319,14 +6290,14 @@
 
     async function leAddNode(layoutId, parentId) {
         const typeSel = $("#le-add-type");
-        const tagSel = $("#le-add-tag");
+        const tagInput = $("#le-tag-input");
         const nameInput = $("#le-add-name");
         const nodeType = typeSel.value;
         let tagFilter = null;
         let name = nameInput.value.trim();
 
         if (nodeType === "tag_parent" || nodeType === "tag_value") {
-            tagFilter = tagSel.value;
+            tagFilter = tagInput.value.trim();
             if (!tagFilter) { addNotification("Select a tag first", "warning"); return; }
             if (!name) name = tagFilter;
         }
@@ -6362,50 +6333,127 @@
         await pbRefreshSegments();
     }
 
-    function pbSetupAddBar() {
-        const typeSel = $("#pb-add-type");
-        const tagSel = $("#pb-add-tag");
-        const valInput = $("#pb-add-value");
-        const addBtn = $("#btn-pb-add-segment");
+    // --- Reusable Tag Picker (autocomplete text input) ---
 
-        // Populate tag dropdown
-        tagSel.innerHTML = '<option value="">— select tag —</option>';
+    function initTagPicker(inputEl, suggestionsEl, tags, onSelect) {
+        // Build sorted list: parents first, then all tags sorted by count desc
         const parents = new Set();
-        for (const t of leAvailableTags) {
+        for (const t of tags) {
             const idx = t.tag.indexOf(":");
             if (idx > 0) parents.add(t.tag.substring(0, idx));
         }
-        if (parents.size > 0) {
-            const grp = document.createElement("optgroup");
-            grp.label = "Parent tags";
-            for (const p of [...parents].sort()) {
-                const o = document.createElement("option");
-                o.value = p; o.textContent = p + ":*";
-                grp.appendChild(o);
+        const parentList = [...parents].sort().map(p => ({ tag: p, count: tags.filter(t => t.tag.startsWith(p + ":")).reduce((s, t) => s + t.count, 0), isParent: true }));
+        const allTags = [...tags].sort((a, b) => b.count - a.count);
+        const combined = [...parentList, ...allTags];
+
+        let activeIdx = -1;
+        let filtered = [];
+
+        function render(query) {
+            query = (query || "").toLowerCase();
+            filtered = query
+                ? combined.filter(t => t.tag.toLowerCase().includes(query))
+                : combined.slice(0, 15);
+            suggestionsEl.innerHTML = "";
+            if (filtered.length === 0) {
+                suggestionsEl.classList.remove("visible");
+                return;
             }
-            tagSel.appendChild(grp);
+            filtered.forEach((t, i) => {
+                const div = document.createElement("div");
+                div.className = "tag-suggestion" + (i === activeIdx ? " active" : "");
+                const label = document.createElement("span");
+                label.textContent = t.tag + (t.isParent ? ":*" : "");
+                if (t.isParent) {
+                    const badge = document.createElement("span");
+                    badge.className = "tag-parent-badge";
+                    badge.textContent = "(parent)";
+                    label.appendChild(badge);
+                }
+                const count = document.createElement("span");
+                count.className = "tag-count";
+                count.textContent = t.count;
+                div.appendChild(label);
+                div.appendChild(count);
+                div.addEventListener("mousedown", (e) => {
+                    e.preventDefault(); // keep focus on input
+                    inputEl.value = t.tag + (t.isParent ? "" : "");
+                    suggestionsEl.classList.remove("visible");
+                    activeIdx = -1;
+                    if (onSelect) onSelect(t);
+                });
+                suggestionsEl.appendChild(div);
+            });
+            suggestionsEl.classList.add("visible");
         }
-        const grp2 = document.createElement("optgroup");
-        grp2.label = "All tags";
-        for (const t of leAvailableTags) {
-            const o = document.createElement("option");
-            o.value = t.tag; o.textContent = `${t.tag} (${t.count})`;
-            grp2.appendChild(o);
-        }
-        tagSel.appendChild(grp2);
+
+        inputEl.addEventListener("input", () => { activeIdx = -1; render(inputEl.value); });
+        inputEl.addEventListener("focus", () => render(inputEl.value));
+        inputEl.addEventListener("blur", () => {
+            // Delay to allow mousedown on suggestion
+            setTimeout(() => suggestionsEl.classList.remove("visible"), 150);
+        });
+        inputEl.addEventListener("keydown", (e) => {
+            if (!suggestionsEl.classList.contains("visible")) return;
+            if (e.key === "ArrowDown") {
+                e.preventDefault();
+                activeIdx = Math.min(activeIdx + 1, filtered.length - 1);
+                render(inputEl.value);
+            } else if (e.key === "ArrowUp") {
+                e.preventDefault();
+                activeIdx = Math.max(activeIdx - 1, 0);
+                render(inputEl.value);
+            } else if (e.key === "Tab" || e.key === "Enter") {
+                if (activeIdx >= 0 && activeIdx < filtered.length) {
+                    e.preventDefault();
+                    const t = filtered[activeIdx];
+                    inputEl.value = t.tag;
+                    suggestionsEl.classList.remove("visible");
+                    activeIdx = -1;
+                    if (onSelect) onSelect(t);
+                } else if (filtered.length > 0) {
+                    e.preventDefault();
+                    const t = filtered[0];
+                    inputEl.value = t.tag;
+                    suggestionsEl.classList.remove("visible");
+                    activeIdx = -1;
+                    if (onSelect) onSelect(t);
+                }
+            } else if (e.key === "Escape") {
+                suggestionsEl.classList.remove("visible");
+                activeIdx = -1;
+            }
+        });
+
+        // Initial render (hidden until focus)
+        activeIdx = -1;
+    }
+
+    function pbSetupAddBar() {
+        const typeSel = $("#pb-add-type");
+        const tagPicker = $("#pb-tag-picker");
+        const tagInput = $("#pb-tag-input");
+        const tagSuggestions = $("#pb-tag-suggestions");
+        const valInput = $("#pb-add-value");
+        const addBtn = $("#btn-pb-add-segment");
+
+        // Init tag picker
+        initTagPicker(tagInput, tagSuggestions, leAvailableTags, null);
 
         typeSel.onchange = () => {
             const v = typeSel.value;
-            tagSel.style.display = (v === "tag_parent" || v === "tag_specific" || v === "tag_group" || v === "hidden_filter") ? "" : "none";
+            const needsTag = (v === "tag_parent" || v === "tag_specific" || v === "tag_group" || v === "hidden_filter");
+            tagPicker.style.display = needsTag ? "" : "none";
             valInput.style.display = (v === "literal" || v === "tag_group" || v === "hidden_filter") ? "" : "none";
             addBtn.style.display = v ? "" : "none";
-            // Adjust placeholder
-            if (v === "literal") { valInput.placeholder = "Folder name"; tagSel.style.display = "none"; }
+            if (v === "literal") { valInput.placeholder = "Folder name"; tagPicker.style.display = "none"; }
             else if (v === "tag_group" || v === "hidden_filter") { valInput.placeholder = "Tags (e.g. beta+proto)"; }
             else { valInput.placeholder = "Value"; }
+            tagInput.value = "";
+            tagSuggestions.classList.remove("visible");
         };
         typeSel.value = "";
-        tagSel.style.display = "none";
+        tagPicker.style.display = "none";
         valInput.style.display = "none";
         addBtn.style.display = "none";
 
@@ -6414,7 +6462,7 @@
 
     async function pbAddSegment() {
         const typeSel = $("#pb-add-type");
-        const tagSel = $("#pb-add-tag");
+        const tagInput = $("#pb-tag-input");
         const valInput = $("#pb-add-value");
         const stype = typeSel.value;
         if (!stype) return;
@@ -6426,14 +6474,13 @@
             sval = valInput.value.trim();
             if (!sval) { addNotification("Enter a folder name", "warning"); return; }
         } else if (stype === "tag_parent" || stype === "tag_specific") {
-            sval = tagSel.value;
+            sval = tagInput.value.trim();
             if (!sval) { addNotification("Select a tag", "warning"); return; }
         } else if (stype === "tag_group") {
-            // Use text input ("+"-separated), or tag dropdown as helper
-            sval = valInput.value.trim() || tagSel.value;
+            sval = valInput.value.trim() || tagInput.value.trim();
             if (!sval) { addNotification("Enter tags separated by +", "warning"); return; }
         } else if (stype === "hidden_filter") {
-            sval = valInput.value.trim() || tagSel.value;
+            sval = valInput.value.trim() || tagInput.value.trim();
             if (!sval) { addNotification("Enter tags to filter by", "warning"); return; }
             visible = false;
         } else if (stype === "alphabetical") {
@@ -6448,7 +6495,8 @@
             });
             // Reset inputs
             typeSel.value = "";
-            tagSel.style.display = "none";
+            $("#pb-tag-picker").style.display = "none";
+            tagInput.value = "";
             valInput.style.display = "none";
             valInput.value = "";
             $("#btn-pb-add-segment").style.display = "none";
