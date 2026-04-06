@@ -5741,7 +5741,7 @@
             currentLayoutId = null;
         } else {
             for (const layout of currentCollectionLayouts) {
-                const typeLabel = { flat: "Flat", alphabetical: "A\u2013Z", by_archive: "By Archive" }[layout.type] || layout.type;
+                const typeLabel = { flat: "Flat", alphabetical: "A\u2013Z", by_archive: "By Archive", segments: "Path" }[layout.type] || layout.type;
                 const opt = document.createElement("option");
                 opt.value = layout.id;
                 opt.textContent = `${layout.name} (${typeLabel})`;
@@ -6125,7 +6125,7 @@
 
     // --- Layout Modal ---
 
-    function openLayoutModal(name = "", type = "flat") {
+    function openLayoutModal(name = "", type = "segments") {
         const isEdit = !!editingLayoutId;
         $("#modal-layout-title").textContent = isEdit ? "Edit Layout" : "Add Layout";
         $("#layout-name-input").value = name;
@@ -6345,6 +6345,261 @@
         }
     }
 
+    // --- Path Builder (new segment-based layout editor) ---
+
+    let pbLayoutId = null;
+    let pbSegments = [];
+
+    async function openPathBuilder(layoutId) {
+        const layout = currentCollectionLayouts.find(l => l.id === layoutId);
+        if (!layout) return;
+        pbLayoutId = layoutId;
+        $("#path-builder-title").textContent = layout.name;
+        $("#modal-path-builder").style.display = "";
+        // Load available tags
+        try { leAvailableTags = await api("GET", "/api/tags"); } catch (e) { leAvailableTags = []; }
+        pbSetupAddBar();
+        await pbRefreshSegments();
+    }
+
+    function pbSetupAddBar() {
+        const typeSel = $("#pb-add-type");
+        const tagSel = $("#pb-add-tag");
+        const valInput = $("#pb-add-value");
+        const addBtn = $("#btn-pb-add-segment");
+
+        // Populate tag dropdown
+        tagSel.innerHTML = '<option value="">— select tag —</option>';
+        const parents = new Set();
+        for (const t of leAvailableTags) {
+            const idx = t.tag.indexOf(":");
+            if (idx > 0) parents.add(t.tag.substring(0, idx));
+        }
+        if (parents.size > 0) {
+            const grp = document.createElement("optgroup");
+            grp.label = "Parent tags";
+            for (const p of [...parents].sort()) {
+                const o = document.createElement("option");
+                o.value = p; o.textContent = p + ":*";
+                grp.appendChild(o);
+            }
+            tagSel.appendChild(grp);
+        }
+        const grp2 = document.createElement("optgroup");
+        grp2.label = "All tags";
+        for (const t of leAvailableTags) {
+            const o = document.createElement("option");
+            o.value = t.tag; o.textContent = `${t.tag} (${t.count})`;
+            grp2.appendChild(o);
+        }
+        tagSel.appendChild(grp2);
+
+        typeSel.onchange = () => {
+            const v = typeSel.value;
+            tagSel.style.display = (v === "tag_parent" || v === "tag_specific" || v === "tag_group" || v === "hidden_filter") ? "" : "none";
+            valInput.style.display = (v === "literal" || v === "tag_group" || v === "hidden_filter") ? "" : "none";
+            addBtn.style.display = v ? "" : "none";
+            // Adjust placeholder
+            if (v === "literal") { valInput.placeholder = "Folder name"; tagSel.style.display = "none"; }
+            else if (v === "tag_group" || v === "hidden_filter") { valInput.placeholder = "Tags (e.g. beta+proto)"; }
+            else { valInput.placeholder = "Value"; }
+        };
+        typeSel.value = "";
+        tagSel.style.display = "none";
+        valInput.style.display = "none";
+        addBtn.style.display = "none";
+
+        addBtn.onclick = () => pbAddSegment();
+    }
+
+    async function pbAddSegment() {
+        const typeSel = $("#pb-add-type");
+        const tagSel = $("#pb-add-tag");
+        const valInput = $("#pb-add-value");
+        const stype = typeSel.value;
+        if (!stype) return;
+
+        let sval = null;
+        let visible = true;
+
+        if (stype === "literal") {
+            sval = valInput.value.trim();
+            if (!sval) { addNotification("Enter a folder name", "warning"); return; }
+        } else if (stype === "tag_parent" || stype === "tag_specific") {
+            sval = tagSel.value;
+            if (!sval) { addNotification("Select a tag", "warning"); return; }
+        } else if (stype === "tag_group") {
+            // Use text input ("+"-separated), or tag dropdown as helper
+            sval = valInput.value.trim() || tagSel.value;
+            if (!sval) { addNotification("Enter tags separated by +", "warning"); return; }
+        } else if (stype === "hidden_filter") {
+            sval = valInput.value.trim() || tagSel.value;
+            if (!sval) { addNotification("Enter tags to filter by", "warning"); return; }
+            visible = false;
+        } else if (stype === "alphabetical") {
+            sval = "A-Z";
+        }
+
+        try {
+            await api("POST", `/api/layouts/${pbLayoutId}/segments`, {
+                segment_type: stype,
+                segment_value: sval,
+                visible: visible,
+            });
+            // Reset inputs
+            typeSel.value = "";
+            tagSel.style.display = "none";
+            valInput.style.display = "none";
+            valInput.value = "";
+            $("#btn-pb-add-segment").style.display = "none";
+            await pbRefreshSegments();
+        } catch (e) {
+            addNotification("Failed to add segment: " + e.message, "error");
+        }
+    }
+
+    async function pbRefreshSegments() {
+        if (!pbLayoutId) return;
+        try {
+            pbSegments = await api("GET", `/api/layouts/${pbLayoutId}/segments`);
+        } catch (e) {
+            pbSegments = [];
+        }
+        pbRenderVisual();
+        pbRenderSegmentList();
+    }
+
+    function pbRenderVisual() {
+        const el = $("#path-builder-visual");
+        el.innerHTML = "";
+        el.appendChild(Object.assign(document.createElement("span"), { className: "path-segment-root", textContent: "/" }));
+
+        for (let i = 0; i < pbSegments.length; i++) {
+            const seg = pbSegments[i];
+            const card = document.createElement("span");
+            const typeClass = "seg-" + seg.segment_type.replace(/_/g, "-");
+            card.className = `path-segment-card ${typeClass}${seg.visible ? "" : " seg-hidden"}`;
+
+            const typeIcons = {
+                literal: "\uD83D\uDCC1",
+                tag_parent: "\uD83C\uDFF7\uFE0F",
+                tag_specific: "\uD83C\uDFF7\uFE0F",
+                tag_group: "\uD83C\uDFF7\uFE0F+",
+                hidden_filter: "\uD83D\uDD12",
+                alphabetical: "Az",
+            };
+            card.innerHTML = `<span class="seg-type-icon">${typeIcons[seg.segment_type] || "?"}</span>` +
+                `<span class="seg-label">${esc(pbSegmentLabel(seg))}</span>` +
+                `<button class="seg-remove" data-seg-id="${seg.id}" title="Remove">&times;</button>`;
+
+            card.querySelector(".seg-remove").addEventListener("click", async (e) => {
+                e.stopPropagation();
+                await api("DELETE", `/api/layouts/segments/${seg.id}`);
+                await pbRefreshSegments();
+            });
+
+            // Click to toggle visibility
+            card.addEventListener("click", async () => {
+                await api("PATCH", `/api/layouts/segments/${seg.id}`, { visible: seg.visible ? 0 : 1 });
+                await pbRefreshSegments();
+            });
+
+            el.appendChild(card);
+
+            if (i < pbSegments.length - 1) {
+                el.appendChild(Object.assign(document.createElement("span"), { className: "path-segment-sep", textContent: "/" }));
+            }
+        }
+
+        el.appendChild(Object.assign(document.createElement("span"), { className: "path-segment-sep", textContent: "/" }));
+        el.appendChild(Object.assign(document.createElement("span"), { className: "path-segment-wildcard", textContent: "*" }));
+    }
+
+    function pbSegmentLabel(seg) {
+        switch (seg.segment_type) {
+            case "literal": return seg.segment_value || "folder";
+            case "tag_parent": return (seg.segment_value || "?") + ":*";
+            case "tag_specific": {
+                const v = seg.segment_value || "";
+                return v.includes(":") ? v.split(":")[1] : v;
+            }
+            case "tag_group": return seg.segment_value || "group";
+            case "hidden_filter": return seg.segment_value || "filter";
+            case "alphabetical": return "A-Z";
+            default: return seg.segment_type;
+        }
+    }
+
+    function pbRenderSegmentList() {
+        const el = $("#path-builder-segments");
+        el.innerHTML = "";
+        if (pbSegments.length === 0) {
+            el.innerHTML = '<p class="empty-hint">No segments. Add a segment to build your path.</p>';
+            return;
+        }
+        for (let i = 0; i < pbSegments.length; i++) {
+            const seg = pbSegments[i];
+            const div = document.createElement("div");
+            div.className = "path-segment-detail";
+
+            const typeLabels = {
+                literal: "LITERAL",
+                tag_parent: "PARENT",
+                tag_specific: "TAG",
+                tag_group: "GROUP",
+                hidden_filter: "HIDDEN",
+                alphabetical: "A-Z",
+            };
+
+            const visIcon = seg.visible ? "\uD83D\uDC41" : "\uD83D\uDC41\u200D\uD83D\uDDE8";
+            const visTitle = seg.visible ? "Visible on disk (click to hide)" : "Hidden filter (click to make visible)";
+
+            div.innerHTML = `
+                <span class="seg-pos">${i + 1}</span>
+                <span class="seg-type-badge">${typeLabels[seg.segment_type] || seg.segment_type}</span>
+                <span class="seg-value">${esc(seg.segment_value || "(none)")}</span>
+                <span class="seg-visibility ${seg.visible ? "seg-visible" : ""}" data-seg-id="${seg.id}" title="${visTitle}">${seg.visible ? "\uD83D\uDC41" : "\uD83D\uDE48"}</span>
+                <span class="seg-actions">
+                    ${i > 0 ? `<button class="seg-action-btn" data-move-up="${seg.id}" title="Move up">\u2191</button>` : ""}
+                    ${i < pbSegments.length - 1 ? `<button class="seg-action-btn" data-move-down="${seg.id}" title="Move down">\u2193</button>` : ""}
+                    <button class="seg-action-btn seg-btn-danger" data-del-seg="${seg.id}" title="Delete">\u00D7</button>
+                </span>
+            `;
+
+            // Visibility toggle
+            div.querySelector(".seg-visibility").addEventListener("click", async () => {
+                await api("PATCH", `/api/layouts/segments/${seg.id}`, { visible: seg.visible ? 0 : 1 });
+                await pbRefreshSegments();
+            });
+
+            // Move up/down
+            const upBtn = div.querySelector(`[data-move-up="${seg.id}"]`);
+            if (upBtn) upBtn.addEventListener("click", async () => {
+                const ids = pbSegments.map(s => s.id);
+                ids.splice(i, 1);
+                ids.splice(i - 1, 0, seg.id);
+                await api("POST", `/api/layouts/${pbLayoutId}/segments/reorder`, { segment_ids: ids });
+                await pbRefreshSegments();
+            });
+            const downBtn = div.querySelector(`[data-move-down="${seg.id}"]`);
+            if (downBtn) downBtn.addEventListener("click", async () => {
+                const ids = pbSegments.map(s => s.id);
+                ids.splice(i, 1);
+                ids.splice(i + 1, 0, seg.id);
+                await api("POST", `/api/layouts/${pbLayoutId}/segments/reorder`, { segment_ids: ids });
+                await pbRefreshSegments();
+            });
+
+            // Delete
+            div.querySelector(`[data-del-seg="${seg.id}"]`).addEventListener("click", async () => {
+                await api("DELETE", `/api/layouts/segments/${seg.id}`);
+                await pbRefreshSegments();
+            });
+
+            el.appendChild(div);
+        }
+    }
+
     // --- Sync ---
 
     async function syncCurrentCollection() {
@@ -6504,7 +6759,13 @@
         });
         $("#btn-edit-layout").addEventListener("click", () => {
             if (!currentLayoutId) return;
-            openLayoutEditor(currentLayoutId);
+            const layout = currentCollectionLayouts.find(l => l.id === currentLayoutId);
+            // Use path builder for segment-based or new layouts; legacy editor for old node-based
+            if (layout && (layout.type === "segments" || (layout.segments && layout.segments.length > 0))) {
+                openPathBuilder(currentLayoutId);
+            } else {
+                openLayoutEditor(currentLayoutId);
+            }
         });
         $("#btn-delete-layout").addEventListener("click", async () => {
             if (!currentLayoutId || !currentCollectionId) return;
@@ -6514,9 +6775,14 @@
                 openCollectionDetail(currentCollectionId);
             }, { confirmText: "Delete" });
         });
-        // Layout editor
+        // Layout editor (legacy)
         $("#btn-layout-editor-close").addEventListener("click", () => {
             $("#modal-layout-editor").style.display = "none";
+            if (currentCollectionId) openCollectionDetail(currentCollectionId);
+        });
+        // Path builder (new)
+        $("#btn-path-builder-close").addEventListener("click", () => {
+            $("#modal-path-builder").style.display = "none";
             if (currentCollectionId) openCollectionDetail(currentCollectionId);
         });
         $("#btn-layout-editor-add-node").addEventListener("click", () => {

@@ -2601,8 +2601,8 @@ def add_collection_layout(collection_id):
     name = data.get("name", "").strip()
     if not name:
         return jsonify({"error": "Layout name is required"}), 400
-    layout_type = data.get("type", "flat")
-    if layout_type not in ("flat", "alphabetical", "by_archive"):
+    layout_type = data.get("type", "segments")
+    if layout_type not in ("flat", "alphabetical", "by_archive", "segments"):
         return jsonify({"error": "Invalid layout type"}), 400
     layout = db.add_collection_layout(collection_id, name, layout_type=layout_type)
     updated = db.get_collection(collection_id)
@@ -2622,7 +2622,7 @@ def update_collection_layout(collection_id, layout_id):
             return jsonify({"error": "Layout name cannot be empty"}), 400
         kwargs["name"] = name
     if "type" in data:
-        if data["type"] not in ("flat", "alphabetical", "by_archive"):
+        if data["type"] not in ("flat", "alphabetical", "by_archive", "segments"):
             return jsonify({"error": "Invalid layout type"}), 400
         kwargs["type"] = data["type"]
     if "position" in data:
@@ -2688,6 +2688,65 @@ def update_layout_node(node_id):
 def delete_layout_node(node_id):
     """Delete a layout node (cascades to children)."""
     db.delete_layout_node(node_id)
+    return jsonify({"ok": True})
+
+
+# ── Layout Segments (new path-based layout system) ────────────────────
+
+@app.route("/api/layouts/<int:layout_id>/segments", methods=["GET"])
+@login_required
+def get_layout_segments(layout_id):
+    """Return the ordered segments for a layout."""
+    return jsonify(db.get_layout_segments(layout_id))
+
+
+@app.route("/api/layouts/<int:layout_id>/segments", methods=["POST"])
+@login_required
+def add_layout_segment(layout_id):
+    """Add a segment to a layout."""
+    data = request.get_json(force=True)
+    segment_type = data.get("segment_type", "").strip()
+    valid_types = ("literal", "tag_parent", "tag_specific", "tag_group",
+                   "hidden_filter", "alphabetical")
+    if segment_type not in valid_types:
+        return jsonify({"error": f"Invalid segment type: {segment_type}"}), 400
+    seg = db.add_layout_segment(
+        layout_id,
+        segment_type=segment_type,
+        segment_value=data.get("segment_value"),
+        visible=data.get("visible", True),
+        include_untagged=data.get("include_untagged", False),
+        position=data.get("position"),
+    )
+    return jsonify(seg), 201
+
+
+@app.route("/api/layouts/segments/<int:segment_id>", methods=["PATCH"])
+@login_required
+def update_layout_segment(segment_id):
+    """Update a segment's properties."""
+    data = request.get_json(force=True)
+    db.update_layout_segment(segment_id, **data)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/layouts/segments/<int:segment_id>", methods=["DELETE"])
+@login_required
+def delete_layout_segment(segment_id):
+    """Delete a segment."""
+    db.delete_layout_segment(segment_id)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/layouts/<int:layout_id>/segments/reorder", methods=["POST"])
+@login_required
+def reorder_layout_segments(layout_id):
+    """Reorder segments. Body: {"segment_ids": [3, 1, 2]}."""
+    data = request.get_json(force=True)
+    segment_ids = data.get("segment_ids", [])
+    if not segment_ids:
+        return jsonify({"error": "segment_ids required"}), 400
+    db.reorder_layout_segments(layout_id, segment_ids)
     return jsonify({"ok": True})
 
 

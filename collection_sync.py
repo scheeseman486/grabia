@@ -350,11 +350,19 @@ def _evaluate_node(node, units, tag_lookup, renames=None):
 
 
 def _evaluate_node_tree(layout, units, tag_lookup):
-    """Evaluate a layout's node tree to produce a directory mapping.
+    """Evaluate a layout to produce a directory mapping.
 
-    Falls back to legacy _compute_layout_mapping if no nodes exist.
+    Priority order:
+    1. New segment-based path template (if segments exist)
+    2. Legacy node tree (if nodes exist)
+    3. Legacy type-based mapping (flat/alphabetical/by_archive)
+
     Returns {relative_dir: [(display_name, unit), ...]}.
     """
+    segments = layout.get("segments", [])
+    if segments:
+        return _evaluate_segments(segments, units, tag_lookup)
+
     nodes = layout.get("nodes", [])
     if not nodes:
         return _compute_layout_mapping(layout, units)
@@ -367,6 +375,174 @@ def _evaluate_node_tree(layout, units, tag_lookup):
             mapping[path].extend(entries)
 
     return mapping
+
+
+def _evaluate_segments(segments, units, tag_lookup):
+    """Evaluate a segment-based path template.
+
+    Processes segments left-to-right.  Each segment either:
+    - Filters the unit set (tag_specific, tag_group, hidden_filter)
+    - Splits the unit set into subdirectories (tag_parent, alphabetical)
+    - Adds a literal path component (literal)
+
+    Returns {relative_dir: [(display_name, unit), ...]}.
+    """
+    # Start with all units in a single group at root path ""
+    # Groups: list of (path_prefix, [units])
+    groups = [("", list(units))]
+
+    for seg in segments:
+        stype = seg["segment_type"]
+        sval = seg.get("segment_value") or ""
+        visible = bool(seg.get("visible", 1))
+        include_untagged = bool(seg.get("include_untagged", 0))
+
+        new_groups = []
+
+        if stype == "literal":
+            # Add a fixed folder name to the path
+            for path, group_units in groups:
+                new_path = os.path.join(path, _safe_name(sval)) if visible else path
+                new_groups.append((new_path, group_units))
+
+        elif stype == "tag_parent":
+            # Expand into child folders for each child value of this parent tag
+            for path, group_units in groups:
+                buckets = defaultdict(list)
+                untagged = []
+                for unit in group_units:
+                    fid = unit["file_row"]["id"]
+                    tags = tag_lookup.get(fid, set())
+                    matched = False
+                    # Special case: archive pseudo-tag
+                    if sval == "archive":
+                        ident = unit["file_row"].get("archive_identifier", "unknown")
+                        buckets[ident].append(unit)
+                        matched = True
+                    else:
+                        for tag in tags:
+                            if ":" in tag:
+                                parent, child = tag.split(":", 1)
+                                if parent == sval:
+                                    buckets[child].append(unit)
+                                    matched = True
+                    if not matched and include_untagged:
+                        untagged.append(unit)
+                for child_val, child_units in buckets.items():
+                    child_path = os.path.join(path, _safe_name(child_val)) if visible else path
+                    new_groups.append((child_path, child_units))
+                if untagged:
+                    untag_path = os.path.join(path, "_untagged") if visible else path
+                    new_groups.append((untag_path, untagged))
+
+        elif stype == "tag_specific":
+            # Filter to units matching a specific tag (parent:child or plain tag)
+            # Display folder name is the child portion
+            for path, group_units in groups:
+                filtered = []
+                for unit in group_units:
+                    fid = unit["file_row"]["id"]
+                    tags = tag_lookup.get(fid, set())
+                    if sval in tags:
+                        filtered.append(unit)
+                if filtered:
+                    if visible:
+                        # Show child portion as folder name
+                        folder_name = sval.split(":", 1)[1] if ":" in sval else sval
+                        new_path = os.path.join(path, _safe_name(folder_name))
+                    else:
+                        new_path = path
+                    new_groups.append((new_path, filtered))
+
+        elif stype == "tag_group":
+            # OR-union of multiple tags. segment_value is JSON array or "+"-separated
+            tag_list = _parse_tag_group(sval)
+            for path, group_units in groups:
+                filtered = []
+                for unit in group_units:
+                    fid = unit["file_row"]["id"]
+                    tags = tag_lookup.get(fid, set())
+                    # Match if any tag in the group matches (including parent:child expansion)
+                    if _matches_tag_group(tags, tag_list):
+                        filtered.append(unit)
+                if filtered:
+                    if visible:
+                        folder_name = "+".join(tag_list)
+                        new_path = os.path.join(path, _safe_name(folder_name))
+                    else:
+                        new_path = path
+                    new_groups.append((new_path, filtered))
+
+        elif stype == "hidden_filter":
+            # Same as tag_group but always invisible
+            tag_list = _parse_tag_group(sval)
+            for path, group_units in groups:
+                filtered = []
+                for unit in group_units:
+                    fid = unit["file_row"]["id"]
+                    tags = tag_lookup.get(fid, set())
+                    if _matches_tag_group(tags, tag_list):
+                        filtered.append(unit)
+                if filtered:
+                    new_groups.append((path, filtered))
+
+        elif stype == "alphabetical":
+            # Split into A-Z + # buckets
+            for path, group_units in groups:
+                buckets = defaultdict(list)
+                for unit in group_units:
+                    bucket = _alphabetical_bucket(unit["display_name"])
+                    buckets[bucket].append(unit)
+                for bucket_name, bucket_units in buckets.items():
+                    new_path = os.path.join(path, bucket_name) if visible else path
+                    new_groups.append((new_path, bucket_units))
+
+        else:
+            # Unknown segment type — pass through
+            new_groups = groups
+
+        groups = new_groups
+
+    # Convert groups to the standard mapping format
+    mapping = defaultdict(list)
+    for path, group_units in groups:
+        for unit in group_units:
+            mapping[path].append((unit["display_name"], unit))
+
+    return mapping
+
+
+def _parse_tag_group(value):
+    """Parse a tag group value — either JSON array or '+'-separated string."""
+    if not value:
+        return []
+    # Try JSON array first
+    try:
+        parsed = json.loads(value)
+        if isinstance(parsed, list):
+            return [str(t).strip() for t in parsed if str(t).strip()]
+    except (json.JSONDecodeError, TypeError):
+        pass
+    # Fall back to "+"-separated
+    return [t.strip() for t in value.split("+") if t.strip()]
+
+
+def _matches_tag_group(file_tags, tag_list):
+    """Check if a file's tags match any tag in a group.
+
+    Supports both exact matches and parent-tag matching:
+    - "beta" matches the tag "beta" directly
+    - "region" matches any tag starting with "region:" (parent match)
+    - "region:japan" matches "region:japan" exactly
+    """
+    for tag in tag_list:
+        if tag in file_tags:
+            return True
+        # Check if this is a parent tag (matches any child)
+        prefix = tag + ":"
+        if any(ft.startswith(prefix) for ft in file_tags):
+            return True
+    return False
 
 
 def _compute_layout_mapping(layout, units):

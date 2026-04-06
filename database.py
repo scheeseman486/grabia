@@ -164,7 +164,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS collections (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL UNIQUE,
-            file_scope TEXT NOT NULL DEFAULT 'processed',
+            file_scope TEXT NOT NULL DEFAULT 'both',
             auto_tag TEXT DEFAULT NULL,
             position INTEGER NOT NULL DEFAULT 0,
             created_at REAL NOT NULL
@@ -219,6 +219,17 @@ def init_db():
             include_untagged INTEGER NOT NULL DEFAULT 1,
             FOREIGN KEY (layout_id) REFERENCES collection_layouts(id) ON DELETE CASCADE,
             FOREIGN KEY (parent_id) REFERENCES collection_layout_nodes(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS collection_layout_segments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            layout_id INTEGER NOT NULL,
+            position INTEGER NOT NULL DEFAULT 0,
+            segment_type TEXT NOT NULL,
+            segment_value TEXT DEFAULT NULL,
+            visible INTEGER NOT NULL DEFAULT 1,
+            include_untagged INTEGER NOT NULL DEFAULT 0,
+            FOREIGN KEY (layout_id) REFERENCES collection_layouts(id) ON DELETE CASCADE
         );
 
         CREATE TABLE IF NOT EXISTS activity_jobs (
@@ -713,8 +724,49 @@ def init_db():
     # SQLite doesn't support DROP COLUMN before 3.35, so we just leave them if present.
     # They're harmless — the code no longer reads or writes them.
 
+    # Migrate legacy layouts (flat/alphabetical/by_archive) to segment-based
+    _migrate_legacy_layouts_to_segments(conn)
+
     conn.commit()
     conn.close()
+
+
+def _migrate_legacy_layouts_to_segments(conn):
+    """Auto-migrate old layout types to segment-based layouts.
+
+    flat → no segments (empty path = all files at root)
+    alphabetical → one alphabetical segment
+    by_archive → one tag_parent segment with value "archive"
+
+    Only migrates layouts that have no segments yet and are not type 'segments'.
+    """
+    rows = conn.execute(
+        "SELECT id, type FROM collection_layouts WHERE type != 'segments'"
+    ).fetchall()
+    for row in rows:
+        lid = row["id"]
+        ltype = row["type"]
+        # Check if already has segments
+        has_segments = conn.execute(
+            "SELECT 1 FROM collection_layout_segments WHERE layout_id = ? LIMIT 1", (lid,)
+        ).fetchone()
+        if has_segments:
+            continue
+
+        if ltype == "alphabetical":
+            conn.execute(
+                "INSERT INTO collection_layout_segments (layout_id, position, segment_type, segment_value, visible, include_untagged) "
+                "VALUES (?, 0, 'alphabetical', 'A-Z', 1, 0)", (lid,)
+            )
+        elif ltype == "by_archive":
+            conn.execute(
+                "INSERT INTO collection_layout_segments (layout_id, position, segment_type, segment_value, visible, include_untagged) "
+                "VALUES (?, 0, 'tag_parent', 'archive', 1, 1)", (lid,)
+            )
+        # flat = no segments needed (all files at root)
+
+        # Update type to 'segments'
+        conn.execute("UPDATE collection_layouts SET type = 'segments' WHERE id = ?", (lid,))
 
 
 # --- Settings ---
@@ -2438,7 +2490,7 @@ def delete_collection_layout(layout_id):
 
 
 def get_collection_layouts(collection_id):
-    """Return layouts for a collection, each including its node tree."""
+    """Return layouts for a collection, each including its node tree and segments."""
     with _db() as conn:
         rows = conn.execute(
             "SELECT * FROM collection_layouts WHERE collection_id = ? ORDER BY position",
@@ -2447,6 +2499,11 @@ def get_collection_layouts(collection_id):
         layouts = [dict(r) for r in rows]
         for layout in layouts:
             layout["nodes"] = _get_layout_node_tree(conn, layout["id"])
+            seg_rows = conn.execute(
+                "SELECT * FROM collection_layout_segments WHERE layout_id = ? ORDER BY position",
+                (layout["id"],),
+            ).fetchall()
+            layout["segments"] = [dict(r) for r in seg_rows]
         return layouts
 
 
@@ -2533,6 +2590,77 @@ def get_layout_root_node(layout_id):
             (layout_id,),
         ).fetchone()
         return dict(row) if row else None
+
+
+# ── Layout Segments (new path-based layout system) ───────────────────
+
+def get_layout_segments(layout_id):
+    """Return ordered segments for a layout."""
+    with _db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM collection_layout_segments WHERE layout_id = ? ORDER BY position",
+            (layout_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def add_layout_segment(layout_id, segment_type, segment_value=None,
+                       visible=True, include_untagged=False, position=None):
+    """Add a segment to a layout. Returns the new segment dict.
+
+    If position is None, appends to the end.
+    """
+    with _db() as conn:
+        if position is None:
+            position = conn.execute(
+                "SELECT COALESCE(MAX(position), -1) + 1 FROM collection_layout_segments WHERE layout_id = ?",
+                (layout_id,),
+            ).fetchone()[0]
+        cur = conn.execute(
+            """INSERT INTO collection_layout_segments
+               (layout_id, position, segment_type, segment_value, visible, include_untagged)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (layout_id, position, segment_type, segment_value,
+             1 if visible else 0, 1 if include_untagged else 0),
+        )
+        conn.commit()
+        row = conn.execute("SELECT * FROM collection_layout_segments WHERE id = ?", (cur.lastrowid,)).fetchone()
+        return dict(row) if row else None
+
+
+def update_layout_segment(segment_id, **kwargs):
+    """Update segment fields. Accepted keys: segment_type, segment_value, visible, include_untagged, position."""
+    allowed = {"segment_type", "segment_value", "visible", "include_untagged", "position"}
+    updates = []
+    params = []
+    for key, val in kwargs.items():
+        if key in allowed:
+            updates.append(f"{key} = ?")
+            params.append(val)
+    if not updates:
+        return
+    params.append(segment_id)
+    with _db() as conn:
+        conn.execute(f"UPDATE collection_layout_segments SET {', '.join(updates)} WHERE id = ?", params)
+        conn.commit()
+
+
+def delete_layout_segment(segment_id):
+    """Delete a layout segment."""
+    with _db() as conn:
+        conn.execute("DELETE FROM collection_layout_segments WHERE id = ?", (segment_id,))
+        conn.commit()
+
+
+def reorder_layout_segments(layout_id, segment_ids):
+    """Reorder segments by setting position = index in the given ID list."""
+    with _db() as conn:
+        for pos, sid in enumerate(segment_ids):
+            conn.execute(
+                "UPDATE collection_layout_segments SET position = ? WHERE id = ? AND layout_id = ?",
+                (pos, sid, layout_id),
+            )
+        conn.commit()
 
 
 # ── Queue Overhaul: Batches ──────────────────────────────────────────

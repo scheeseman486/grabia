@@ -314,7 +314,7 @@
                 <p class="collection-preview-hint" id="collection-preview-hint"></p>
             </div>
 
-            <!-- Layout Tree Editor (modal) -->
+            <!-- Layout Tree Editor (legacy, hidden) -->
             <div class="modal-overlay" id="modal-layout-editor" style="display:none">
                 <div class="modal modal-wide">
                     <h3>Edit Layout: <span id="layout-editor-title"></span></h3>
@@ -336,6 +336,43 @@
                     </div>
                     <div class="modal-footer">
                         <button class="action-btn" id="btn-layout-editor-close">Close</button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Path Builder (new segment-based layout editor) -->
+            <div class="modal-overlay" id="modal-path-builder" style="display:none">
+                <div class="modal modal-wide">
+                    <h3>Edit Layout: <span id="path-builder-title"></span></h3>
+                    <div class="path-builder">
+                        <!-- Visual path display -->
+                        <div class="path-builder-visual" id="path-builder-visual">
+                            <span class="path-segment-root">/</span>
+                            <!-- Segment cards are injected here -->
+                            <span class="path-segment-wildcard">*</span>
+                        </div>
+                        <!-- Segment list -->
+                        <div class="path-builder-segments" id="path-builder-segments"></div>
+                        <!-- Add segment bar -->
+                        <div class="path-builder-add">
+                            <select id="pb-add-type" class="le-select">
+                                <option value="">+ Add segment...</option>
+                                <option value="literal">Literal folder</option>
+                                <option value="tag_parent">Parent tag (expands)</option>
+                                <option value="tag_specific">Specific tag (filter)</option>
+                                <option value="tag_group">Tag group (OR)</option>
+                                <option value="hidden_filter">Hidden filter</option>
+                                <option value="alphabetical">Alphabetical (A-Z)</option>
+                            </select>
+                            <select id="pb-add-tag" class="le-select" style="display:none">
+                                <option value="">— select tag —</option>
+                            </select>
+                            <input type="text" id="pb-add-value" class="le-input" placeholder="Value" style="display:none">
+                            <button class="action-btn action-btn-sm" id="btn-pb-add-segment" style="display:none">Add</button>
+                        </div>
+                    </div>
+                    <div class="modal-footer">
+                        <button class="action-btn" id="btn-path-builder-close">Close</button>
                     </div>
                 </div>
             </div>
@@ -615,6 +652,7 @@
             </label>
             <label>Type
                 <select id="layout-type-input">
+                    <option value="segments">Path builder — customizable with tags</option>
                     <option value="flat">Flat — all files in one directory</option>
                     <option value="alphabetical">Alphabetical — files sorted A-Z</option>
                     <option value="by_archive">By Archive — grouped by source archive</option>
