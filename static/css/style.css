@@ -73,16 +73,18 @@
 
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
-select {
+select, input[type="text"], input[type="email"], input[type="password"],
+input[type="number"], input[type="url"], input[type="search"], textarea {
     background: var(--bg-tertiary);
     color: var(--text-primary);
     border: 1px solid var(--border);
     border-radius: 4px;
     padding: 4px 8px;
     font-size: 13px;
-    cursor: pointer;
 }
-select:focus { outline: none; border-color: var(--accent); }
+select { cursor: pointer; }
+select:focus, input:focus, textarea:focus { outline: none; border-color: var(--accent); }
+::placeholder { color: var(--text-muted); }
 
 body {
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
@@ -186,14 +188,8 @@ body {
 #bandwidth-input {
     width: 85px;
     padding: 4px 6px;
-    border: 1px solid var(--border);
-    border-radius: 4px;
-    background: var(--bg-tertiary);
-    color: var(--text-primary);
-    font-size: 13px;
     text-align: right;
 }
-#bandwidth-input:focus { outline: none; border-color: var(--accent); }
 #bandwidth-input:disabled {
     opacity: 0.4;
     cursor: default;
@@ -2498,14 +2494,7 @@ details[open] > .collection-archives-summary::before {
     padding: 3px 6px;
     font-size: 12px;
 }
-.le-input {
-    width: 120px;
-    border: 1px solid var(--border);
-    border-radius: 4px;
-    background: var(--bg-tertiary);
-    color: var(--text-primary);
-}
-.le-input:focus { outline: none; border-color: var(--accent); }
+.le-input { width: 120px; }
 
 /* ── Tag Picker (autocomplete) ─────────────────────────────────────── */
 .tag-picker { position: relative; display: inline-block; }
@@ -2968,16 +2957,7 @@ details[open] > .collection-archives-summary::before {
     margin-bottom: 12px;
 }
 /* activity-filters select — uses base select styles */
-#page-activity .activity-filters input {
-    padding: 4px 8px;
-    border: 1px solid var(--border);
-    border-radius: 4px;
-    background: var(--bg-tertiary);
-    color: var(--text-primary);
-    font-size: 13px;
-    cursor: text;
-}
-#page-activity .activity-filters input::placeholder { color: var(--text-muted); }
+/* activity-filters input — uses base input styles */
 .activity-search { width: 160px; }
 
 /* Activity cancel button (used in Ongoing tab) */
