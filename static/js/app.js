@@ -5839,14 +5839,22 @@
         let currentLayoutId = null;
         let skipDepth = null; // when set, skip rows at this depth or deeper
 
+        let layoutCollapsed = false; // tracks if current layout section is collapsed
+
         for (const row of cpRows) {
-            // Track current layout
+            // Track current layout — make layout headers collapsible
             if (row.type === "layout_header") {
                 currentLayoutId = row.layout_id;
                 skipDepth = null;
-                rows.push({ ...row, _layoutId: currentLayoutId });
+                const key = `layout|${row.layout_id}`;
+                const expanded = cpExpandedDirs.has(key);
+                layoutCollapsed = !expanded;
+                rows.push({ ...row, _layoutId: currentLayoutId, _key: key, _expanded: expanded });
                 continue;
             }
+
+            // Skip everything inside a collapsed layout
+            if (layoutCollapsed) continue;
 
             // If we're skipping (inside collapsed folder), check depth
             if (skipDepth !== null && row.depth >= skipDepth) continue;
@@ -5923,9 +5931,16 @@
             }
 
             if (row.type === "layout_header") {
-                div.classList.add("layout-header");
+                div.classList.add("layout-header", "cp-folder");
                 const isActive = selectedLid && row.layout_id === selectedLid;
-                div.innerHTML = `<span class="preview-name">${esc(row.name)} <span style="font-weight:400;opacity:0.5">${esc(row.layout_type)}</span>${isActive ? ' <span style="font-size:10px;opacity:0.6">\u2713 selected</span>' : ""}</span>`;
+                const arrow = row._expanded ? "\u25BE" : "\u25B8";
+                div.innerHTML = `<span class="preview-name" style="cursor:pointer">${arrow} ${esc(row.name)} <span style="font-weight:400;opacity:0.5">${esc(row.layout_type)}</span>${isActive ? ' <span style="font-size:10px;opacity:0.6">\u2713 selected</span>' : ""}</span>`;
+                div.addEventListener("click", () => {
+                    if (cpExpandedDirs.has(row._key)) cpExpandedDirs.delete(row._key);
+                    else cpExpandedDirs.add(row._key);
+                    cpLastRange = null;
+                    cpRenderVisible();
+                });
             } else if (row.type === "bucket_header") {
                 div.classList.add("bucket-header", "cp-folder");
                 const arrow = row._expanded ? "\u25BE" : "\u25B8";
@@ -6147,15 +6162,25 @@
             $("#layout-modal-error").textContent = "Name is required.";
             return;
         }
-        const body = { name, type: $("#layout-type-input").value };
+        const layoutType = $("#layout-type-input").value;
+        const body = { name, type: layoutType };
         try {
+            let newLayout = null;
             if (editingLayoutId) {
                 await api("PUT", `/api/collections/${currentCollectionId}/layouts/${editingLayoutId}`, body);
             } else {
-                await api("POST", `/api/collections/${currentCollectionId}/layouts`, body);
+                newLayout = await api("POST", `/api/collections/${currentCollectionId}/layouts`, body);
             }
             closeLayoutModal();
-            openCollectionDetail(currentCollectionId);
+            await openCollectionDetail(currentCollectionId);
+            // Auto-open path builder for new segment layouts
+            if (newLayout && (layoutType === "segments")) {
+                currentLayoutId = newLayout.id;
+                // Update the layout dropdown to select the new layout
+                const sel = $("#collection-layout-select");
+                if (sel) sel.value = newLayout.id;
+                openPathBuilder(newLayout.id);
+            }
         } catch (e) {
             $("#layout-modal-error").textContent = e.message;
         }
