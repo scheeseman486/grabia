@@ -508,14 +508,43 @@ def update_group(group_id):
         return jsonify({"error": "Group name is required"}), 400
     db.rename_group(group_id, name)
     broadcast_sse("groups_changed", {})
+
+    # Refresh auto-tags for all archives in this group — group name changed
+    try:
+        from auto_tagger import _refresh_archive_auto_tags
+        archives = db.get_archives()
+        for a in archives:
+            if a.get("group_id") == group_id:
+                _refresh_archive_auto_tags(a["id"])
+    except Exception as e:
+        log.warning("Auto-tag refresh failed after group %d rename: %s", group_id, e)
+
     return jsonify({"ok": True})
 
 
 @app.route("/api/groups/<int:group_id>", methods=["DELETE"])
 @login_required
 def remove_group(group_id):
+    # Collect archives in this group before deletion so we can refresh their tags
+    affected_archive_ids = []
+    try:
+        archives = db.get_archives()
+        affected_archive_ids = [a["id"] for a in archives if a.get("group_id") == group_id]
+    except Exception:
+        pass
+
     db.delete_group(group_id)
     broadcast_sse("groups_changed", {})
+
+    # Refresh auto-tags — these archives no longer have a group
+    if affected_archive_ids:
+        try:
+            from auto_tagger import _refresh_archive_auto_tags
+            for aid in affected_archive_ids:
+                _refresh_archive_auto_tags(aid)
+        except Exception as e:
+            log.warning("Auto-tag refresh failed after group %d deletion: %s", group_id, e)
+
     return jsonify({"ok": True})
 
 
@@ -536,6 +565,14 @@ def set_archive_group(archive_id):
     db.set_archive_group(archive_id, group_id)
     archive = db.get_archive(archive_id)
     broadcast_sse("archive_updated", archive)
+
+    # Refresh auto-tags — group assignment changes the group: tag
+    try:
+        from auto_tagger import _refresh_archive_auto_tags
+        _refresh_archive_auto_tags(archive_id)
+    except Exception as e:
+        log.warning("Auto-tag refresh failed for archive %d after group change: %s", archive_id, e)
+
     return jsonify(archive)
 
 

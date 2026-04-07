@@ -588,6 +588,15 @@ def _finalise_job(job_id, ctx, job_cache):
         "summary": {"processed": counts["completed"], "failed": counts["failed"]},
     })
 
+    # Refresh auto-tags — processing changes file-level tags (processed, original)
+    if counts["completed"] > 0:
+        try:
+            from auto_tagger import auto_tag_archive
+            auto_tag_archive(archive_id)
+            log.info("worker", "Auto-tagged archive %d after processing", archive_id)
+        except Exception as e:
+            log.warning("worker", "Auto-tag failed for archive %d after processing: %s", archive_id, e)
+
 
 def _finalise_empty_jobs():
     """Check for running jobs that have no remaining queue entries and finalise them."""

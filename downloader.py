@@ -754,8 +754,24 @@ class DownloadManager:
 
     def _check_archive_completion(self, archive_id):
         """Recompute archive status after a file finishes downloading.
-        Delegates to the canonical recompute_archive_status()."""
+        Delegates to the canonical recompute_archive_status().
+        If the archive becomes fully complete, refresh auto-tags."""
+        old_archive = db.get_archive(archive_id)
+        old_status = old_archive.get("status") if old_archive else None
+
         db.recompute_archive_status(archive_id)
+
+        new_archive = db.get_archive(archive_id)
+        new_status = new_archive.get("status") if new_archive else None
+
+        # Auto-tag when archive transitions to complete
+        if new_status == "complete" and old_status != "complete":
+            try:
+                from auto_tagger import auto_tag_archive
+                auto_tag_archive(archive_id)
+                log.info("download", "Auto-tagged archive %d after download completion", archive_id)
+            except Exception as e:
+                log.warning("download", "Auto-tag failed for archive %d: %s", archive_id, e)
 
 
 # Singleton
