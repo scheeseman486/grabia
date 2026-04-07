@@ -735,12 +735,23 @@ def init_db():
     # Reset archive_files stuck in processing states from a crash.
     # Files marked 'queued' or 'processing' need to be reset so they can be
     # re-queued when the recovered job runs.
-    conn.execute("""
-        UPDATE archive_files SET processing_status = '', processing_error = '',
-               process_queue_status = ''
-        WHERE processing_status IN ('queued', 'processing')
-           OR process_queue_status IN ('queued', 'processing')
-    """)
+    # Guard: process_queue_status may not exist yet (added by overlay migration below).
+    _has_pqs = any(
+        r[1] == "process_queue_status"
+        for r in conn.execute("PRAGMA table_info(archive_files)").fetchall()
+    )
+    if _has_pqs:
+        conn.execute("""
+            UPDATE archive_files SET processing_status = '', processing_error = '',
+                   process_queue_status = ''
+            WHERE processing_status IN ('queued', 'processing')
+               OR process_queue_status IN ('queued', 'processing')
+        """)
+    else:
+        conn.execute("""
+            UPDATE archive_files SET processing_status = '', processing_error = ''
+            WHERE processing_status IN ('queued', 'processing')
+        """)
 
     # Migrate legacy processing statuses: 'completed' and 'extracted' → 'processed'
     conn.execute("""
