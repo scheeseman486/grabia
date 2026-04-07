@@ -568,6 +568,12 @@ def init_db():
     conn.execute("CREATE INDEX IF NOT EXISTS idx_file_tags_tag ON file_tags(tag)")
     conn.commit()
 
+    # Performance indexes for collection file counting and queries
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_af_processing_status ON archive_files(processing_status)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_af_download_status ON archive_files(download_status)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_af_archive_id ON archive_files(archive_id)")
+    conn.commit()
+
     # Add manifest cache columns to archives
     try:
         conn.execute("SELECT manifest_json FROM archives LIMIT 1")
@@ -2098,17 +2104,40 @@ def get_collections():
     """Return all collections with summary info."""
     with _db() as conn:
         rows = conn.execute("SELECT * FROM collections ORDER BY position").fetchall()
+        if not rows:
+            return []
+
+        # Pre-compute file counts for each scope in one pass (avoids N full-table scans)
+        _file_count_cache = {}
+        scopes_needed = set(r["file_scope"] for r in rows)
+        for scope in scopes_needed:
+            _file_count_cache[scope] = _count_collection_files(conn, scope)
+
+        # Batch-load layout counts and layouts for all collections in two queries
+        cids = [r["id"] for r in rows]
+        placeholders = ",".join("?" * len(cids))
+
+        layout_count_rows = conn.execute(
+            f"SELECT collection_id, COUNT(*) as cnt FROM collection_layouts WHERE collection_id IN ({placeholders}) GROUP BY collection_id",
+            cids,
+        ).fetchall()
+        layout_counts = {r["collection_id"]: r["cnt"] for r in layout_count_rows}
+
+        layout_rows = conn.execute(
+            f"SELECT * FROM collection_layouts WHERE collection_id IN ({placeholders}) ORDER BY collection_id, position",
+            cids,
+        ).fetchall()
+        layouts_by_cid = {}
+        for lr in layout_rows:
+            layouts_by_cid.setdefault(lr["collection_id"], []).append(dict(lr))
+
         result = []
         for row in rows:
             d = dict(row)
             cid = d["id"]
-            d["layout_count"] = conn.execute(
-                "SELECT COUNT(*) FROM collection_layouts WHERE collection_id = ?", (cid,)
-            ).fetchone()[0]
-            d["file_count"] = _count_collection_files(conn, d["file_scope"])
-            d["layouts"] = [dict(r) for r in conn.execute(
-                "SELECT * FROM collection_layouts WHERE collection_id = ? ORDER BY position", (cid,)
-            ).fetchall()]
+            d["layout_count"] = layout_counts.get(cid, 0)
+            d["file_count"] = _file_count_cache[d["file_scope"]]
+            d["layouts"] = layouts_by_cid.get(cid, [])
             result.append(d)
         return result
 
@@ -2222,6 +2251,22 @@ def get_archive_tags(archive_id):
             (archive_id,),
         ).fetchall()
         return [{"tag": r["tag"], "auto": bool(r["auto"])} for r in rows]
+
+
+def get_archive_tags_bulk(archive_ids):
+    """Return {archive_id: [tag_str, ...]} for all given archive IDs in one query."""
+    if not archive_ids:
+        return {}
+    with _db() as conn:
+        placeholders = ",".join("?" * len(archive_ids))
+        rows = conn.execute(
+            f"SELECT archive_id, tag FROM archive_tags WHERE archive_id IN ({placeholders}) ORDER BY archive_id, tag",
+            list(archive_ids),
+        ).fetchall()
+        result = {}
+        for r in rows:
+            result.setdefault(r["archive_id"], []).append(r["tag"])
+        return result
 
 
 def get_all_tags():

@@ -259,14 +259,16 @@ def _build_file_tag_lookup(collection_id, files=None):
         for t in tags:
             lookup[fid].add(t["tag"])
 
-    # Inherited archive-level tags
-    for aid, ident in archive_info.items():
-        archive_tags = db.get_archive_tags(aid)
-        atag_set = {t["tag"] for t in archive_tags}
-        # Apply archive tags to all files of this archive
-        for f in files:
-            if f["archive_id"] == aid:
-                lookup[f["id"]].update(atag_set)
+    # Inherited archive-level tags (bulk load)
+    archive_tags_bulk = db.get_archive_tags_bulk(list(archive_info.keys()))
+    # Pre-group files by archive_id to avoid re-scanning
+    files_by_archive = defaultdict(list)
+    for f in files:
+        files_by_archive[f["archive_id"]].append(f["id"])
+    for aid, tags in archive_tags_bulk.items():
+        atag_set = set(tags)
+        for fid in files_by_archive.get(aid, []):
+            lookup[fid].update(atag_set)
 
     return lookup
 
