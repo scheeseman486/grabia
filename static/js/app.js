@@ -615,7 +615,7 @@
 
         es.addEventListener("file_complete", (e) => {
             const data = JSON.parse(e.data);
-            updateFileRow(data.file_id, { download_status: "completed", downloaded: 1, queue_position: null });
+            updateFileRow(data.file_id, { download_status: "downloaded", downloaded: 1, queue_position: null });
             // Remove from active downloads (queue_update event handles queue data removal)
             activeDownloads = activeDownloads.filter(d => d.file_id !== data.file_id);
             currentDownloadInfo = activeDownloads.length > 0 ? activeDownloads[0] : null;
@@ -1872,11 +1872,14 @@
         if (!currentArchiveId) return;
         const archiveName = getArchiveName(currentArchiveId);
         const fileCount = vsFiles.length;
-        const msg = `This archive has ${fileCount.toLocaleString()} file${fileCount !== 1 ? "s" : ""}. Add all to scan queue?`;
+        const msg = `This archive has ${fileCount.toLocaleString()} file${fileCount !== 1 ? "s" : ""}. Add all to scan queue?`
+            + `<label style="display:flex;align-items:center;gap:6px;margin-top:10px;font-size:0.92em;cursor:pointer">`
+            + `<input type="checkbox" id="scan-match-by-name" checked>`
+            + `<span>Match by filename <span style="opacity:0.6">(associate files with same name but different extension, e.g. dog.chd → dog.zip)</span></span></label>`;
         confirmAction("confirm_scan_archive", "Scan Archive", msg, async () => {
+            const matchByName = document.getElementById("scan-match-by-name")?.checked ?? false;
             try {
-                await api("POST", `/api/archives/${currentArchiveId}/scan`);
-                // Server creates the notification and broadcasts via SSE
+                await api("POST", `/api/archives/${currentArchiveId}/scan`, { match_by_name: matchByName });
                 updateScanButton();
             } catch (e) {
                 if (e.message && e.message.includes("already queued")) {
@@ -2396,7 +2399,7 @@
             }
             for (const f of node.files) {
                 // If this file is processed, mark it as expandable inline
-                if (f.processing_status === "processed") {
+                if (f.has_processed) {
                     const processedPath = "__processed__" + f.id;
                     const expanded = vsExpandedFolders.has(processedPath);
                     rows.push({ type: "file", file: f, depth, processedPath, processedExpanded: expanded });
@@ -2564,9 +2567,8 @@
             html += (isQueued && !isUnknown) ? buildGripCell() : '<td class="col-grip"></td>';
         }
 
-        const procStatus = f.processing_status || "";
-        const sourceDeleted = (f.downloaded === 0 && procStatus === "processed");
-        const hasProcessedOutput = (procStatus === "processed");
+        const hasProcessedOutput = !!f.has_processed;
+        const sourceDeleted = (f.downloaded === 0 && hasProcessedOutput);
         const hideQueue = isUnknown || (hasProcessedOutput && !sourceDeleted);
         if (hideQueue) {
             html += '<td class="col-queue"></td>';
@@ -2740,7 +2742,7 @@
             attachUnknownDrag(tr, f.id);
         }
         // Completed, processed, and skipped files: drop targets for unknown files
-        const canReceiveOutput = f.download_status === "completed" || hasProcessedOutput || isSkipped;
+        const canReceiveOutput = f.download_status === "downloaded" || hasProcessedOutput || isSkipped;
         if (canReceiveOutput && !isUnknown) {
             attachOutputDropTarget(tr, f.id);
         }
@@ -2862,14 +2864,14 @@
     }
 
     function formatFileStatus(f) {
-        // Show processing status first — it takes priority over download status
-        if (f.processing_status && f.processing_status !== "") {
-            if (f.processing_status === "processed") return "processed";
-            if (f.processing_status === "processing") return "processing...";
-            if (f.processing_status === "queued") return "proc. queued";
-            if (f.processing_status === "failed") return "proc. failed";
-            if (f.processing_status === "skipped") return "proc. skipped";
-        }
+        // Show processing queue status first — it takes priority over download status
+        const pqs = f.process_queue_status || "";
+        if (pqs === "processing") return "processing...";
+        if (pqs === "queued") return "proc. queued";
+        if (pqs === "failed") return "proc. failed";
+        if (pqs === "skipped") return "proc. skipped";
+        // Check overlay for processed state
+        if (f.has_processed) return "processed";
         if (f.queue_position == null && f.download_status === "pending") {
             if (f.downloaded_bytes > 0 && f.size > 0) {
                 const pct = ((f.downloaded_bytes / f.size) * 100).toFixed(1);
@@ -6598,18 +6600,18 @@
             const btn = $("#btn-migrate-processed");
             const result = $("#migrate-processed-result");
             btn.disabled = true;
-            btn.textContent = "Migrating...";
+            btn.textContent = "Flattening...";
             result.style.display = "none";
             try {
                 const r = await api("POST", "/api/settings/migrate-processed");
-                result.textContent = `Done: ${r.migrated} migrated, ${r.skipped} skipped, ${r.errors} errors across ${r.archives} archives.`;
+                result.textContent = `Done: ${r.flattened} flattened, ${r.moved_to_processed} moved to processed/, ${r.skipped} skipped, ${r.errors} errors across ${r.archives} archives.`;
                 result.style.display = "block";
             } catch (e) {
-                result.textContent = "Migration failed: " + e.message;
+                result.textContent = "Flatten failed: " + e.message;
                 result.style.display = "block";
             }
             btn.disabled = false;
-            btn.textContent = "Migrate to .processed Folders";
+            btn.textContent = "Flatten Processed Files";
         });
         // Tab switching
         $$(".settings-tab").forEach((tab) => {

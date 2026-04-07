@@ -418,6 +418,9 @@ def _process_single_entry(entry, ctx):
 
     db.set_file_processing_status(file_id, "processing")
 
+    # Clean up any previous overlay entries before (re-)processing
+    db.delete_local_files_for_source(file_id)
+
     cancel_evt = _cancel_events.get(archive_id)
 
     def _cancelled():
@@ -476,6 +479,36 @@ def _process_single_entry(entry, ctx):
                 processor_type=profile["processor_type"],
                 processed_files=result.get("processed_files"),
             )
+
+            # Write processed outputs to overlay table
+            pf = result["processed_filename"]
+            pf_flat = os.path.basename(pf.rstrip("/").rstrip(os.sep)) if "/" in pf or os.sep in pf else pf
+            try:
+                output_path = os.path.join(ctx["output_dir"], pf_flat)
+                pf_size = os.path.getsize(output_path) if os.path.isfile(output_path) else 0
+            except OSError:
+                pf_size = 0
+            db.add_local_file(
+                archive_id, name=pf_flat, origin="processed",
+                source_file_id=file_id, size=pf_size,
+                processor_type=profile["processor_type"],
+                processing_job_id=ctx.get("job_id"),
+            )
+            # Additional outputs
+            for extra in result.get("processed_files", []) or []:
+                extra_flat = os.path.basename(extra.rstrip("/").rstrip(os.sep)) if "/" in extra or os.sep in extra else extra
+                if extra_flat != pf_flat:
+                    try:
+                        extra_path = os.path.join(ctx["output_dir"], extra_flat)
+                        ex_size = os.path.getsize(extra_path) if os.path.isfile(extra_path) else 0
+                    except OSError:
+                        ex_size = 0
+                    db.add_local_file(
+                        archive_id, name=extra_flat, origin="processed",
+                        source_file_id=file_id, size=ex_size,
+                        processor_type=profile["processor_type"],
+                        processing_job_id=ctx.get("job_id"),
+                    )
             if act_job_id:
                 activity.log(act_job_id, "success",
                              f"Converted: {filename} → {result['processed_filename']}",
@@ -712,8 +745,10 @@ def _reset_stuck_files(archive_id):
     try:
         with db._db() as conn:
             conn.execute(
-                "UPDATE archive_files SET processing_status = '', processing_error = 'Interrupted by error' "
-                "WHERE archive_id = ? AND processing_status IN ('processing', 'queued')",
+                "UPDATE archive_files SET processing_status = '', process_queue_status = '', "
+                "processing_error = 'Interrupted by error' "
+                "WHERE archive_id = ? AND (processing_status IN ('processing', 'queued') "
+                "OR process_queue_status IN ('processing', 'queued'))",
                 (archive_id,),
             )
             conn.commit()

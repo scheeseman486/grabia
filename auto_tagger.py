@@ -306,13 +306,9 @@ def auto_tag_archive(archive_id):
         file_tags = parse_file_tags(f["name"])
         for tag in file_tags:
             db.add_file_tag(f["id"], tag, auto=True)
-        # Auto-tag based on processing/download status
-        proc_status = f.get("processing_status", "")
-        dl_status = f.get("download_status", "")
-        if proc_status == "processed":
-            db.add_file_tag(f["id"], "processed", auto=True)
-        if dl_status == "completed" and f.get("origin") == "manifest":
-            db.add_file_tag(f["id"], "original", auto=True)
+        # Status-based tags (processed, original, downloaded) are now virtual
+        # tags computed at query time in the collection sync engine — no need
+        # to store them here.
         tagged_count += 1
 
     # Archive-level auto tags: archive identifier + group membership.
@@ -355,13 +351,6 @@ def auto_tag_files(file_ids):
         file_tags = parse_file_tags(f["name"])
         for tag in file_tags:
             db.add_file_tag(fid, tag, auto=True)
-        # Auto-tag based on processing/download status
-        proc_status = f.get("processing_status", "")
-        dl_status = f.get("download_status", "")
-        if proc_status == "processed":
-            db.add_file_tag(fid, "processed", auto=True)
-        if dl_status == "completed" and f.get("origin") == "manifest":
-            db.add_file_tag(fid, "original", auto=True)
         affected_archives.add(f["archive_id"])
         tagged += 1
 

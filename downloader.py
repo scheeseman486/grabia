@@ -507,7 +507,7 @@ class DownloadManager:
 
         if success:
             log.debug("download", "Completed: %s", filename)
-            db.set_file_download_status(file_id, "completed", downloaded_bytes=expected_size)
+            db.set_file_download_status(file_id, "downloaded", downloaded_bytes=expected_size)
             self._notify("file_complete", {"file_id": file_id, "filename": filename, "identifier": identifier})
             self._notify("queue_update", {"queue_type": "download", "action": "completed", "file_id": file_id})
             activity.log(None, "success", f"Downloaded {filename}",

@@ -894,8 +894,8 @@
                         <h3>Maintenance</h3>
                         <div class="settings-form">
                             <div class="maintenance-action">
-                                <p class="settings-desc">Move all processed output (CHD, CISO, extracted files, etc.) into <code>.processed</code> folders. For example, <code>Game.chd</code> becomes <code>Game.zip.processed/Game.chd</code> and old extraction folders are renamed. Updates both on-disk files and database records. Already-migrated files are skipped.</p>
-                                <button class="action-btn" id="btn-migrate-processed">Migrate to .processed Folders</button>
+                                <p class="settings-desc">Flatten processed files: move files out of <code>.processed</code> subfolders into the flat <code>processed/{identifier}/</code> layout, and move any processed files still in <code>downloads/</code> into <code>processed/</code>. Idempotent — files already in the flat layout are skipped.</p>
+                                <button class="action-btn" id="btn-migrate-processed">Flatten Processed Files</button>
                                 <p class="settings-desc" id="migrate-processed-result" style="display:none;"></p>
                             </div>
                         </div>

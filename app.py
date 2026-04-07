@@ -287,182 +287,100 @@ def update_settings():
 @app.route("/api/settings/migrate-processed", methods=["POST"])
 @login_required
 def migrate_processed_folders():
-    """Move all processed output into ``.processed`` folders.
+    """Flatten processed files: move files out of ``.processed`` subfolders
+    into the flat ``processed/{identifier}/`` layout, and move any processed
+    files still in ``downloads/`` into ``processed/``.
 
-    Handles two cases:
+    This is the reverse of the old migration — it produces the flat overlay
+    layout that matches the new ``local_files`` database table.
 
-    1. **Extract processor** (folder-style output):
-       Old: ``identifier/GameName/``  →  New: ``identifier/GameName.zip.processed/``
-
-    2. **CHD / CISO / other processors** (loose file output):
-       Old: ``identifier/GameName.chd``  →  New: ``identifier/GameName.zip.processed/GameName.chd``
-
-    Checks both processed_dir and download_dir for each file.  Updates DB
-    records (processed_filename + processed_files_json).  Idempotent — files
-    already inside a ``.processed`` folder are skipped.
+    Idempotent — files already in the flat layout are skipped.
     """
     import shutil
 
     download_dir = db.get_download_dir()
     processed_dir = db.get_processed_dir()
 
-    stats = {"migrated": 0, "skipped": 0, "errors": 0, "archives": 0}
+    stats = {"flattened": 0, "moved_to_processed": 0, "skipped": 0, "errors": 0, "archives": 0}
 
-    with db._db() as conn:
-        rows = conn.execute(
-            "SELECT af.id, af.name, af.processed_filename, af.processed_files_json, "
-            "       af.processor_type, a.identifier "
-            "FROM archive_files af "
-            "JOIN archives a ON af.archive_id = a.id "
-            "WHERE af.processing_status = 'processed' "
-            "  AND af.processed_filename != ''"
-        ).fetchall()
+    # Get all archives
+    archives = db.get_archives()
+    for archive in archives:
+        identifier = archive["identifier"]
+        proc_ident_dir = os.path.join(processed_dir, identifier)
+        dl_ident_dir = os.path.join(download_dir, identifier)
+        touched = False
 
-    seen_archives = set()
+        # Phase 1: Flatten .processed subfolders in processed/{identifier}/
+        if os.path.isdir(proc_ident_dir):
+            for entry in os.listdir(proc_ident_dir):
+                if not entry.endswith(".processed"):
+                    continue
+                subfolder = os.path.join(proc_ident_dir, entry)
+                if not os.path.isdir(subfolder):
+                    continue
+                # Move all files out of subfolder into parent
+                for fname in os.listdir(subfolder):
+                    src = os.path.join(subfolder, fname)
+                    dst = os.path.join(proc_ident_dir, fname)
+                    if os.path.exists(dst):
+                        stats["skipped"] += 1
+                        continue
+                    try:
+                        shutil.move(src, dst)
+                        stats["flattened"] += 1
+                        touched = True
+                    except OSError as e:
+                        log.error("migrate", "Failed to move %s -> %s: %s", src, dst, e)
+                        stats["errors"] += 1
+                # Remove empty subfolder
+                try:
+                    if not os.listdir(subfolder):
+                        os.rmdir(subfolder)
+                except OSError:
+                    pass
 
-    for row in rows:
-        file_id = row["id"]
-        source_name = row["name"]              # e.g. "Game (USA).zip"
-        old_pf = row["processed_filename"]     # e.g. "Game (USA).chd" or "Game (USA)/"
-        identifier = row["identifier"]
-        processor_type = row["processor_type"] or ""
-
-        # Build the target .processed folder name from the source filename
-        source_basename = os.path.basename(source_name)    # "Game (USA).zip"
-        proc_folder = source_basename + ".processed"       # "Game (USA).zip.processed"
-        proc_folder_pf = proc_folder + os.sep              # "Game (USA).zip.processed/"
-
-        # Already migrated?  (processed_filename already lives inside a .processed folder)
-        old_pf_clean = old_pf.rstrip("/").rstrip(os.sep)
-        if old_pf_clean.endswith(".processed") or (os.sep + proc_folder) in old_pf or ("/" + proc_folder) in old_pf or old_pf.startswith(proc_folder + os.sep) or old_pf.startswith(proc_folder + "/"):
-            stats["skipped"] += 1
-            continue
-
-        if identifier not in seen_archives:
-            seen_archives.add(identifier)
-            stats["archives"] += 1
-
-        # Determine the base directory where the files live
-        base_dir = None
-        for candidate_base in [
-            os.path.join(processed_dir, identifier),
-            os.path.join(download_dir, identifier),
-        ]:
-            candidate = os.path.join(candidate_base, old_pf_clean)
-            if os.path.exists(candidate):
-                base_dir = candidate_base
-                break
-
-        if not base_dir:
-            stats["skipped"] += 1
-            continue
-
-        proc_folder_abs = os.path.join(base_dir, proc_folder)
-
-        # --- Case 1: Extract processor (old_pf is a folder) ---
-        is_folder = old_pf.endswith("/") or old_pf.endswith(os.sep) or os.path.isdir(os.path.join(base_dir, old_pf_clean))
-
-        if is_folder:
-            old_abs = os.path.join(base_dir, old_pf_clean)
-            if os.path.exists(proc_folder_abs):
+        # Phase 2: Move processed files from downloads/ to processed/
+        # Check local_files overlay for this archive's processed outputs
+        overlay_files = db.get_all_processed_files(archive["id"])
+        for rel_name in overlay_files:
+            dl_path = os.path.join(dl_ident_dir, rel_name)
+            if not os.path.exists(dl_path):
+                continue
+            proc_path = os.path.join(proc_ident_dir, rel_name)
+            if os.path.exists(proc_path):
                 stats["skipped"] += 1
                 continue
             try:
-                os.rename(old_abs, proc_folder_abs)
+                os.makedirs(os.path.dirname(proc_path), exist_ok=True)
+                shutil.move(dl_path, proc_path)
+                stats["moved_to_processed"] += 1
+                touched = True
             except OSError as e:
-                log.error("migrate", "Failed to rename folder %s -> %s: %s", old_abs, proc_folder_abs, e)
+                log.error("migrate", "Failed to move %s -> %s: %s", dl_path, proc_path, e)
                 stats["errors"] += 1
-                continue
 
-            # Update processed_files_json paths
-            old_folder = old_pf_clean
-            new_files_json = ""
-            old_pj = row["processed_files_json"]
-            if old_pj:
-                try:
-                    old_files = json.loads(old_pj)
-                    new_files = []
-                    for p in old_files:
-                        if p.startswith(old_folder + "/") or p.startswith(old_folder + os.sep):
-                            new_files.append(proc_folder + p[len(old_folder):])
-                        else:
-                            new_files.append(proc_folder + os.sep + p)
-                    new_files_json = json.dumps(new_files)
-                except (json.JSONDecodeError, TypeError):
-                    pass
-
+        # Phase 3: Update local_files names to flat paths (strip .processed/ prefixes)
+        if touched:
             with db._db() as conn:
-                conn.execute(
-                    "UPDATE archive_files SET processed_filename = ?, processed_files_json = ? "
-                    "WHERE id = ?",
-                    (proc_folder_pf, new_files_json, file_id),
-                )
+                lf_rows = conn.execute(
+                    "SELECT id, name FROM local_files WHERE archive_id = ?",
+                    (archive["id"],),
+                ).fetchall()
+                for lf in lf_rows:
+                    old_name = lf["name"]
+                    # Strip any .processed/ prefix from the name
+                    new_name = db._strip_processed_prefix(old_name)
+                    if new_name != old_name:
+                        conn.execute(
+                            "UPDATE local_files SET name = ? WHERE id = ?",
+                            (new_name, lf["id"]),
+                        )
                 conn.commit()
+            stats["archives"] += 1
 
-        # --- Case 2: Non-folder output (CHD, CISO, etc.) ---
-        else:
-            # Gather all output files from processed_files_json (or just the primary)
-            output_files = []
-            if row["processed_files_json"]:
-                try:
-                    output_files = json.loads(row["processed_files_json"])
-                except (json.JSONDecodeError, TypeError):
-                    pass
-            if not output_files:
-                output_files = [old_pf_clean]
-
-            # Create the .processed folder
-            try:
-                os.makedirs(proc_folder_abs, exist_ok=True)
-            except OSError as e:
-                log.error("migrate", "Failed to create folder %s: %s", proc_folder_abs, e)
-                stats["errors"] += 1
-                continue
-
-            # Move each output file into the .processed folder
-            moved_files = []
-            had_error = False
-            for rel in output_files:
-                rel_clean = rel.rstrip("/").rstrip(os.sep)
-                old_abs = os.path.join(base_dir, rel_clean)
-                if not os.path.isfile(old_abs):
-                    # Also check the other base dir
-                    alt_base = os.path.join(download_dir, identifier) if base_dir != os.path.join(download_dir, identifier) else os.path.join(processed_dir, identifier)
-                    old_abs = os.path.join(alt_base, rel_clean)
-                    if not os.path.isfile(old_abs):
-                        moved_files.append(rel_clean)  # Keep as-is if not found
-                        continue
-
-                fname = os.path.basename(rel_clean)
-                new_abs = os.path.join(proc_folder_abs, fname)
-                try:
-                    shutil.move(old_abs, new_abs)
-                    moved_files.append(proc_folder + os.sep + fname)
-                except OSError as e:
-                    log.error("migrate", "Failed to move %s -> %s: %s", old_abs, new_abs, e)
-                    had_error = True
-                    moved_files.append(rel_clean)  # Keep old path on failure
-
-            if had_error:
-                stats["errors"] += 1
-                continue
-
-            # Update DB: primary processed_filename is now the folder
-            new_primary = proc_folder + os.sep + os.path.basename(old_pf_clean)
-            new_files_json = json.dumps(moved_files) if moved_files else ""
-
-            with db._db() as conn:
-                conn.execute(
-                    "UPDATE archive_files SET processed_filename = ?, processed_files_json = ? "
-                    "WHERE id = ?",
-                    (new_primary, new_files_json, file_id),
-                )
-                conn.commit()
-
-        stats["migrated"] += 1
-
-    log.info("migrate", "Processed folder migration complete: %d migrated, %d skipped, %d errors across %d archives",
-             stats["migrated"], stats["skipped"], stats["errors"], stats["archives"])
+    log.info("migrate", "Flatten migration complete: %d flattened, %d moved to processed/, %d skipped, %d errors across %d archives",
+             stats["flattened"], stats["moved_to_processed"], stats["skipped"], stats["errors"], stats["archives"])
     return jsonify({"ok": True, **stats})
 
 
@@ -673,21 +591,27 @@ def delete_archive_folder(archive_id):
 
     download_dir = db.get_setting("download_dir", os.path.expanduser("~/ia-downloads"))
     base_dir = os.path.realpath(os.path.join(download_dir, archive["identifier"]))
+    processed_dir = db.get_processed_dir()
+    proc_base = os.path.realpath(os.path.join(processed_dir, archive["identifier"]))
 
     import shutil
     removed = False
     if os.path.isdir(base_dir) and base_dir.startswith(os.path.realpath(download_dir) + os.sep):
         shutil.rmtree(base_dir)
         removed = True
+    if os.path.isdir(proc_base) and proc_base.startswith(os.path.realpath(processed_dir) + os.sep):
+        shutil.rmtree(proc_base)
+        removed = True
 
-    # Reset all files to pending
+    # Reset all files to pending and clear overlay
     conn = db.get_db()
     conn.execute(
         "UPDATE archive_files SET download_status = 'pending', downloaded_bytes = 0, "
         "processing_status = '', processed_filename = '', processed_files_json = '', "
-        "processing_error = '', error_message = '' WHERE archive_id = ?",
+        "processing_error = '', error_message = '', process_queue_status = '' WHERE archive_id = ?",
         (archive_id,),
     )
+    conn.execute("DELETE FROM local_files WHERE archive_id = ?", (archive_id,))
     conn.commit()
     conn.close()
     db.recompute_archive_status(archive_id)
@@ -720,6 +644,7 @@ def refresh_archive(archive_id):
 # --- Scan Queue (DB-backed) ---
 
 _scan_cancel = {}  # archive_id -> threading.Event
+_scan_options = {}  # archive_id -> {match_by_name: bool, ...}
 _scan_lock = threading.Lock()
 _scan_wake = threading.Event()  # signalled when new entries are added
 
@@ -825,58 +750,44 @@ def _scan_single_file_on_disk(f, base_dir, entry_id=None, identifier=None):
     if not local_path.startswith(base_dir + os.sep) and local_path != base_dir:
         return "skipped"
 
-    # Check processed/failed files — verify processed output still exists
-    proc_status = f.get("processing_status") or ""
-    if proc_status in ("processed", "failed"):
-        pf = f.get("processed_filename", "")
-        if pf and identifier:
-            pf_path = _resolve_processed_file(identifier, pf, base_dir)
-        elif pf:
-            pf_path = os.path.join(base_dir, pf)
-        else:
-            pf_path = ""
-        has_output = pf_path and (os.path.isfile(pf_path) or os.path.isdir(pf_path))
+    # Check if file has processed outputs in overlay
+    proc_queue = f.get("process_queue_status") or ""
+    has_overlay_outputs = bool(db.get_processed_outputs(file_id))
 
-        if proc_status == "processed" and has_output:
-            # Processed output exists — check if original is still on disk
+    if has_overlay_outputs or proc_queue == "failed":
+        if has_overlay_outputs:
+            # Processed output exists in overlay — check if original is still on disk
             if not os.path.isfile(local_path):
                 # Original deleted but processed files remain
-                # Set status=completed, downloaded=0 in one atomic update
-                # (can't use set_file_download_status which forces downloaded=1)
                 with db._db() as conn:
                     conn.execute(
-                        "UPDATE archive_files SET download_status = 'completed', "
+                        "UPDATE archive_files SET download_status = 'downloaded', "
                         "downloaded = 0, queue_position = NULL WHERE id = ?",
                         (file_id,),
                     )
                     conn.commit()
             else:
-                # Original still on disk — ensure status is completed, downloaded=1
-                db.set_file_download_status(file_id, "completed",
+                # Original still on disk — ensure status is downloaded
+                db.set_file_download_status(file_id, "downloaded",
                     downloaded_bytes=f.get("downloaded_bytes") or f.get("size", 0))
             return "matched"
 
-        # No valid processed output — clear stale processing state
+        # Failed processing with no overlay outputs — clear stale state
         with db._db() as conn:
             conn.execute(
                 "UPDATE archive_files SET processing_status = '', processed_filename = '', "
-                "processed_files_json = '', processor_type = '', processing_error = '' WHERE id = ?",
+                "processed_files_json = '', processor_type = '', processing_error = '', "
+                "process_queue_status = '' WHERE id = ?",
                 (file_id,),
             )
             conn.commit()
 
     if not os.path.isfile(local_path):
-        # Check for processed version (e.g., game.zip → game.chd)
-        base_no_ext = os.path.splitext(name)[0]
-        for proc_ext in (".chd", ".cso"):
-            proc_rel = base_no_ext + proc_ext
-            if identifier:
-                proc_path = _resolve_processed_file(identifier, proc_rel, base_dir)
-            else:
-                proc_path = os.path.join(base_dir, proc_rel)
-            if os.path.isfile(proc_path):
-                db.set_file_download_status(file_id, "completed", downloaded_bytes=os.path.getsize(proc_path))
-                return "matched"
+        # Check if this file already has processed outputs in the overlay
+        if has_overlay_outputs:
+            db.set_file_download_status(file_id, "downloaded",
+                downloaded_bytes=f.get("downloaded_bytes") or 0)
+            return "matched"
         db.set_file_download_status(file_id, "pending", downloaded_bytes=0)
         return "missing"
 
@@ -884,7 +795,7 @@ def _scan_single_file_on_disk(f, base_dir, entry_id=None, identifier=None):
     expected_size = f["size"]
     expected_md5 = f["md5"]
 
-    if f["download_status"] == "completed":
+    if f["download_status"] == "downloaded":
         return "matched"
 
     has_size = expected_size > 0
@@ -935,7 +846,7 @@ def _scan_single_file_on_disk(f, base_dir, entry_id=None, identifier=None):
             db.set_file_download_status(file_id, "conflict", error_message=f"Read error: {e}")
             return "conflict"
 
-    db.set_file_download_status(file_id, "completed", downloaded_bytes=local_size)
+    db.set_file_download_status(file_id, "downloaded", downloaded_bytes=local_size)
     return "matched"
 
 
@@ -966,10 +877,14 @@ def _start_archive_scan(archive_id):
     broadcast_sse("notification_created", db.get_notification(notif_id))
     activity.update_job_notification(act_job_id, notif_id)
 
-    # Clean slate for this archive — remove old scan-origin files, reset conflicts
+    # Clean slate for this archive — remove old scan-origin files and local overlay, reset conflicts
     with db._db() as conn:
         conn.execute(
             "DELETE FROM archive_files WHERE archive_id = ? AND origin = 'scan'",
+            (archive_id,),
+        )
+        conn.execute(
+            "DELETE FROM local_files WHERE archive_id = ? AND origin = 'local'",
             (archive_id,),
         )
         conn.execute(
@@ -982,14 +897,16 @@ def _start_archive_scan(archive_id):
     # Count total entries for this archive in the queue
     total = db.count_pending_scan_entries(archive_id) + 1  # +1 for the one already claimed
 
+    scan_opts = _scan_options.get(archive_id, {})
     ctx["id"] = archive_id
     ctx["act_job_id"] = act_job_id
     ctx["notif_id"] = notif_id
-    ctx["summary"] = {"matched": 0, "conflict": 0, "unknown": 0, "missing": 0, "partial": 0}
+    ctx["summary"] = {"matched": 0, "conflict": 0, "unknown": 0, "missing": 0, "partial": 0, "auto_matched": 0}
     ctx["total"] = total
     ctx["processed"] = 0
     ctx["last_progress"] = 0.0
     ctx["last_notif"] = 0.0
+    ctx["match_by_name"] = scan_opts.get("match_by_name", False)
 
     activity.log(act_job_id, "info",
                  f"Scan started: {total} manifest files to verify",
@@ -1108,7 +1025,7 @@ def _detect_media_units(archive_id):
         conn.commit()
 
         rows = conn.execute(
-            """SELECT id, name, processing_status, media_root
+            """SELECT id, name, process_queue_status, media_root
                FROM archive_files
                WHERE archive_id = ? AND origin = 'manifest'""",
             (archive_id,),
@@ -1119,11 +1036,11 @@ def _detect_media_units(archive_id):
 
     # Group files by their parent directory
     from collections import defaultdict
-    by_dir = defaultdict(list)  # dir_path → [(file_id, basename, processing_status, media_root)]
+    by_dir = defaultdict(list)  # dir_path → [(file_id, basename, process_queue_status, media_root)]
     for r in rows:
         name = r["name"]
         parent = os.path.dirname(name)
-        by_dir[parent].append((r["id"], os.path.basename(name), r["processing_status"], r["media_root"]))
+        by_dir[parent].append((r["id"], os.path.basename(name), r["process_queue_status"], r["media_root"]))
 
     METADATA_EXTS = {".txt", ".nfo", ".jpg", ".jpeg", ".png", ".pdf", ".xml",
                      ".htm", ".html", ".bmp", ".gif", ".svg"}
@@ -1266,33 +1183,85 @@ def _finish_archive_scan(archive_id):
                                         "current": ctx["processed"], "total": ctx["total"]})
         with _scan_lock:
             _scan_cancel.pop(archive_id, None)
+        _scan_options.pop(archive_id, None)
         ctx["id"] = None
         db.clear_completed_scan_entries(archive_id)
         return
 
     # Scan for unknown files on disk
+    match_by_name = ctx.get("match_by_name", False)
     if os.path.isdir(base_dir):
         broadcast_sse("scan_progress", {"archive_id": archive_id, "phase": "disk", "current": 0, "total": 0})
 
         # Build manifest and processed name sets
         with db._db() as conn:
-            manifest_names = {r["name"] for r in conn.execute(
-                "SELECT name FROM archive_files WHERE archive_id = ? AND origin = 'manifest'",
+            manifest_rows = conn.execute(
+                "SELECT id, name FROM archive_files WHERE archive_id = ? AND origin = 'manifest'",
                 (archive_id,),
-            ).fetchall()}
+            ).fetchall()
+            manifest_names = {r["name"] for r in manifest_rows}
+
+            # Build stem→file_id lookup for match-by-name (stem = name without extension)
+            # Includes subdirectory path: "subdir/Game (USA)" maps to file_id
+            stem_to_manifest = {}
+            if match_by_name:
+                for r in manifest_rows:
+                    stem = os.path.splitext(r["name"])[0]
+                    # Only keep first match per stem (closest manifest entry)
+                    if stem not in stem_to_manifest:
+                        stem_to_manifest[stem] = r["id"]
 
         processed_names = db.get_all_processed_files(archive_id)
 
         unknown_files = []
+        auto_matched = []  # (rel_name, local_size, manifest_file_id)
         for root, _dirs, files in os.walk(base_dir):
             if cancel_evt and cancel_evt.is_set():
                 break
             for fname in files:
                 full = os.path.join(root, fname)
                 rel = os.path.relpath(full, base_dir)
-                if rel not in manifest_names and rel not in processed_names:
-                    unknown_files.append(rel)
-                    summary["unknown"] += 1
+                if rel in manifest_names or rel in processed_names:
+                    continue
+
+                # Try stem-matching: does this file's stem match a manifest entry?
+                if match_by_name:
+                    rel_stem = os.path.splitext(rel)[0]
+                    manifest_fid = stem_to_manifest.get(rel_stem)
+                    if manifest_fid is not None:
+                        local_size = 0
+                        try:
+                            local_size = os.path.getsize(full)
+                        except OSError:
+                            pass
+                        auto_matched.append((rel, local_size, manifest_fid))
+                        continue
+
+                unknown_files.append(rel)
+                summary["unknown"] += 1
+
+        # Insert auto-matched files into the overlay as processed outputs
+        if auto_matched:
+            import time as _time
+            with db._db() as conn:
+                for rel_name, local_size, source_fid in auto_matched:
+                    # Strip any .processed/ prefix for a clean overlay name
+                    clean_name = db._strip_processed_prefix(rel_name)
+                    conn.execute(
+                        """INSERT OR IGNORE INTO local_files
+                           (archive_id, source_file_id, name, size, origin, processor_type, created_at)
+                           VALUES (?, ?, ?, ?, 'processed', '', ?)""",
+                        (archive_id, source_fid, clean_name, local_size, _time.time()),
+                    )
+                    # Also ensure the source manifest file is marked downloaded
+                    conn.execute(
+                        "UPDATE archive_files SET download_status = 'downloaded' "
+                        "WHERE id = ? AND download_status NOT IN ('downloaded', 'downloading')",
+                        (source_fid,),
+                    )
+                conn.commit()
+            summary["auto_matched"] = len(auto_matched)
+            log.info("scan", "%d files auto-matched by filename stem", len(auto_matched))
 
         if unknown_files:
             with db._db() as conn:
@@ -1329,6 +1298,8 @@ def _finish_archive_scan(archive_id):
         parts.append(f'{summary["partial"]} partial')
     if summary["conflict"] > 0:
         parts.append(f'{summary["conflict"]} conflict')
+    if summary.get("auto_matched", 0) > 0:
+        parts.append(f'{summary["auto_matched"]} auto-matched')
     if summary["unknown"] > 0:
         parts.append(f'{summary["unknown"]} unknown')
     if summary["missing"] > 0:
@@ -1346,6 +1317,9 @@ def _finish_archive_scan(archive_id):
                      archive_id=archive_id)
     if summary["partial"] > 0:
         activity.log(act_job_id, "info", f'{summary["partial"]} partial download(s) re-queued',
+                     archive_id=archive_id)
+    if summary.get("auto_matched", 0) > 0:
+        activity.log(act_job_id, "info", f'{summary["auto_matched"]} file(s) auto-matched by filename',
                      archive_id=archive_id)
     if summary["unknown"] > 0:
         activity.log(act_job_id, "info", f'{summary["unknown"]} unknown file(s) found on disk',
@@ -1374,6 +1348,7 @@ def _finish_archive_scan(archive_id):
     # Clean up
     with _scan_lock:
         _scan_cancel.pop(archive_id, None)
+    _scan_options.pop(archive_id, None)
     db.clear_completed_scan_entries(archive_id)
     ctx["id"] = None
 
@@ -1386,6 +1361,9 @@ def scan_existing_files(archive_id):
     if not archive:
         return jsonify({"error": "Not found"}), 404
 
+    data = request.json or {}
+    match_by_name = bool(data.get("match_by_name", False))
+
     download_dir = db.get_setting("download_dir", os.path.expanduser("~/ia-downloads"))
     base_dir = os.path.realpath(os.path.join(download_dir, archive["identifier"]))
     if not os.path.isdir(base_dir):
@@ -1396,6 +1374,9 @@ def scan_existing_files(archive_id):
             return jsonify({"error": "Scan already queued for this archive"}), 409
         evt = threading.Event()
         _scan_cancel[archive_id] = evt
+
+    # Store scan options keyed by archive_id so the worker can read them
+    _scan_options[archive_id] = {"match_by_name": match_by_name}
 
     try:
         # Get all manifest files for this archive
@@ -1408,6 +1389,7 @@ def scan_existing_files(archive_id):
         if not file_ids:
             with _scan_lock:
                 _scan_cancel.pop(archive_id, None)
+            _scan_options.pop(archive_id, None)
             return jsonify({"error": "No manifest files to scan"}), 400
 
         # Add entries to scan_queue
@@ -1650,34 +1632,15 @@ def delete_file(file_id):
     else:
         # Manifest files: keep in DB but reset download status
         db.set_file_download_status(file_id, "pending", downloaded_bytes=0, error_message="")
-        # Only reset processing state if there are no processed outputs remaining on disk
-        has_outputs = False
-        if f.get("processing_status") == "processed":
-            if archive:
-                ident = archive["identifier"]
-                download_dir = db.get_setting("download_dir", os.path.expanduser("~/ia-downloads"))
-                base_dir = os.path.realpath(os.path.join(download_dir, ident))
-                # Check processed_filename
-                pf = f.get("processed_filename", "")
-                if pf:
-                    pf_abs = _resolve_processed_file(ident, pf.rstrip("/").rstrip(os.sep), base_dir)
-                    if os.path.isfile(pf_abs) or os.path.isdir(pf_abs):
-                        has_outputs = True
-                # Check processed_files_json entries
-                if not has_outputs and f.get("processed_files_json"):
-                    try:
-                        for p in json.loads(f["processed_files_json"]):
-                            p_abs = _resolve_processed_file(ident, p.rstrip("/").rstrip(os.sep), base_dir)
-                            if os.path.isfile(p_abs) or os.path.isdir(p_abs):
-                                has_outputs = True
-                                break
-                    except (json.JSONDecodeError, TypeError):
-                        pass
+        # Check overlay for processed outputs
+        has_outputs = bool(db.get_processed_outputs(file_id))
         if not has_outputs:
+            # No overlay outputs — clear stale processing state
             conn = db.get_db()
             conn.execute(
                 "UPDATE archive_files SET processing_status = '', processed_filename = '', "
-                "processed_files_json = '', processing_error = '', processor_type = '' WHERE id = ?",
+                "processed_files_json = '', processing_error = '', processor_type = '', "
+                "process_queue_status = '' WHERE id = ?",
                 (file_id,),
             )
             conn.commit()
@@ -1702,31 +1665,26 @@ def get_processed_tree(file_id):
     download_dir = db.get_setting("download_dir", os.path.expanduser("~/ia-downloads"))
     base_dir = os.path.realpath(os.path.join(download_dir, ident))
 
-    # Build the set of root paths to scan.
-    # processed_filename is the primary output (a file, or a folder ending with /).
-    # processed_files_json lists individual files — but we want the tree from the
-    # root entries, not each leaf, so we prefer processed_filename when it's a folder.
-    root_paths = []
-    pf = (f.get("processed_filename") or "").rstrip("/").rstrip(os.sep)
-    if pf:
-        root_paths.append(pf)
+    # Build the set of root paths to scan from the overlay table.
+    # Falls back to legacy columns if the overlay has nothing.
+    overlay_outputs = db.get_processed_outputs(file_id)
+    root_paths = [lf["name"].rstrip("/").rstrip(os.sep) for lf in overlay_outputs]
 
-    # For non-folder primary outputs, also include any entries from processed_files_json
-    # that aren't already children of a root
-    if f["processed_files_json"]:
-        try:
-            extra = json.loads(f["processed_files_json"])
-            for p in extra:
-                p = p.rstrip("/").rstrip(os.sep)
-                # Skip if already covered by an existing root (as child)
-                if any(p == r or p.startswith(r + "/") or p.startswith(r + os.sep) for r in root_paths):
-                    continue
-                root_paths.append(p)
-        except (json.JSONDecodeError, TypeError):
-            pass
-
-    if not root_paths and f.get("processed_filename"):
-        root_paths = [f["processed_filename"].rstrip("/").rstrip(os.sep)]
+    # Fallback to legacy columns if overlay is empty (pre-migration data)
+    if not root_paths:
+        pf = (f.get("processed_filename") or "").rstrip("/").rstrip(os.sep)
+        if pf:
+            root_paths.append(pf)
+        if f.get("processed_files_json"):
+            try:
+                extra = json.loads(f["processed_files_json"])
+                for p in extra:
+                    p = p.rstrip("/").rstrip(os.sep)
+                    if any(p == r or p.startswith(r + "/") or p.startswith(r + os.sep) for r in root_paths):
+                        continue
+                    root_paths.append(p)
+            except (json.JSONDecodeError, TypeError):
+                pass
 
     # Build tree from disk (verify each entry actually exists)
     # Check processed_dir first, fall back to download_dir (legacy location)
@@ -1830,11 +1788,17 @@ def delete_processed_file(file_id):
             paths_to_delete = [f["processed_filename"]]
         for p in paths_to_delete:
             _safe_delete(p.rstrip("/").rstrip(os.sep))
-        # Reset all processing state
+        # Also delete files listed in overlay
+        overlay_outputs = db.get_processed_outputs(file_id)
+        for lf in overlay_outputs:
+            _safe_delete(lf["name"].rstrip("/").rstrip(os.sep))
+        # Clear overlay rows and legacy processing state
+        db.delete_local_files_for_source(file_id)
         conn = db.get_db()
         conn.execute(
             "UPDATE archive_files SET processing_status = '', processed_filename = '', "
-            "processed_files_json = '', processing_error = '', processor_type = '' WHERE id = ?",
+            "processed_files_json = '', processing_error = '', processor_type = '', "
+            "process_queue_status = '' WHERE id = ?",
             (file_id,),
         )
         conn.commit()
@@ -1843,7 +1807,10 @@ def delete_processed_file(file_id):
         # Delete a single processed output
         _safe_delete(filename.rstrip("/").rstrip(os.sep))
 
-        # Update processed_files_json to remove the deleted entry
+        # Remove the overlay row for this specific output
+        db.delete_local_file_by_name(file_id, filename.rstrip("/").rstrip(os.sep))
+
+        # Update processed_files_json to remove the deleted entry (legacy compat)
         remaining = []
         if f["processed_files_json"]:
             try:
@@ -1951,6 +1918,17 @@ def rename_processed_file(file_id):
 
     conn.commit()
     conn.close()
+
+    # Update the overlay row name to match
+    old_clean = old_path.rstrip("/").rstrip(os.sep)
+    new_clean = new_rel.rstrip("/").rstrip(os.sep)
+    with db._db() as oconn:
+        oconn.execute(
+            "UPDATE local_files SET name = ? WHERE source_file_id = ? AND name = ?",
+            (new_clean, file_id, old_clean),
+        )
+        oconn.commit()
+
     return jsonify({"ok": True, "new_path": new_rel})
 
 

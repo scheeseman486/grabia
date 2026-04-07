@@ -232,6 +232,25 @@ def init_db():
             FOREIGN KEY (layout_id) REFERENCES collection_layouts(id) ON DELETE CASCADE
         );
 
+        CREATE TABLE IF NOT EXISTS local_files (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            archive_id INTEGER NOT NULL,
+            source_file_id INTEGER DEFAULT NULL,
+            name TEXT NOT NULL,
+            size INTEGER NOT NULL DEFAULT 0,
+            origin TEXT NOT NULL DEFAULT 'local',
+            processor_type TEXT NOT NULL DEFAULT '',
+            processing_job_id INTEGER DEFAULT NULL,
+            created_at REAL NOT NULL,
+            FOREIGN KEY (archive_id) REFERENCES archives(id) ON DELETE CASCADE,
+            FOREIGN KEY (source_file_id) REFERENCES archive_files(id) ON DELETE SET NULL,
+            FOREIGN KEY (processing_job_id) REFERENCES processing_jobs(id) ON DELETE SET NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_lf_archive ON local_files(archive_id);
+        CREATE INDEX IF NOT EXISTS idx_lf_source ON local_files(source_file_id);
+        CREATE INDEX IF NOT EXISTS idx_lf_origin ON local_files(origin);
+
         CREATE TABLE IF NOT EXISTS activity_jobs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             category TEXT NOT NULL,
@@ -383,12 +402,12 @@ def init_db():
                         FROM archive_files af
                         JOIN archives a ON af.archive_id = a.id
                         WHERE af.queued = 1
-                          AND af.download_status NOT IN ('completed', 'conflict')
+                          AND af.download_status NOT IN ('downloaded', 'conflict')
                     ) AS t
                     WHERE t.id = archive_files.id
                 )
                 WHERE queued = 1
-                  AND download_status NOT IN ('completed', 'conflict')
+                  AND download_status NOT IN ('downloaded', 'conflict')
             """)
             log.info("Migrated queued files to queue_position column")
 
@@ -651,7 +670,7 @@ def init_db():
     # Dequeue files that have already completed or hit a conflict
     conn.execute("""
         UPDATE archive_files SET queue_position = NULL
-        WHERE queue_position IS NOT NULL AND download_status IN ('completed', 'conflict')
+        WHERE queue_position IS NOT NULL AND download_status IN ('downloaded', 'conflict')
     """)
 
     # Fix archives stuck on 'downloading' or 'queued' from a previous session.
@@ -667,11 +686,13 @@ def init_db():
         counts = conn.execute("""
             SELECT
                 COUNT(*) as total,
-                SUM(CASE WHEN download_status = 'completed'
-                           OR processing_status = 'processed' THEN 1 ELSE 0 END) as completed,
-                SUM(CASE WHEN download_status = 'failed' THEN 1 ELSE 0 END) as failed,
-                SUM(CASE WHEN queue_position IS NOT NULL THEN 1 ELSE 0 END) as queued
-            FROM archive_files WHERE archive_id = ?
+                SUM(CASE WHEN af.download_status = 'downloaded'
+                           OR EXISTS(SELECT 1 FROM local_files lf
+                                     WHERE lf.source_file_id = af.id AND lf.origin = 'processed')
+                    THEN 1 ELSE 0 END) as completed,
+                SUM(CASE WHEN af.download_status = 'failed' THEN 1 ELSE 0 END) as failed,
+                SUM(CASE WHEN af.queue_position IS NOT NULL THEN 1 ELSE 0 END) as queued
+            FROM archive_files af WHERE af.archive_id = ?
         """, (aid,)).fetchone()
         total = counts["total"] or 0
         completed = counts["completed"] or 0
@@ -715,8 +736,10 @@ def init_db():
     # Files marked 'queued' or 'processing' need to be reset so they can be
     # re-queued when the recovered job runs.
     conn.execute("""
-        UPDATE archive_files SET processing_status = '', processing_error = ''
+        UPDATE archive_files SET processing_status = '', processing_error = '',
+               process_queue_status = ''
         WHERE processing_status IN ('queued', 'processing')
+           OR process_queue_status IN ('queued', 'processing')
     """)
 
     # Migrate legacy processing statuses: 'completed' and 'extracted' → 'processed'
@@ -735,6 +758,9 @@ def init_db():
 
     # Migration: move flatten/use_media_units from collections to layouts
     _migrate_collection_options_to_layouts(conn)
+
+    # Migration: overlay DB — move processed outputs and local files to local_files table
+    _migrate_to_overlay_db(conn)
 
     conn.commit()
     conn.close()
@@ -842,6 +868,130 @@ def _migrate_collection_options_to_layouts(conn):
         conn.execute("UPDATE collections SET file_scope = 'both' WHERE id = ?", (cid,))
 
 
+def _migrate_to_overlay_db(conn):
+    """Migrate processed outputs and local files from archive_files to local_files.
+
+    Also renames download_status 'completed' → 'downloaded', origin 'scan' → 'local',
+    and adds process_queue_status column.
+
+    Idempotent — checks if migration already ran by looking for process_queue_status column.
+    """
+    # Check if already migrated
+    try:
+        conn.execute("SELECT process_queue_status FROM archive_files LIMIT 1")
+        return  # Already migrated
+    except sqlite3.OperationalError:
+        pass
+
+    now = time.time()
+
+    # Ensure local_files table exists (may already from schema)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS local_files (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            archive_id INTEGER NOT NULL,
+            source_file_id INTEGER DEFAULT NULL,
+            name TEXT NOT NULL,
+            size INTEGER NOT NULL DEFAULT 0,
+            origin TEXT NOT NULL DEFAULT 'local',
+            processor_type TEXT NOT NULL DEFAULT '',
+            processing_job_id INTEGER DEFAULT NULL,
+            created_at REAL NOT NULL,
+            FOREIGN KEY (archive_id) REFERENCES archives(id) ON DELETE CASCADE,
+            FOREIGN KEY (source_file_id) REFERENCES archive_files(id) ON DELETE SET NULL,
+            FOREIGN KEY (processing_job_id) REFERENCES processing_jobs(id) ON DELETE SET NULL
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_lf_archive ON local_files(archive_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_lf_source ON local_files(source_file_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_lf_origin ON local_files(origin)")
+
+    # Step 1: Migrate processed outputs to local_files
+    processed_rows = conn.execute("""
+        SELECT id, archive_id, processed_filename, processed_files_json, processor_type
+        FROM archive_files
+        WHERE processing_status = 'processed' AND processed_filename != ''
+    """).fetchall()
+
+    for row in processed_rows:
+        fid = row["id"]
+        aid = row["archive_id"]
+        pf = row["processed_filename"]
+        pf_json = row["processed_files_json"]
+        ptype = row["processor_type"] or ""
+
+        # Strip .processed/ subfolder prefix from name to get flat path
+        pf_flat = _strip_processed_prefix(pf)
+
+        # Insert primary output
+        conn.execute(
+            "INSERT OR IGNORE INTO local_files (archive_id, source_file_id, name, origin, processor_type, created_at) "
+            "VALUES (?, ?, ?, 'processed', ?, ?)",
+            (aid, fid, pf_flat, ptype, now),
+        )
+
+        # Insert additional outputs from processed_files_json
+        if pf_json:
+            try:
+                extra_files = json.loads(pf_json)
+                for ef in extra_files:
+                    ef_flat = _strip_processed_prefix(ef)
+                    if ef_flat != pf_flat:
+                        conn.execute(
+                            "INSERT OR IGNORE INTO local_files (archive_id, source_file_id, name, origin, processor_type, created_at) "
+                            "VALUES (?, ?, ?, 'processed', ?, ?)",
+                            (aid, fid, ef_flat, ptype, now),
+                        )
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+    # Step 2: Migrate local/scan files to local_files
+    scan_rows = conn.execute("""
+        SELECT id, archive_id, name, size FROM archive_files WHERE origin = 'scan'
+    """).fetchall()
+
+    for row in scan_rows:
+        conn.execute(
+            "INSERT OR IGNORE INTO local_files (archive_id, source_file_id, name, size, origin, created_at) "
+            "VALUES (?, NULL, ?, ?, 'local', ?)",
+            (row["archive_id"], row["name"], row["size"], now),
+        )
+
+    # Delete scan rows from archive_files (they don't belong in the manifest mirror)
+    conn.execute("DELETE FROM archive_files WHERE origin = 'scan'")
+
+    # Step 3: Rename statuses
+    conn.execute("UPDATE archive_files SET download_status = 'downloaded' WHERE download_status = 'completed'")
+
+    # Step 4: Add process_queue_status column
+    conn.execute("ALTER TABLE archive_files ADD COLUMN process_queue_status TEXT NOT NULL DEFAULT ''")
+    # Copy transient states only (not 'processed' which is now in local_files)
+    conn.execute("""
+        UPDATE archive_files SET process_queue_status = processing_status
+        WHERE processing_status IN ('queued', 'processing', 'failed', 'skipped')
+    """)
+
+    log.info("Overlay DB migration: migrated %d processed outputs and %d local files",
+             len(processed_rows), len(scan_rows))
+
+
+def _strip_processed_prefix(path):
+    """Strip .processed/ subfolder prefix from a path to get the flat filename.
+
+    Examples:
+        'Game.zip.processed/Game.chd' → 'Game.chd'
+        'Game.zip.processed/'         → 'Game.zip.processed'  (folder ref stays as-is)
+        'Game.chd'                    → 'Game.chd'  (already flat)
+    """
+    import os as _os
+    path = path.rstrip("/").rstrip(_os.sep)
+    parts = path.replace("\\", "/").split("/")
+    # If first part ends with .processed, strip it
+    if len(parts) > 1 and parts[0].endswith(".processed"):
+        return "/".join(parts[1:])
+    return path
+
+
 # --- Settings ---
 
 def get_setting(key, default=None):
@@ -927,25 +1077,30 @@ def add_archive_files(archive_id, files):
 def _enrich_archives_with_progress(archives, conn):
     """Add download progress stats to a list of archive dicts.
     Uses total file counts (not just queued) as the denominator.
-    Processed files (processing_status = 'processed') count toward completed."""
+    Processed files (has rows in local_files overlay) count toward completed."""
     if not archives:
         return archives
     ids = [a["id"] for a in archives]
     placeholders = ",".join("?" * len(ids))
     rows = conn.execute(f"""
-        SELECT archive_id,
+        SELECT af.archive_id,
                COUNT(*) AS total_files,
-               SUM(CASE WHEN download_status = 'completed' THEN 1 ELSE 0 END) AS downloaded_files,
-               SUM(CASE WHEN download_status = 'completed'
-                          OR processing_status = 'processed' THEN 1 ELSE 0 END) AS completed_files,
-               SUM(CASE WHEN processing_status = 'processed' THEN 1 ELSE 0 END) AS processed_files,
-               COALESCE(SUM(size), 0) AS total_size,
-               COALESCE(SUM(downloaded_bytes), 0) AS downloaded_bytes,
-               COALESCE(SUM(CASE WHEN processing_status = 'processed'
-                            THEN downloaded_bytes ELSE 0 END), 0) AS processed_bytes,
-               SUM(CASE WHEN queue_position IS NOT NULL THEN 1 ELSE 0 END) AS queued_files
-        FROM archive_files WHERE archive_id IN ({placeholders})
-        GROUP BY archive_id
+               SUM(CASE WHEN af.download_status = 'downloaded' THEN 1 ELSE 0 END) AS downloaded_files,
+               SUM(CASE WHEN af.download_status = 'downloaded'
+                          OR EXISTS(SELECT 1 FROM local_files lf
+                                    WHERE lf.source_file_id = af.id AND lf.origin = 'processed')
+                   THEN 1 ELSE 0 END) AS completed_files,
+               SUM(CASE WHEN EXISTS(SELECT 1 FROM local_files lf
+                                    WHERE lf.source_file_id = af.id AND lf.origin = 'processed')
+                   THEN 1 ELSE 0 END) AS processed_files,
+               COALESCE(SUM(af.size), 0) AS total_size,
+               COALESCE(SUM(af.downloaded_bytes), 0) AS downloaded_bytes,
+               COALESCE(SUM(CASE WHEN EXISTS(SELECT 1 FROM local_files lf
+                                             WHERE lf.source_file_id = af.id AND lf.origin = 'processed')
+                            THEN af.downloaded_bytes ELSE 0 END), 0) AS processed_bytes,
+               SUM(CASE WHEN af.queue_position IS NOT NULL THEN 1 ELSE 0 END) AS queued_files
+        FROM archive_files af WHERE af.archive_id IN ({placeholders})
+        GROUP BY af.archive_id
     """, ids).fetchall()
     prog = {r["archive_id"]: dict(r) for r in rows}
     for a in archives:
@@ -963,20 +1118,25 @@ def _enrich_archives_with_progress(archives, conn):
 
 def get_archive_progress(archive_id):
     """Return download progress stats for a single archive using total file counts.
-    Processed files count toward completed_files."""
+    Processed files (overlay local_files rows) count toward completed_files."""
     with _db() as conn:
         row = conn.execute("""
             SELECT COUNT(*) AS total_files,
-                   SUM(CASE WHEN download_status = 'completed' THEN 1 ELSE 0 END) AS downloaded_files,
-                   SUM(CASE WHEN download_status = 'completed'
-                              OR processing_status = 'processed' THEN 1 ELSE 0 END) AS completed_files,
-                   SUM(CASE WHEN processing_status = 'processed' THEN 1 ELSE 0 END) AS processed_files,
-                   COALESCE(SUM(size), 0) AS total_size,
-                   COALESCE(SUM(downloaded_bytes), 0) AS downloaded_bytes,
-                   COALESCE(SUM(CASE WHEN processing_status = 'processed'
-                                THEN downloaded_bytes ELSE 0 END), 0) AS processed_bytes,
-                   SUM(CASE WHEN queue_position IS NOT NULL THEN 1 ELSE 0 END) AS queued_files
-            FROM archive_files WHERE archive_id = ?
+                   SUM(CASE WHEN af.download_status = 'downloaded' THEN 1 ELSE 0 END) AS downloaded_files,
+                   SUM(CASE WHEN af.download_status = 'downloaded'
+                              OR EXISTS(SELECT 1 FROM local_files lf
+                                        WHERE lf.source_file_id = af.id AND lf.origin = 'processed')
+                       THEN 1 ELSE 0 END) AS completed_files,
+                   SUM(CASE WHEN EXISTS(SELECT 1 FROM local_files lf
+                                        WHERE lf.source_file_id = af.id AND lf.origin = 'processed')
+                       THEN 1 ELSE 0 END) AS processed_files,
+                   COALESCE(SUM(af.size), 0) AS total_size,
+                   COALESCE(SUM(af.downloaded_bytes), 0) AS downloaded_bytes,
+                   COALESCE(SUM(CASE WHEN EXISTS(SELECT 1 FROM local_files lf
+                                                 WHERE lf.source_file_id = af.id AND lf.origin = 'processed')
+                                THEN af.downloaded_bytes ELSE 0 END), 0) AS processed_bytes,
+                   SUM(CASE WHEN af.queue_position IS NOT NULL THEN 1 ELSE 0 END) AS queued_files
+            FROM archive_files af WHERE af.archive_id = ?
         """, (archive_id,)).fetchone()
         if row:
             return dict(row)
@@ -1055,14 +1215,16 @@ def recompute_archive_status(archive_id, fallback=None):
         row = conn.execute("""
             SELECT
                 COUNT(*) as total,
-                SUM(CASE WHEN download_status = 'completed' THEN 1 ELSE 0 END) as downloaded,
-                SUM(CASE WHEN download_status = 'completed'
-                           OR processing_status = 'processed' THEN 1 ELSE 0 END) as completed,
-                SUM(CASE WHEN download_status = 'failed' THEN 1 ELSE 0 END) as failed,
-                SUM(CASE WHEN queue_position IS NOT NULL THEN 1 ELSE 0 END) as queued,
-                SUM(CASE WHEN download_status = 'downloading' THEN 1 ELSE 0 END) as downloading
-            FROM archive_files
-            WHERE archive_id = ?
+                SUM(CASE WHEN af.download_status = 'downloaded' THEN 1 ELSE 0 END) as downloaded,
+                SUM(CASE WHEN af.download_status = 'downloaded'
+                           OR EXISTS(SELECT 1 FROM local_files lf
+                                     WHERE lf.source_file_id = af.id AND lf.origin = 'processed')
+                    THEN 1 ELSE 0 END) as completed,
+                SUM(CASE WHEN af.download_status = 'failed' THEN 1 ELSE 0 END) as failed,
+                SUM(CASE WHEN af.queue_position IS NOT NULL THEN 1 ELSE 0 END) as queued,
+                SUM(CASE WHEN af.download_status = 'downloading' THEN 1 ELSE 0 END) as downloading
+            FROM archive_files af
+            WHERE af.archive_id = ?
         """, (archive_id,)).fetchone()
 
         total = row["total"] or 0
@@ -1123,14 +1285,14 @@ _FILE_SORT_MAP = {
     "queue_position": ("queue_position", "ASC"),
 }
 
-# Effective status mirrors the JS formatFileStatus logic:
-# processing_status takes priority, then queue_position+download_status determines "skipped"
+# Effective status: process_queue_status takes priority, then overlay check,
+# then queue_position+download_status determines "skipped"
 _EFFECTIVE_STATUS_EXPR = """CASE
-    WHEN processing_status = 'processed' THEN 'processed'
-    WHEN processing_status = 'processing' THEN 'processing'
-    WHEN processing_status = 'queued' THEN 'proc_queued'
-    WHEN processing_status = 'failed' THEN 'proc_failed'
-    WHEN processing_status = 'skipped' THEN 'proc_skipped'
+    WHEN process_queue_status = 'processing' THEN 'processing'
+    WHEN process_queue_status = 'queued' THEN 'proc_queued'
+    WHEN process_queue_status = 'failed' THEN 'proc_failed'
+    WHEN process_queue_status = 'skipped' THEN 'proc_skipped'
+    WHEN EXISTS(SELECT 1 FROM local_files lf WHERE lf.source_file_id = archive_files.id AND lf.origin = 'processed') THEN 'processed'
     WHEN queue_position IS NULL AND download_status = 'pending' THEN 'skipped'
     ELSE download_status
 END"""
@@ -1166,7 +1328,24 @@ def get_archive_files(archive_id, sort="name", sort_dir=None, search=""):
             f"SELECT * FROM archive_files WHERE {where} ORDER BY {order}",
             params,
         ).fetchall()
-        return [dict(r) for r in rows], total
+        result = []
+        for r in rows:
+            d = dict(r)
+            fid = d["id"]
+            d["has_processed"] = bool(conn.execute(
+                "SELECT 1 FROM local_files WHERE source_file_id = ? AND origin = 'processed' LIMIT 1",
+                (fid,),
+            ).fetchone())
+            if d["has_processed"]:
+                outs = conn.execute(
+                    "SELECT name FROM local_files WHERE source_file_id = ? AND origin = 'processed' ORDER BY name",
+                    (fid,),
+                ).fetchall()
+                d["processed_outputs"] = "|".join(r2["name"] for r2 in outs)
+            else:
+                d["processed_outputs"] = ""
+            result.append(d)
+        return result, total
 
 
 def count_unqueued_files(archive_id):
@@ -1194,8 +1373,10 @@ def set_file_queue_position(file_id):
         ).fetchone()[0]
         conn.execute(
             """UPDATE archive_files SET queue_position = ?
-               WHERE id = ? AND download_status NOT IN ('completed', 'conflict')
-                 AND processing_status NOT IN ('queued', 'processing', 'processed')""",
+               WHERE id = ? AND download_status NOT IN ('downloaded', 'conflict')
+                 AND process_queue_status NOT IN ('queued', 'processing')
+                 AND NOT EXISTS(SELECT 1 FROM local_files lf
+                                WHERE lf.source_file_id = archive_files.id AND lf.origin = 'processed')""",
             (max_pos + 1, file_id),
         )
         conn.commit()
@@ -1235,11 +1416,13 @@ def set_all_files_queued(archive_id, queued):
                 "SELECT COALESCE(MAX(queue_position), 0) FROM archive_files WHERE queue_position IS NOT NULL"
             ).fetchone()[0]
             eligible = conn.execute(
-                """SELECT id FROM archive_files
-                   WHERE archive_id = ? AND queue_position IS NULL
-                     AND download_status NOT IN ('completed', 'conflict')
-                     AND processing_status NOT IN ('queued', 'processing', 'processed')
-                   ORDER BY name ASC""",
+                """SELECT id FROM archive_files af
+                   WHERE af.archive_id = ? AND af.queue_position IS NULL
+                     AND af.download_status NOT IN ('downloaded', 'conflict')
+                     AND af.process_queue_status NOT IN ('queued', 'processing')
+                     AND NOT EXISTS(SELECT 1 FROM local_files lf
+                                    WHERE lf.source_file_id = af.id AND lf.origin = 'processed')
+                   ORDER BY af.name ASC""",
                 (archive_id,),
             ).fetchall()
             added = 0
@@ -1251,10 +1434,12 @@ def set_all_files_queued(archive_id, queued):
                 )
                 added += 1
             already = conn.execute(
-                """SELECT COUNT(*) FROM archive_files
-                   WHERE archive_id = ? AND (queue_position IS NOT NULL
-                     OR download_status IN ('completed', 'conflict')
-                     OR processing_status IN ('queued', 'processing', 'processed'))""",
+                """SELECT COUNT(*) FROM archive_files af
+                   WHERE af.archive_id = ? AND (af.queue_position IS NOT NULL
+                     OR af.download_status IN ('downloaded', 'conflict')
+                     OR af.process_queue_status IN ('queued', 'processing')
+                     OR EXISTS(SELECT 1 FROM local_files lf
+                               WHERE lf.source_file_id = af.id AND lf.origin = 'processed'))""",
                 (archive_id,),
             ).fetchone()[0]
             conn.commit()
@@ -1386,7 +1571,7 @@ def get_download_progress():
         row = conn.execute("""
             SELECT
                 COUNT(*) as total_files,
-                SUM(CASE WHEN download_status = 'completed' THEN 1 ELSE 0 END) as completed_files,
+                SUM(CASE WHEN download_status = 'downloaded' THEN 1 ELSE 0 END) as completed_files,
                 SUM(CASE WHEN download_status = 'downloading' THEN 1 ELSE 0 END) as active_files,
                 SUM(CASE WHEN download_status = 'failed' THEN 1 ELSE 0 END) as failed_files,
                 COALESCE(SUM(size), 0) as total_size,
@@ -1420,12 +1605,14 @@ def reset_stale_processing():
     with _db() as conn:
         # Reset stuck files
         stuck_files = conn.execute(
-            "SELECT COUNT(*) as cnt FROM archive_files WHERE processing_status IN ('processing', 'queued')"
+            "SELECT COUNT(*) as cnt FROM archive_files WHERE process_queue_status IN ('processing', 'queued')"
         ).fetchone()["cnt"]
         if stuck_files:
             conn.execute(
-                "UPDATE archive_files SET processing_status = '', processing_error = 'Reset after crash' "
-                "WHERE processing_status IN ('processing', 'queued')"
+                "UPDATE archive_files SET process_queue_status = '', processing_status = '', "
+                "processing_error = 'Reset after crash' "
+                "WHERE process_queue_status IN ('processing', 'queued') "
+                "OR processing_status IN ('processing', 'queued')"
             )
 
         # Fail stuck processing jobs
@@ -1740,9 +1927,19 @@ def set_archive_processing_profile(archive_id, profile_id):
 # --- Processing Status Helpers ---
 
 def set_file_processing_status(file_id, status, processed_filename=None, processor_type=None, error=None, processed_files=None):
+    """Update processing state on a file.
+
+    Writes to both legacy columns (processing_status etc.) and the new
+    process_queue_status column for backward compatibility during transition.
+    """
     with _db() as conn:
         updates = ["processing_status = ?"]
         params = [status]
+        # Also update overlay-era queue status column
+        # 'processed' is not a queue status — clear it when done
+        queue_status = "" if status == "processed" else status
+        updates.append("process_queue_status = ?")
+        params.append(queue_status)
         if processed_filename is not None:
             updates.append("processed_filename = ?")
             params.append(processed_filename)
@@ -1761,28 +1958,15 @@ def set_file_processing_status(file_id, status, processed_filename=None, process
 
 
 def get_all_processed_files(archive_id):
-    """Return a set of all output filenames (relative to download dir) produced
-    by processing for the given archive.  Includes both single-file outputs
-    (processed_filename) and multi-file outputs (processed_files_json)."""
+    """Return a set of all output filenames produced by processing for the
+    given archive.  Reads from the local_files overlay table."""
     with _db() as conn:
         rows = conn.execute(
-            "SELECT processed_filename, processed_files_json FROM archive_files "
-            "WHERE archive_id = ? AND processing_status = 'processed'",
+            "SELECT name FROM local_files "
+            "WHERE archive_id = ? AND origin = 'processed'",
             (archive_id,),
         ).fetchall()
-        names = set()
-        for r in rows:
-            pf = r["processed_filename"]
-            if pf:
-                names.add(pf)
-            pj = r["processed_files_json"]
-            if pj:
-                try:
-                    for entry in json.loads(pj):
-                        names.add(entry)
-                except (json.JSONDecodeError, TypeError):
-                    pass
-        return names
+        return {r["name"] for r in rows}
 
 
 def set_media_root(file_ids, media_root):
@@ -1874,9 +2058,8 @@ def reset_failed_files_by_ids(file_ids):
 
 def assign_as_processed_output(target_file_id, unknown_file_id):
     """Assign an unknown file as processed output of a target file.
-    Adds the unknown file's name to the target's processed_files_json,
-    sets the target's processing_status to 'processed' if not already,
-    and deletes the unknown file record."""
+    Creates a local_files overlay row linking the unknown file to the target,
+    and deletes the unknown file record from archive_files."""
     with _db() as conn:
         unknown = conn.execute("SELECT * FROM archive_files WHERE id = ?", (unknown_file_id,)).fetchone()
         if not unknown or unknown["download_status"] != "unknown":
@@ -1887,7 +2070,14 @@ def assign_as_processed_output(target_file_id, unknown_file_id):
         if unknown["archive_id"] != target["archive_id"]:
             return False, "Files must be in the same archive"
 
-        # Add unknown file's name to target's processed_files_json
+        # Create overlay row for the processed output
+        conn.execute(
+            """INSERT INTO local_files (archive_id, source_file_id, name, size, origin, processor_type, created_at)
+               VALUES (?, ?, ?, ?, 'processed', '', ?)""",
+            (target["archive_id"], target_file_id, unknown["name"], unknown["size"] or 0, time.time()),
+        )
+
+        # Also update legacy columns for backward compat during transition
         existing = []
         if target["processed_files_json"]:
             try:
@@ -1896,8 +2086,6 @@ def assign_as_processed_output(target_file_id, unknown_file_id):
                 existing = []
         if unknown["name"] not in existing:
             existing.append(unknown["name"])
-
-        # Update target: set processing_status and processed_files_json
         updates = ["processed_files_json = ?"]
         params = [json.dumps(existing)]
         if target["processing_status"] != "processed":
@@ -1915,15 +2103,18 @@ def assign_as_processed_output(target_file_id, unknown_file_id):
 
 
 def get_processable_files(archive_id, processor_types=None):
-    """Get files eligible for processing: completed downloads, not already processed.
+    """Get files eligible for processing: downloaded, not already processed
+    (no overlay rows), and not currently queued/processing.
     Optionally filter by file extensions matching processor input types."""
     with _db() as conn:
         rows = conn.execute(
-            """SELECT * FROM archive_files
-               WHERE archive_id = ? AND download_status = 'completed'
-                 AND processing_status IN ('', 'failed')
-                 AND origin = 'manifest'
-               ORDER BY name ASC""",
+            """SELECT * FROM archive_files af
+               WHERE af.archive_id = ? AND af.download_status = 'downloaded'
+                 AND af.process_queue_status IN ('', 'failed')
+                 AND af.origin = 'manifest'
+                 AND NOT EXISTS(SELECT 1 FROM local_files lf
+                                WHERE lf.source_file_id = af.id AND lf.origin = 'processed')
+               ORDER BY af.name ASC""",
             (archive_id,),
         ).fetchall()
         return [dict(r) for r in rows]
@@ -1933,7 +2124,7 @@ def get_processing_queue_files(archive_id):
     """Get files currently queued or being processed for an archive."""
     with _db() as conn:
         rows = conn.execute(
-            "SELECT * FROM archive_files WHERE archive_id = ? AND processing_status IN ('queued', 'processing')",
+            "SELECT * FROM archive_files WHERE archive_id = ? AND process_queue_status IN ('queued', 'processing')",
             (archive_id,),
         ).fetchall()
         return [dict(r) for r in rows]
@@ -2227,20 +2418,103 @@ def delete_collection(collection_id):
 
 
 def get_collection_files(collection_id):
-    """Return all completed/processed files with archive identifier.
+    """Return all files eligible for collections: downloaded originals from the
+    manifest plus processed/local files from the overlay.
 
-    File scope filtering is now handled by layout tag segments, so this
-    returns all files that are either processed or downloaded originals.
+    Returns a UNION of archive_files (originals) and local_files (overlay).
+    Each row has a 'file_type' column: 'original', 'processed', or 'local'.
     """
     with _db() as conn:
         rows = conn.execute(
-            """SELECT af.*, a.identifier AS archive_identifier
+            """SELECT af.id, af.archive_id, af.name, af.size, 'original' AS file_type,
+                      a.identifier AS archive_identifier, af.media_root,
+                      NULL AS source_file_id
                FROM archive_files af
                JOIN archives a ON af.archive_id = a.id
-               WHERE af.processing_status = 'processed'
-                  OR (af.download_status = 'completed' AND af.origin = 'manifest')""",
+               WHERE af.download_status = 'downloaded' AND af.origin = 'manifest'
+
+               UNION ALL
+
+               SELECT lf.id, lf.archive_id, lf.name, lf.size,
+                      lf.origin AS file_type,
+                      a.identifier AS archive_identifier, '' AS media_root,
+                      lf.source_file_id
+               FROM local_files lf
+               JOIN archives a ON lf.archive_id = a.id""",
         ).fetchall()
         return [dict(r) for r in rows]
+
+
+# ── Local Files (Overlay) ─────────────────────────────────────────────
+
+def add_local_file(archive_id, name, origin="local", source_file_id=None,
+                   size=0, processor_type="", processing_job_id=None):
+    """Insert a row into local_files. Returns the new row ID."""
+    with _db() as conn:
+        cur = conn.execute(
+            "INSERT INTO local_files (archive_id, source_file_id, name, size, origin, "
+            "processor_type, processing_job_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (archive_id, source_file_id, name, size, origin,
+             processor_type, processing_job_id, time.time()),
+        )
+        conn.commit()
+        return cur.lastrowid
+
+
+def get_local_files_for_archive(archive_id):
+    """Return all local_files rows for an archive."""
+    with _db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM local_files WHERE archive_id = ? ORDER BY name", (archive_id,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_processed_outputs(source_file_id):
+    """Return local_files rows that are processed outputs of a given source file."""
+    with _db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM local_files WHERE source_file_id = ? AND origin = 'processed' ORDER BY name",
+            (source_file_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def delete_local_file(local_file_id):
+    """Delete a local_files row."""
+    with _db() as conn:
+        conn.execute("DELETE FROM local_files WHERE id = ?", (local_file_id,))
+        conn.commit()
+
+
+def delete_local_files_for_source(source_file_id):
+    """Delete all processed outputs for a source file (e.g. before re-processing)."""
+    with _db() as conn:
+        conn.execute(
+            "DELETE FROM local_files WHERE source_file_id = ? AND origin = 'processed'",
+            (source_file_id,),
+        )
+        conn.commit()
+
+
+def delete_local_file_by_name(source_file_id, name):
+    """Delete a specific overlay row matching source_file_id and name."""
+    with _db() as conn:
+        conn.execute(
+            "DELETE FROM local_files WHERE source_file_id = ? AND name = ?",
+            (source_file_id, name),
+        )
+        conn.commit()
+
+
+def set_file_process_queue_status(file_id, status):
+    """Update the transient processing queue status on an archive_file."""
+    with _db() as conn:
+        conn.execute(
+            "UPDATE archive_files SET process_queue_status = ? WHERE id = ?",
+            (status, file_id),
+        )
+        conn.commit()
 
 
 # ── Archive Tags ──────────────────────────────────────────────────────

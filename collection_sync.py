@@ -79,62 +79,65 @@ def get_processed_dir():
 def _resolve_filename(file_row, flatten=True):
     """Determine the filename that should appear in a collection.
 
-    If the file has been processed and has a ``processed_filename``,
-    use that.  Otherwise fall back to the original manifest ``name``.
-
-    If the unit was expanded from ``processed_files_json``, the
-    ``_extra_processed_path`` key overrides the normal resolution.
+    Uses the ``name`` field directly — for overlay files (processed/local)
+    this is already the output filename; for originals it's the manifest name.
 
     When ``flatten`` is True (default), returns only the leaf name (no
     subdirectory components).  When False, returns the full relative path
     preserving the original archive directory structure.
     """
-    extra = file_row.get("_extra_processed_path")
-    if extra:
-        raw = extra
-    else:
-        raw = file_row.get("processed_filename") or file_row["name"]
+    raw = file_row["name"]
     return os.path.basename(raw) if flatten else raw
 
 
 def _resolve_filepath(file_row, download_dir):
     """Return the absolute path to the real file on disk.
 
-    Uses the full relative path (including subdirectories) to locate the
-    file, even though ``_resolve_filename`` strips subdirectories for
-    display purposes.
-
-    If the unit was expanded from ``processed_files_json``, the
-    ``_extra_processed_path`` key overrides the normal resolution.
-
-    For processed files, checks the separate ``processed_dir`` first,
-    falling back to the legacy location inside ``download_dir``.
+    Checks ``file_type`` to determine where the file lives:
+    - ``original`` → download_dir/{identifier}/{name}
+    - ``processed`` or ``local`` → processed_dir/{identifier}/{name}
+      with fallback chain for legacy layouts
     """
     identifier = file_row["archive_identifier"]
-    # Expanded multi-output entry takes precedence
-    extra = file_row.get("_extra_processed_path")
-    if extra:
-        return _resolve_processed_path(identifier, extra, download_dir)
-    raw = file_row.get("processed_filename") or file_row["name"]
-    if file_row.get("processed_filename"):
+    file_type = file_row.get("file_type", "original")
+    raw = file_row["name"]
+    if file_type in ("processed", "local"):
         return _resolve_processed_path(identifier, raw, download_dir)
-    # Unprocessed file — always in download_dir
+    # Original file — always in download_dir
     return os.path.join(download_dir, identifier, raw)
 
 
 def _resolve_processed_path(identifier, rel_path, download_dir):
-    """Locate a processed file, checking ``processed_dir`` first.
+    """Locate a processed file using a fallback chain.
 
-    Processed outputs may live in either the dedicated processed directory
-    (new layout) or alongside downloads (legacy).  This function checks the
-    processed dir first and falls back to download_dir so both old and
-    migrated archives work transparently.
+    Checks in order:
+    1. Flat overlay: processed_dir/{identifier}/{name}
+    2. Legacy .processed subfolder: processed_dir/{identifier}/{source}.processed/{name}
+       (scans for any .processed subfolder containing the file)
+    3. Legacy download dir: download_dir/{identifier}/{name}
+
+    This means files are found before, during, and after the file migration
+    that flattens .processed subfolders.
     """
     processed_dir = get_processed_dir()
+    # 1. Flat overlay layout (target state)
     candidate = os.path.join(processed_dir, identifier, rel_path)
     if os.path.exists(candidate):
         return candidate
-    # Legacy fallback — processed file alongside downloads
+    # 2. Legacy .processed subfolder layout
+    ident_dir = os.path.join(processed_dir, identifier)
+    if os.path.isdir(ident_dir):
+        basename = os.path.basename(rel_path)
+        rel_dir = os.path.dirname(rel_path)
+        for entry in os.listdir(ident_dir):
+            if entry.endswith(".processed"):
+                if rel_dir:
+                    sub_candidate = os.path.join(ident_dir, entry, rel_dir, basename)
+                else:
+                    sub_candidate = os.path.join(ident_dir, entry, basename)
+                if os.path.exists(sub_candidate):
+                    return sub_candidate
+    # 3. Legacy fallback — processed file alongside downloads
     return os.path.join(download_dir, identifier, rel_path)
 
 
@@ -174,9 +177,8 @@ def _build_media_units(files, download_dir, flatten=True, use_media_units=True):
       - Media root dirs:  ``{display_name, file_row, is_dir: True,
         target_dir, children: [file_row, ...]}``
 
-    **Critical rule:** processed files are always standalone — ``media_root``
-    is ignored when ``processed_filename`` is set, because the processor has
-    already collapsed multi-file input into a single output.
+    **Critical rule:** processed/local overlay files are always standalone —
+    ``media_root`` only applies to original manifest files.
 
     When ``use_media_units`` is False, media_root is ignored entirely and
     all files are treated as standalone.
@@ -186,35 +188,17 @@ def _build_media_units(files, download_dir, flatten=True, use_media_units=True):
     grouped = defaultdict(list)  # (identifier, media_root) → [file_rows]
 
     for f in files:
+        file_type = f.get("file_type", "original")
         root = f.get("media_root", "")
-        is_processed = bool(f.get("processed_filename"))
-        if use_media_units and root and not is_processed:
+        is_overlay = file_type in ("processed", "local")
+        if use_media_units and root and not is_overlay:
             grouped[(f["archive_identifier"], root)].append(f)
         else:
-            # Primary entry (processed_filename or original name)
             units.append({
                 "display_name": _resolve_filename(f, flatten=flatten),
                 "file_row": f,
                 "is_dir": False,
             })
-            # Expand additional processed outputs from processed_files_json
-            if is_processed and f.get("processed_files_json"):
-                primary = f.get("processed_filename", "")
-                try:
-                    extra_files = json.loads(f["processed_files_json"])
-                except (json.JSONDecodeError, TypeError):
-                    extra_files = []
-                for extra_path in extra_files:
-                    if not extra_path or extra_path == primary:
-                        continue
-                    # Create a shallow copy with override key for path resolution
-                    expanded = dict(f)
-                    expanded["_extra_processed_path"] = extra_path
-                    units.append({
-                        "display_name": os.path.basename(extra_path) if flatten else extra_path,
-                        "file_row": expanded,
-                        "is_dir": False,
-                    })
 
     for (identifier, root), group_files in grouped.items():
         units.append({
@@ -229,10 +213,19 @@ def _build_media_units(files, download_dir, flatten=True, use_media_units=True):
 
 
 def _build_file_tag_lookup(collection_id, files=None):
-    """Build a file_id -> set(tags) lookup for all files in a collection.
+    """Build a composite_key -> set(tags) lookup for all files in a collection.
 
     Includes own file tags + inherited archive tags + group tags.
-    Also adds a pseudo-tag 'archive:{identifier}' for by_archive grouping.
+    Also adds virtual tags derived from file state:
+    - ``archive:{identifier}`` for by_archive grouping
+    - ``original`` for manifest files
+    - ``downloaded`` for downloaded originals
+    - ``processed`` for processed overlay files
+    - ``local`` for locally imported overlay files
+
+    Since the UNION query returns rows from both archive_files and local_files
+    with potentially overlapping IDs, we use a composite key of
+    ``(file_type, id)`` to avoid collisions.
 
     If ``files`` is provided, uses that list instead of querying the DB again.
     """
@@ -242,33 +235,75 @@ def _build_file_tag_lookup(collection_id, files=None):
     if not files:
         return lookup
 
+    # Tags that are contradictory for overlay files — an overlay file is
+    # not an "original" or "downloaded", even if its source was.
+    _OVERLAY_EXCLUDED_TAGS = {"original", "downloaded"}
+
     # Collect all archive IDs and their identifiers
     archive_info = {}  # archive_id -> identifier
-    file_ids = []
+    # We need composite keys because IDs from archive_files and local_files can collide
+    original_file_ids = []
+    # Track overlay files that have a source_file_id for tag inheritance
+    overlay_by_source = defaultdict(list)  # source_file_id -> [ckey, ...]
     for f in files:
-        file_ids.append(f["id"])
+        file_type = f.get("file_type", "original")
+        # Use composite key to avoid ID collisions between tables
+        ckey = (file_type, f["id"])
+        f["_ckey"] = ckey  # stash for downstream use
         aid = f["archive_id"]
         if aid not in archive_info:
             archive_info[aid] = f.get("archive_identifier", "")
-        # Add archive pseudo-tag
-        lookup[f["id"]].add(f"archive:{f.get('archive_identifier', '')}")
 
-    # Bulk load file tags
-    file_tags = db.get_file_tags_bulk(file_ids)
-    for fid, tags in file_tags.items():
-        for t in tags:
-            lookup[fid].add(t["tag"])
+        # Virtual tags based on file_type
+        lookup[ckey].add(f"archive:{f.get('archive_identifier', '')}")
+        if file_type == "original":
+            lookup[ckey].add("original")
+            lookup[ckey].add("downloaded")
+            original_file_ids.append(f["id"])
+        elif file_type == "processed":
+            lookup[ckey].add("processed")
+            # Track for tag inheritance from source
+            src = f.get("source_file_id")
+            if src is not None:
+                overlay_by_source[src].append(ckey)
+        elif file_type == "local":
+            lookup[ckey].add("local")
+            src = f.get("source_file_id")
+            if src is not None:
+                overlay_by_source[src].append(ckey)
+
+    # Bulk load file tags for originals
+    if original_file_ids:
+        file_tags = db.get_file_tags_bulk(original_file_ids)
+        # Map original file tags to composite keys
+        orig_id_to_ckey = {}
+        for f in files:
+            if f.get("file_type", "original") == "original":
+                orig_id_to_ckey[f["id"]] = f["_ckey"]
+        for fid, tags in file_tags.items():
+            ckey = orig_id_to_ckey.get(fid)
+            if ckey:
+                for t in tags:
+                    tag_str = t["tag"]
+                    lookup[ckey].add(tag_str)
+
+            # Propagate to overlay files derived from this source,
+            # excluding contradictory tags
+            for overlay_ckey in overlay_by_source.get(fid, []):
+                for t in tags:
+                    tag_str = t["tag"]
+                    if tag_str not in _OVERLAY_EXCLUDED_TAGS:
+                        lookup[overlay_ckey].add(tag_str)
 
     # Inherited archive-level tags (bulk load)
     archive_tags_bulk = db.get_archive_tags_bulk(list(archive_info.keys()))
-    # Pre-group files by archive_id to avoid re-scanning
     files_by_archive = defaultdict(list)
     for f in files:
-        files_by_archive[f["archive_id"]].append(f["id"])
+        files_by_archive[f["archive_id"]].append(f["_ckey"])
     for aid, tags in archive_tags_bulk.items():
         atag_set = set(tags)
-        for fid in files_by_archive.get(aid, []):
-            lookup[fid].update(atag_set)
+        for ckey in files_by_archive.get(aid, []):
+            lookup[ckey].update(atag_set)
 
     return lookup
 
@@ -308,7 +343,7 @@ def _evaluate_node(node, units, tag_lookup, renames=None):
         tag_filter = node.get("tag_filter", "")
         # Group units by the child values of this parent tag
         for unit in units:
-            fid = unit["file_row"]["id"]
+            fid = unit["file_row"].get("_ckey", ("original", unit["file_row"]["id"]))
             tags = tag_lookup.get(fid, set())
             matched = False
             for tag in tags:
@@ -333,7 +368,7 @@ def _evaluate_node(node, units, tag_lookup, renames=None):
     elif node_type == "tag_value":
         tag_filter = node.get("tag_filter", "")
         for unit in units:
-            fid = unit["file_row"]["id"]
+            fid = unit["file_row"].get("_ckey", ("original", unit["file_row"]["id"]))
             tags = tag_lookup.get(fid, set())
             if tag_filter in tags:
                 mapping[""].append((unit["display_name"], unit))
@@ -417,7 +452,7 @@ def _evaluate_segments(segments, units, tag_lookup):
                 buckets = defaultdict(list)
                 untagged = []
                 for unit in group_units:
-                    fid = unit["file_row"]["id"]
+                    fid = unit["file_row"].get("_ckey", ("original", unit["file_row"]["id"]))
                     tags = tag_lookup.get(fid, set())
                     matched = False
                     # Special case: archive pseudo-tag
@@ -447,7 +482,7 @@ def _evaluate_segments(segments, units, tag_lookup):
             for path, group_units in groups:
                 filtered = []
                 for unit in group_units:
-                    fid = unit["file_row"]["id"]
+                    fid = unit["file_row"].get("_ckey", ("original", unit["file_row"]["id"]))
                     tags = tag_lookup.get(fid, set())
                     if sval in tags:
                         filtered.append(unit)
@@ -466,7 +501,7 @@ def _evaluate_segments(segments, units, tag_lookup):
             for path, group_units in groups:
                 filtered = []
                 for unit in group_units:
-                    fid = unit["file_row"]["id"]
+                    fid = unit["file_row"].get("_ckey", ("original", unit["file_row"]["id"]))
                     tags = tag_lookup.get(fid, set())
                     # Match if any tag in the group matches (including parent:child expansion)
                     if _matches_tag_group(tags, tag_list):
@@ -485,7 +520,7 @@ def _evaluate_segments(segments, units, tag_lookup):
             for path, group_units in groups:
                 filtered = []
                 for unit in group_units:
-                    fid = unit["file_row"]["id"]
+                    fid = unit["file_row"].get("_ckey", ("original", unit["file_row"]["id"]))
                     tags = tag_lookup.get(fid, set())
                     if _matches_tag_group(tags, tag_list):
                         filtered.append(unit)
@@ -678,15 +713,17 @@ def sync_collection(collection_id):
         "total_errors": 0,
     }
 
+    # ── Phase 1: Compute desired symlinks for ALL layouts ───────────────
+    # All layouts share coll_dir, so we must compute the full desired set
+    # before removing anything — otherwise one layout deletes another's links.
+    all_desired = {}  # link_path → (target_path, is_dir, layout_name)
+    per_layout_desired = {}  # layout_name → {link_path → (target_path, is_dir)}
+
     for layout in layouts:
-        # Each layout has its own flatten/media_units settings
         flatten = bool(layout.get("flatten", 1))
         use_media_units = bool(layout.get("use_media_units", 1))
         units = _build_media_units(files, download_dir, flatten=flatten,
                                    use_media_units=use_media_units)
-
-        # Layouts build paths directly in the collection root directory
-        layout_dir = coll_dir
 
         layout_stats = {
             "created": 0,
@@ -695,20 +732,18 @@ def sync_collection(collection_id):
             "conflicts": 0,
             "errors": [],
         }
+        stats["layouts"][layout["name"]] = layout_stats
 
-        # Compute desired symlinks for this layout (node-based or legacy)
         mapping = _evaluate_node_tree(layout, units, tag_lookup)
         layout_stats["conflicts"] = _resolve_conflicts(mapping)
 
-        # Build set of desired symlink paths (absolute) → (target_path, is_dir)
-        desired = {}  # link_path → (target_path, is_dir)
+        desired = {}
         for subdir, entries in mapping.items():
             if subdir:
-                # Apply _safe_name to each path component (nested paths may contain /)
                 safe_parts = [_safe_name(p) for p in subdir.replace("\\", "/").split("/") if p]
-                link_parent = os.path.join(layout_dir, *safe_parts) if safe_parts else layout_dir
+                link_parent = os.path.join(coll_dir, *safe_parts) if safe_parts else coll_dir
             else:
-                link_parent = layout_dir
+                link_parent = coll_dir
 
             for display_name, unit in entries:
                 link_path = os.path.join(link_parent, display_name)
@@ -718,50 +753,63 @@ def sync_collection(collection_id):
                     target_path = _resolve_filepath(unit["file_row"], download_dir)
                 desired[link_path] = (target_path, unit["is_dir"])
 
-        # Collect existing symlinks under this layout dir
-        # Check both files and directories — directory symlinks appear in dirnames
-        existing = set()
-        if os.path.isdir(layout_dir):
-            for dirpath, dirnames, filenames in os.walk(layout_dir):
-                for fname in filenames:
-                    full = os.path.join(dirpath, fname)
-                    if os.path.islink(full):
-                        existing.add(full)
-                # Directory symlinks: os.walk lists them in dirnames but
-                # won't recurse into them (they're symlinks).  Check each.
-                for dname in list(dirnames):
-                    full = os.path.join(dirpath, dname)
-                    if os.path.islink(full):
-                        existing.add(full)
-                        # Don't recurse into symlinked dirs
-                        dirnames.remove(dname)
+        per_layout_desired[layout["name"]] = desired
+        for lp, val in desired.items():
+            # First layout to claim a path wins
+            if lp not in all_desired:
+                all_desired[lp] = (*val, layout["name"])
 
-        # Remove stale symlinks (exist on disk but not in desired set)
-        for link_path in existing - set(desired.keys()):
-            try:
-                os.unlink(link_path)
-                layout_stats["removed"] += 1
-            except OSError as e:
-                layout_stats["errors"].append(f"Remove {link_path}: {e}")
+    # ── Phase 2: Collect existing symlinks in collection dir ──────────
+    existing = set()
+    if os.path.isdir(coll_dir):
+        for dirpath, dirnames, filenames in os.walk(coll_dir):
+            for fname in filenames:
+                full = os.path.join(dirpath, fname)
+                if os.path.islink(full):
+                    existing.add(full)
+            for dname in list(dirnames):
+                full = os.path.join(dirpath, dname)
+                if os.path.islink(full):
+                    existing.add(full)
+                    dirnames.remove(dname)
 
-        # Create or update symlinks
+    # ── Phase 3: Remove stale symlinks (not desired by ANY layout) ────
+    all_desired_paths = set(all_desired.keys())
+    removed_count = 0
+    remove_errors = []
+    for link_path in existing - all_desired_paths:
+        try:
+            os.unlink(link_path)
+            removed_count += 1
+        except OSError as e:
+            remove_errors.append(f"Remove {link_path}: {e}")
+
+    # Distribute removal stats to the first layout (they're shared removals)
+    if layouts:
+        first_layout_name = layouts[0]["name"]
+        stats["layouts"][first_layout_name]["removed"] = removed_count
+        stats["layouts"][first_layout_name]["errors"].extend(remove_errors)
+
+    # ── Phase 4: Create or update symlinks for all layouts ────────────
+    for layout in layouts:
+        layout_name = layout["name"]
+        layout_stats = stats["layouts"][layout_name]
+        desired = per_layout_desired[layout_name]
+
         for link_path, (target_path, is_dir) in desired.items():
             rel_target = _compute_relative_symlink(link_path, target_path)
 
             if os.path.islink(link_path):
-                # Check if it already points to the right place
                 current = os.readlink(link_path)
                 if current == rel_target:
                     layout_stats["unchanged"] += 1
                     continue
-                # Wrong target — remove and recreate
                 try:
                     os.unlink(link_path)
                 except OSError as e:
                     layout_stats["errors"].append(f"Update {link_path}: {e}")
                     continue
 
-            # Ensure parent directory exists
             parent = os.path.dirname(link_path)
             try:
                 os.makedirs(parent, exist_ok=True)
@@ -769,7 +817,6 @@ def sync_collection(collection_id):
                 layout_stats["errors"].append(f"Mkdir {parent}: {e}")
                 continue
 
-            # Verify the target actually exists before linking
             if is_dir:
                 if not os.path.isdir(target_path):
                     layout_stats["errors"].append(
@@ -789,11 +836,13 @@ def sync_collection(collection_id):
             except OSError as e:
                 layout_stats["errors"].append(f"Symlink {link_path}: {e}")
 
-        # Clean up empty directories left after removal
-        if os.path.isdir(layout_dir):
-            _remove_empty_dirs(layout_dir)
+    # Clean up empty directories
+    if os.path.isdir(coll_dir):
+        _remove_empty_dirs(coll_dir)
 
-        stats["layouts"][layout["name"]] = layout_stats
+    for layout in layouts:
+        layout_name = layout["name"]
+        layout_stats = stats["layouts"][layout_name]
         stats["total_created"] += layout_stats["created"]
         stats["total_removed"] += layout_stats["removed"]
         stats["total_errors"] += len(layout_stats["errors"])
