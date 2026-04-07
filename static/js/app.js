@@ -5758,7 +5758,7 @@
             }
 
             section.style.display = "";
-            hint.textContent = `${cpRows.filter(r => r.type === "file" || r.type === "dir_unit").length} entries across ${cpRows.filter(r => r.type === "layout_header").length} layout(s)`;
+            hint.textContent = `${cpRows.filter(r => r.type === "file" || r.type === "dir_unit").length} entries`;
 
             // Build the flat visible rows (expanding dir_units as needed)
             cpRenderVisible();
@@ -5777,45 +5777,29 @@
     }
 
     function cpGetVisibleRows() {
-        /* Build the flat row list:
-           - Bucket headers become expandable folders (collapsed by default)
+        /* Build the flat row list from the unified folder view.
+           - Bucket headers are expandable folders (collapsed by default)
            - Dir_units within expanded buckets also expandable
            - Hidden rows (inside collapsed folders) are omitted
+           - Each row carries layout_ids[] for highlighting
         */
         const rows = [];
-        let currentLayoutId = null;
         let skipDepth = null; // when set, skip rows at this depth or deeper
 
-        let layoutCollapsed = false; // tracks if current layout section is collapsed
-
         for (const row of cpRows) {
-            // Track current layout — make layout headers collapsible
-            if (row.type === "layout_header") {
-                currentLayoutId = row.layout_id;
-                skipDepth = null;
-                const key = `layout|${row.layout_id}`;
-                const expanded = cpExpandedDirs.has(key);
-                layoutCollapsed = !expanded;
-                rows.push({ ...row, _layoutId: currentLayoutId, _key: key, _expanded: expanded });
-                continue;
-            }
-
-            // Skip everything inside a collapsed layout
-            if (layoutCollapsed) continue;
-
             // If we're skipping (inside collapsed folder), check depth
             if (skipDepth !== null && row.depth >= skipDepth) continue;
             skipDepth = null; // past the collapsed section
 
             if (row.type === "bucket_header") {
-                const key = `bucket|${currentLayoutId}|${row.path || row.name}`;
+                const key = `bucket|${row.path || row.name}`;
                 const expanded = cpExpandedDirs.has(key);
-                rows.push({ ...row, _layoutId: currentLayoutId, _key: key, _expanded: expanded });
+                rows.push({ ...row, _key: key, _expanded: expanded });
                 if (!expanded) skipDepth = row.depth + 1;
             } else if (row.type === "dir_unit") {
                 const key = `dir|${row.display_name}|${row.archive_identifier}`;
                 const expanded = cpExpandedDirs.has(key);
-                rows.push({ ...row, _layoutId: currentLayoutId, _key: key, _expanded: expanded });
+                rows.push({ ...row, _key: key, _expanded: expanded });
                 if (expanded) {
                     for (const child of (row.children || [])) {
                         rows.push({
@@ -5825,12 +5809,12 @@
                             size: child.size || 0,
                             archive_identifier: row.archive_identifier,
                             is_dir: false,
-                            _layoutId: currentLayoutId,
+                            layout_ids: row.layout_ids || [],
                         });
                     }
                 }
             } else {
-                rows.push({ ...row, _layoutId: currentLayoutId });
+                rows.push({ ...row });
             }
         }
         return rows;
@@ -5873,22 +5857,12 @@
             div.style.paddingLeft = (12 + row.depth * 20) + "px";
 
             // Highlight rows belonging to the selected layout
-            if (selectedLid && row._layoutId === selectedLid && row.type !== "layout_header") {
+            const rowLayouts = row.layout_ids || [];
+            if (selectedLid && rowLayouts.includes(selectedLid)) {
                 div.classList.add("cp-highlighted");
             }
 
-            if (row.type === "layout_header") {
-                div.classList.add("layout-header", "cp-folder");
-                const isActive = selectedLid && row.layout_id === selectedLid;
-                const arrow = row._expanded ? "\u25BE" : "\u25B8";
-                div.innerHTML = `<span class="preview-name" style="cursor:pointer">${arrow} ${esc(row.name)} <span style="font-weight:400;opacity:0.5">${esc(row.layout_type)}</span>${isActive ? ' <span style="font-size:10px;opacity:0.6">\u2713 selected</span>' : ""}</span>`;
-                div.addEventListener("click", () => {
-                    if (cpExpandedDirs.has(row._key)) cpExpandedDirs.delete(row._key);
-                    else cpExpandedDirs.add(row._key);
-                    cpLastRange = null;
-                    cpRenderVisible();
-                });
-            } else if (row.type === "bucket_header") {
+            if (row.type === "bucket_header") {
                 div.classList.add("bucket-header", "cp-folder");
                 const arrow = row._expanded ? "\u25BE" : "\u25B8";
                 const countStr = row.file_count ? ` <span style="opacity:0.4;font-weight:400">(${row.file_count})</span>` : "";

@@ -921,11 +921,17 @@ def preview_collection(collection_id):
     # Build tag lookup for node-based layouts
     tag_lookup = _build_file_tag_lookup(collection_id, files=files)
 
-    rows = []
+    # ── Merge all layouts into a single unified folder view ──
+    # Each bucket/entry tracks which layout(s) placed it there so the UI
+    # can highlight entries belonging to the selected layout.
+
+    # merged: subdir -> display_name -> { entry_dict, layout_ids: set }
+    merged_buckets: dict[str, dict[str, dict]] = {}
+    # Track which layouts contribute to each bucket for the bucket header
+    bucket_layout_ids: dict[str, set] = {}
 
     for layout in layouts:
         lid = layout["id"]
-        # Each layout has its own flatten/media_units settings
         flatten = bool(layout.get("flatten", 1))
         use_media_units = bool(layout.get("use_media_units", 1))
         units = _build_media_units(files, download_dir, flatten=flatten,
@@ -933,61 +939,68 @@ def preview_collection(collection_id):
         mapping = _evaluate_node_tree(layout, units, tag_lookup)
         _resolve_conflicts(mapping)
 
-        rows.append({
-            "type": "layout_header",
-            "depth": 0,
-            "name": layout["name"],
-            "layout_type": layout["type"],
-            "layout_id": lid,
-        })
+        for subdir, entries in mapping.items():
+            if subdir not in merged_buckets:
+                merged_buckets[subdir] = {}
+                bucket_layout_ids[subdir] = set()
+            bucket_layout_ids[subdir].add(lid)
 
-        # Sort buckets: alphabetical order for bucket names
-        for subdir in sorted(mapping.keys()):
-            entries = mapping[subdir]
-            if subdir:
-                # Support nested paths: split on / or os.sep for depth
-                parts = [p for p in subdir.replace("\\", "/").split("/") if p]
-                depth = len(parts)
-                rows.append({
-                    "type": "bucket_header",
-                    "depth": depth,
-                    "name": parts[-1],
-                    "path": subdir,
-                    "layout_id": lid,
-                    "file_count": len(entries),
-                })
-                entry_depth = depth + 1
-            else:
-                entry_depth = 1
-
-            # Sort entries by display name within each bucket
-            for display_name, unit in sorted(entries, key=lambda e: e[0].lower()):
-                if unit["is_dir"]:
-                    children = []
-                    for child in unit.get("children", []):
-                        children.append({
-                            "name": os.path.basename(child["name"]),
-                            "size": child.get("size", 0),
-                        })
-                    rows.append({
-                        "type": "dir_unit",
-                        "depth": entry_depth,
-                        "display_name": display_name,
-                        "is_dir": True,
-                        "archive_identifier": unit["file_row"]["archive_identifier"],
-                        "children": sorted(children, key=lambda c: c["name"].lower()),
-                        "layout_id": lid,
-                    })
+            for display_name, unit in entries:
+                key = display_name
+                if key in merged_buckets[subdir]:
+                    # Same file placed by multiple layouts — add layout id
+                    merged_buckets[subdir][key]["layout_ids"].add(lid)
                 else:
-                    rows.append({
-                        "type": "file",
-                        "depth": entry_depth,
-                        "display_name": display_name,
-                        "is_dir": False,
-                        "archive_identifier": unit["file_row"]["archive_identifier"],
-                        "size": unit["file_row"].get("size", 0),
-                        "layout_id": lid,
-                    })
+                    if unit["is_dir"]:
+                        children = []
+                        for child in unit.get("children", []):
+                            children.append({
+                                "name": os.path.basename(child["name"]),
+                                "size": child.get("size", 0),
+                            })
+                        merged_buckets[subdir][key] = {
+                            "type": "dir_unit",
+                            "display_name": display_name,
+                            "is_dir": True,
+                            "archive_identifier": unit["file_row"]["archive_identifier"],
+                            "children": sorted(children, key=lambda c: c["name"].lower()),
+                            "layout_ids": {lid},
+                        }
+                    else:
+                        merged_buckets[subdir][key] = {
+                            "type": "file",
+                            "display_name": display_name,
+                            "is_dir": False,
+                            "archive_identifier": unit["file_row"]["archive_identifier"],
+                            "size": unit["file_row"].get("size", 0),
+                            "layout_ids": {lid},
+                        }
+
+    # ── Flatten into row list ──
+    rows = []
+    for subdir in sorted(merged_buckets.keys()):
+        bucket_entries = merged_buckets[subdir]
+        if subdir:
+            parts = [p for p in subdir.replace("\\", "/").split("/") if p]
+            depth = len(parts)
+            rows.append({
+                "type": "bucket_header",
+                "depth": depth,
+                "name": parts[-1],
+                "path": subdir,
+                "layout_ids": sorted(bucket_layout_ids[subdir]),
+                "file_count": len(bucket_entries),
+            })
+            entry_depth = depth + 1
+        else:
+            entry_depth = 1
+
+        for display_name in sorted(bucket_entries.keys(), key=str.lower):
+            entry = bucket_entries[display_name]
+            row = {k: v for k, v in entry.items() if k != "layout_ids"}
+            row["depth"] = entry_depth
+            row["layout_ids"] = sorted(entry["layout_ids"])
+            rows.append(row)
 
     return {"rows": rows, "total": len(rows)}
 

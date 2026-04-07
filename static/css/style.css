@@ -2670,16 +2670,6 @@ details[open] > .collection-archives-summary::before {
 .collection-preview-row:hover {
     background: var(--hover-bg);
 }
-.collection-preview-row.layout-header {
-    font-weight: 600;
-    font-size: 14px;
-    background: var(--bg-primary);
-    border-bottom: 1px solid var(--border);
-    height: 36px;
-    position: sticky;
-    top: 0;
-    z-index: 1;
-}
 .collection-preview-row.bucket-header {
     font-weight: 600;
     font-size: 13px;
