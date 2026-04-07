@@ -315,8 +315,12 @@ def auto_tag_archive(archive_id):
             db.add_file_tag(f["id"], "original", auto=True)
         tagged_count += 1
 
-    # Archive-level auto tags: only group membership, not file tag bubbling.
+    # Archive-level auto tags: archive identifier + group membership.
     # File tags belong to files — archive tags should describe the archive itself.
+    archive_tag = sanitise_tag(f"archive:{archive['identifier']}")
+    if archive_tag:
+        db.add_archive_tag(archive_id, archive_tag, auto=True)
+
     if archive.get("group_id"):
         groups = db.get_groups() if hasattr(db, 'get_groups') else []
         group = next((g for g in groups if g["id"] == archive["group_id"]), None)
@@ -369,7 +373,7 @@ def auto_tag_files(file_ids):
 
 
 def _refresh_archive_auto_tags(archive_id):
-    """Recompute archive-level auto tags (group tag only, no file tag bubbling)."""
+    """Recompute archive-level auto tags (archive identifier + group tag)."""
     import database as db
 
     db.clear_auto_archive_tags(archive_id)
@@ -378,7 +382,12 @@ def _refresh_archive_auto_tags(archive_id):
     if not archive:
         return
 
-    # Only group tag at archive level
+    # Archive identifier tag
+    archive_tag = sanitise_tag(f"archive:{archive['identifier']}")
+    if archive_tag:
+        db.add_archive_tag(archive_id, archive_tag, auto=True)
+
+    # Group tag
     if archive.get("group_id"):
         groups = db.get_groups() if hasattr(db, 'get_groups') else []
         group = next((g for g in groups if g["id"] == archive["group_id"]), None)

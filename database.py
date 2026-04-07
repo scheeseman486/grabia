@@ -2081,14 +2081,10 @@ def get_collection(collection_id):
         if not row:
             return None
         d = dict(row)
-        d["archive_count"] = conn.execute(
-            "SELECT COUNT(*) FROM collection_archives WHERE collection_id = ?", (collection_id,)
-        ).fetchone()[0]
         d["layout_count"] = conn.execute(
             "SELECT COUNT(*) FROM collection_layouts WHERE collection_id = ?", (collection_id,)
         ).fetchone()[0]
-        # Count total files across archives in this collection
-        d["file_count"] = _count_collection_files(conn, collection_id, d["file_scope"], d["auto_tag"])
+        d["file_count"] = _count_collection_files(conn, d["file_scope"])
         layouts = [dict(r) for r in conn.execute(
             "SELECT * FROM collection_layouts WHERE collection_id = ? ORDER BY position", (collection_id,)
         ).fetchall()]
@@ -2106,13 +2102,10 @@ def get_collections():
         for row in rows:
             d = dict(row)
             cid = d["id"]
-            d["archive_count"] = conn.execute(
-                "SELECT COUNT(*) FROM collection_archives WHERE collection_id = ?", (cid,)
-            ).fetchone()[0]
             d["layout_count"] = conn.execute(
                 "SELECT COUNT(*) FROM collection_layouts WHERE collection_id = ?", (cid,)
             ).fetchone()[0]
-            d["file_count"] = _count_collection_files(conn, cid, d["file_scope"], d["auto_tag"])
+            d["file_count"] = _count_collection_files(conn, d["file_scope"])
             d["layouts"] = [dict(r) for r in conn.execute(
                 "SELECT * FROM collection_layouts WHERE collection_id = ? ORDER BY position", (cid,)
             ).fetchall()]
@@ -2144,27 +2137,8 @@ def delete_collection(collection_id):
         conn.commit()
 
 
-def _get_collection_archive_ids(conn, collection_id, auto_tag=None):
-    """Return set of archive IDs in a collection (manual + auto-tag)."""
-    ids = set()
-    for row in conn.execute(
-        "SELECT archive_id FROM collection_archives WHERE collection_id = ?", (collection_id,)
-    ).fetchall():
-        ids.add(row[0])
-    if auto_tag:
-        for row in conn.execute(
-            "SELECT archive_id FROM archive_tags WHERE tag = ?", (auto_tag,)
-        ).fetchall():
-            ids.add(row[0])
-    return ids
-
-
-def _count_collection_files(conn, collection_id, file_scope, auto_tag):
-    """Count files matching the collection's scope across its archives."""
-    archive_ids = _get_collection_archive_ids(conn, collection_id, auto_tag)
-    if not archive_ids:
-        return 0
-    placeholders = ",".join("?" * len(archive_ids))
+def _count_collection_files(conn, file_scope):
+    """Count all files matching the given scope (no archive filtering)."""
     if file_scope == "processed":
         condition = "processing_status = 'processed'"
     elif file_scope == "downloaded":
@@ -2172,22 +2146,22 @@ def _count_collection_files(conn, collection_id, file_scope, auto_tag):
     else:  # both
         condition = "(processing_status = 'processed' OR (download_status = 'completed' AND origin = 'manifest'))"
     row = conn.execute(
-        f"SELECT COUNT(*) FROM archive_files WHERE archive_id IN ({placeholders}) AND {condition}",
-        list(archive_ids),
+        f"SELECT COUNT(*) FROM archive_files WHERE {condition}",
     ).fetchone()
     return row[0]
 
 
 def get_collection_files(collection_id):
-    """Return all files matching a collection's scope, with archive identifier."""
+    """Return all files matching a collection's scope, with archive identifier.
+
+    Collections no longer scope by archive membership — all files matching the
+    file_scope are returned. Layout segment tag filters determine which files
+    appear in a specific collection view.
+    """
     with _db() as conn:
         coll = conn.execute("SELECT * FROM collections WHERE id = ?", (collection_id,)).fetchone()
         if not coll:
             return []
-        archive_ids = _get_collection_archive_ids(conn, collection_id, coll["auto_tag"])
-        if not archive_ids:
-            return []
-        placeholders = ",".join("?" * len(archive_ids))
         scope = coll["file_scope"]
         if scope == "processed":
             condition = "af.processing_status = 'processed'"
@@ -2199,80 +2173,7 @@ def get_collection_files(collection_id):
             f"""SELECT af.*, a.identifier AS archive_identifier
                 FROM archive_files af
                 JOIN archives a ON af.archive_id = a.id
-                WHERE af.archive_id IN ({placeholders}) AND {condition}""",
-            list(archive_ids),
-        ).fetchall()
-        return [dict(r) for r in rows]
-
-
-# ── Collection-Archive relationships ──────────────────────────────────
-
-def add_archive_to_collection(collection_id, archive_id):
-    """Add an archive to a collection. Returns True if added, False if already present.
-    Raises ValueError if the archive doesn't exist."""
-    with _db() as conn:
-        # Verify the archive exists first
-        if not conn.execute("SELECT 1 FROM archives WHERE id = ?", (archive_id,)).fetchone():
-            raise ValueError(f"Archive {archive_id} not found")
-        try:
-            conn.execute(
-                "INSERT INTO collection_archives (collection_id, archive_id) VALUES (?, ?)",
-                (collection_id, archive_id),
-            )
-            conn.commit()
-            return True
-        except sqlite3.IntegrityError:
-            return False
-
-
-def remove_archive_from_collection(collection_id, archive_id):
-    """Remove an archive from a collection."""
-    with _db() as conn:
-        conn.execute(
-            "DELETE FROM collection_archives WHERE collection_id = ? AND archive_id = ?",
-            (collection_id, archive_id),
-        )
-        conn.commit()
-
-
-def get_archives_for_collection(collection_id):
-    """Return archives in a collection (manual + auto-tag), with file counts."""
-    with _db() as conn:
-        coll = conn.execute("SELECT * FROM collections WHERE id = ?", (collection_id,)).fetchone()
-        if not coll:
-            return []
-        archive_ids = _get_collection_archive_ids(conn, collection_id, coll["auto_tag"])
-        if not archive_ids:
-            return []
-        placeholders = ",".join("?" * len(archive_ids))
-        rows = conn.execute(
-            f"SELECT * FROM archives WHERE id IN ({placeholders}) ORDER BY identifier",
-            list(archive_ids),
-        ).fetchall()
-        # Check which are manual vs auto-tag
-        manual_ids = set(r[0] for r in conn.execute(
-            "SELECT archive_id FROM collection_archives WHERE collection_id = ?", (collection_id,)
-        ).fetchall())
-        result = []
-        for row in rows:
-            d = dict(row)
-            d["manual"] = d["id"] in manual_ids
-            d["file_count"] = conn.execute(
-                "SELECT COUNT(*) FROM archive_files WHERE archive_id = ?", (d["id"],)
-            ).fetchone()[0]
-            result.append(d)
-        return result
-
-
-def get_collections_for_archive(archive_id):
-    """Return collections that contain this archive (manual membership only)."""
-    with _db() as conn:
-        rows = conn.execute(
-            """SELECT c.* FROM collections c
-               JOIN collection_archives ca ON c.id = ca.collection_id
-               WHERE ca.archive_id = ?
-               ORDER BY c.position""",
-            (archive_id,),
+                WHERE {condition}""",
         ).fetchall()
         return [dict(r) for r in rows]
 

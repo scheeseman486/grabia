@@ -4419,16 +4419,10 @@
 
     async function loadArchiveTagsAndCollections(archiveId) {
         const tagsEl = $("#archive-tags");
-        const collsEl = $("#archive-collections-list");
         tagsEl.innerHTML = "";
-        collsEl.innerHTML = "";
         try {
-            const [tags, colls] = await Promise.all([
-                api("GET", `/api/archives/${archiveId}/tags`),
-                api("GET", `/api/archives/${archiveId}/collections`),
-            ]);
+            const tags = await api("GET", `/api/archives/${archiveId}/tags`);
             renderArchiveTags(tags, archiveId);
-            renderArchiveCollections(colls);
         } catch (e) {
             // Silently fail — tags are optional
         }
@@ -4469,22 +4463,6 @@
                 loadArchiveTagsAndCollections(archiveId);
             });
         });
-    }
-
-    function renderArchiveCollections(colls) {
-        const el = $("#archive-collections-list");
-        el.innerHTML = "";
-        if (colls.length === 0) {
-            el.innerHTML = '<span class="no-collections">None</span>';
-            return;
-        }
-        for (const c of colls) {
-            const chip = document.createElement("span");
-            chip.className = "collection-chip";
-            chip.textContent = c.name;
-            chip.addEventListener("click", () => openCollectionDetail(c.id));
-            el.appendChild(chip);
-        }
     }
 
     // ── Collections ────────────────────────────────────────────────────────
@@ -5690,7 +5668,6 @@
                     <span class="collection-card-scope">${esc(coll.file_scope)}</span>
                 </div>
                 <div class="collection-card-meta">
-                    <span>${coll.archive_count} archive${coll.archive_count !== 1 ? "s" : ""}</span>
                     <span>${coll.file_count} file${coll.file_count !== 1 ? "s" : ""}</span>
                     <span>${coll.layout_count} layout${coll.layout_count !== 1 ? "s" : ""}</span>
                 </div>
@@ -5756,31 +5733,6 @@
             }
         }
 
-        // Archives (collapsible)
-        const collArchives = coll.archives || [];
-        $("#collection-archives-heading").textContent = `Archives (${collArchives.length})`;
-        const archivesEl = $("#collection-archives");
-        archivesEl.innerHTML = "";
-        if (collArchives.length === 0) {
-            archivesEl.innerHTML = '<p class="empty-hint">No archives. Click "Add" to get started.</p>';
-        } else {
-            for (const a of collArchives) {
-                const div = document.createElement("div");
-                div.className = "collection-archive-item";
-                div.innerHTML = `
-                    <div class="collection-archive-info">
-                        <strong>${esc(a.title || a.identifier)}</strong>
-                        <span class="collection-archive-meta">${a.identifier} \u2022 ${a.file_count} files${!a.manual ? " \u2022 auto-tag" : ""}</span>
-                    </div>
-                    ${a.manual ? `<button class="action-btn action-btn-sm batch-btn-danger" data-remove-archive="${a.id}">Remove</button>` : ""}
-                `;
-                archivesEl.appendChild(div);
-            }
-            archivesEl.addEventListener("click", (e) => {
-                const btn = e.target.closest("[data-remove-archive]");
-                if (btn) removeArchiveFromCollection(parseInt(btn.dataset.removeArchive));
-            });
-        }
     }
 
     function closeCollectionDetail() {
@@ -6055,86 +6007,6 @@
             showPage("page-collections");
         } catch (e) {
             alert("Failed to delete: " + e.message);
-        }
-    }
-
-    // --- Add Archives Modal ---
-
-    async function openAddArchivesModal() {
-        if (!currentCollectionId) return;
-        const listEl = $("#add-archives-list");
-        const searchEl = $("#add-archives-search");
-        searchEl.value = "";
-        listEl.innerHTML = "";
-
-        // Fetch the full collection data to get all archive IDs (manual + auto-tag)
-        let collectionArchiveIds = new Set();
-        try {
-            const coll = await api("GET", `/api/collections/${currentCollectionId}`);
-            if (coll.archives) {
-                for (const a of coll.archives) collectionArchiveIds.add(a.id);
-            }
-        } catch (e) { /* proceed with empty set */ }
-
-        function render(filter = "") {
-            listEl.innerHTML = "";
-            const lf = filter.toLowerCase();
-            const currentIds = collectionArchiveIds;
-
-            for (const a of archives) {
-                if (lf && !(a.identifier || "").toLowerCase().includes(lf) && !(a.title || "").toLowerCase().includes(lf)) continue;
-                const inColl = currentIds.has(a.id);
-                const div = document.createElement("div");
-                div.className = "add-archive-item" + (inColl ? " in-collection" : "");
-                div.innerHTML = `
-                    <div class="add-archive-info">
-                        <strong>${esc(a.title || a.identifier)}</strong>
-                        <span>${a.identifier}</span>
-                    </div>
-                    ${inColl
-                        ? '<span class="add-archive-badge">Added</span>'
-                        : `<button class="action-btn action-btn-sm primary" data-add-archive="${a.id}">Add</button>`
-                    }
-                `;
-                listEl.appendChild(div);
-            }
-        }
-
-        render();
-        searchEl.addEventListener("input", () => render(searchEl.value));
-        listEl.addEventListener("click", async (e) => {
-            const btn = e.target.closest("[data-add-archive]");
-            if (!btn) return;
-            const aid = parseInt(btn.dataset.addArchive);
-            try {
-                await api("POST", `/api/collections/${currentCollectionId}/archives`, { archive_id: aid });
-                collectionArchiveIds.add(aid);
-                const item = btn.closest(".add-archive-item");
-                btn.replaceWith(Object.assign(document.createElement("span"), { className: "add-archive-badge", textContent: "Added" }));
-                if (item) item.classList.add("in-collection");
-                // Refresh detail in background
-                openCollectionDetail(currentCollectionId);
-                // Refresh archive sidebar collections if this archive is currently open
-                if (currentArchiveId === aid) loadArchiveTagsAndCollections(aid);
-            } catch (e) {
-                alert(e.message);
-            }
-        });
-        $("#modal-add-archives").classList.add("open");
-    }
-
-    function closeAddArchivesModal() {
-        $("#modal-add-archives").classList.remove("open");
-    }
-
-    async function removeArchiveFromCollection(archiveId) {
-        if (!currentCollectionId) return;
-        try {
-            await api("DELETE", `/api/collections/${currentCollectionId}/archives/${archiveId}`);
-            openCollectionDetail(currentCollectionId);
-            if (currentArchiveId === archiveId) loadArchiveTagsAndCollections(archiveId);
-        } catch (e) {
-            alert(e.message);
         }
     }
 
@@ -6818,8 +6690,6 @@
             const coll = await api("GET", `/api/collections/${currentCollectionId}`);
             openCollectionModal(coll);
         });
-        $("#btn-add-archives-to-collection").addEventListener("click", openAddArchivesModal);
-        $("#btn-add-archives-cancel").addEventListener("click", closeAddArchivesModal);
         $("#btn-add-layout").addEventListener("click", () => { editingLayoutId = null; openLayoutModal(); });
         $("#btn-layout-modal-cancel").addEventListener("click", closeLayoutModal);
         $("#btn-layout-modal-save").addEventListener("click", saveLayout);

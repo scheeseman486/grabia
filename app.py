@@ -2473,7 +2473,6 @@ def get_collection(collection_id):
     coll = db.get_collection(collection_id)
     if not coll:
         return jsonify({"error": "Collection not found"}), 404
-    coll["archives"] = db.get_archives_for_collection(collection_id)
     return jsonify(coll)
 
 
@@ -2537,47 +2536,6 @@ def reorder_collections():
     for pos, cid in enumerate(order):
         db.update_collection(cid, position=pos)
     broadcast_sse("collections_reordered", {"order": order})
-    return jsonify({"ok": True})
-
-
-# ── Collection Archives ──────────────────────────────────────────────────
-
-@app.route("/api/collections/<int:collection_id>/archives", methods=["GET"])
-@login_required
-def get_collection_archives(collection_id):
-    """Return archives in a collection."""
-    coll = db.get_collection(collection_id)
-    if not coll:
-        return jsonify({"error": "Collection not found"}), 404
-    return jsonify(db.get_archives_for_collection(collection_id))
-
-
-@app.route("/api/collections/<int:collection_id>/archives", methods=["POST"])
-@login_required
-def add_collection_archive(collection_id):
-    """Add an archive to a collection."""
-    coll = db.get_collection(collection_id)
-    if not coll:
-        return jsonify({"error": "Collection not found"}), 404
-    data = request.get_json(force=True)
-    archive_id = data.get("archive_id")
-    if not archive_id:
-        return jsonify({"error": "archive_id is required"}), 400
-    added = db.add_archive_to_collection(collection_id, archive_id)
-    if not added:
-        return jsonify({"error": "Archive already in collection"}), 409
-    updated = db.get_collection(collection_id)
-    broadcast_sse("collection_updated", updated)
-    return jsonify({"ok": True}), 201
-
-
-@app.route("/api/collections/<int:collection_id>/archives/<int:archive_id>", methods=["DELETE"])
-@login_required
-def remove_collection_archive(collection_id, archive_id):
-    """Remove an archive from a collection."""
-    db.remove_archive_from_collection(collection_id, archive_id)
-    updated = db.get_collection(collection_id)
-    broadcast_sse("collection_updated", updated)
     return jsonify({"ok": True})
 
 
@@ -2942,12 +2900,6 @@ def remove_file_tag(file_id, tag):
     db.remove_file_tag(file_id, tag)
     return jsonify(db.get_file_tags(file_id))
 
-
-@app.route("/api/archives/<int:archive_id>/collections", methods=["GET"])
-@login_required
-def get_archive_collections(archive_id):
-    """Return collections that contain this archive."""
-    return jsonify(db.get_collections_for_archive(archive_id))
 
 
 @app.route("/api/collections/settings", methods=["GET"])

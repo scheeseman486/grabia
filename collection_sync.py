@@ -360,8 +360,12 @@ def _evaluate_node_tree(layout, units, tag_lookup):
     Returns {relative_dir: [(display_name, unit), ...]}.
     """
     segments = layout.get("segments", [])
+    layout_type = layout.get("layout_type") or layout.get("type", "")
     if segments:
         return _evaluate_segments(segments, units, tag_lookup)
+    # Segment-type layouts with no segments = empty (user must add filters)
+    if layout_type == "segments":
+        return {}
 
     nodes = layout.get("nodes", [])
     if not nodes:
