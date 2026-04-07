@@ -2568,6 +2568,9 @@
         }
 
         const hasProcessedOutput = !!f.has_processed;
+        const procStatus = (f.process_queue_status === "processing" || f.process_queue_status === "queued") ? f.process_queue_status
+            : f.process_queue_status === "failed" ? "failed"
+            : hasProcessedOutput ? "processed" : "";
         const sourceDeleted = (f.downloaded === 0 && hasProcessedOutput);
         const hideQueue = isUnknown || (hasProcessedOutput && !sourceDeleted);
         if (hideQueue) {
