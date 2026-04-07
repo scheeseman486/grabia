@@ -5661,14 +5661,12 @@
             const card = document.createElement("div");
             card.className = "collection-card";
             card.dataset.id = coll.id;
-            const layoutInfo = (coll.layouts || []).map((l) => `${l.name} (${l.type})`).join(", ") || "No layouts";
+            const layoutInfo = (coll.layouts || []).map((l) => l.name).join(", ") || "No layouts";
             card.innerHTML = `
                 <div class="collection-card-header">
                     <h3 class="collection-card-title">${esc(coll.name)}</h3>
-                    <span class="collection-card-scope">${esc(coll.file_scope)}</span>
                 </div>
                 <div class="collection-card-meta">
-                    <span>${coll.file_count} file${coll.file_count !== 1 ? "s" : ""}</span>
                     <span>${coll.layout_count} layout${coll.layout_count !== 1 ? "s" : ""}</span>
                 </div>
                 <div class="collection-card-layouts">${esc(layoutInfo)}</div>
@@ -5702,12 +5700,8 @@
 
     function renderCollectionDetail(coll) {
         $("#collection-detail-title").textContent = coll.name;
-        const scopeLabel = { processed: "Processed files", downloaded: "Downloaded files", both: "All files" }[coll.file_scope] || coll.file_scope;
-        let meta = `${coll.file_count} files \u2022 ${scopeLabel}`;
-        if (coll.auto_tag) meta += ` \u2022 auto-tag: ${coll.auto_tag}`;
-        if (!coll.flatten) meta += ` \u2022 flatten: off`;
-        if (!coll.use_media_units) meta += ` \u2022 media units: off`;
-        $("#collection-detail-meta").textContent = meta;
+        const layoutCount = (coll.layouts || []).length;
+        $("#collection-detail-meta").textContent = `${layoutCount} layout${layoutCount !== 1 ? "s" : ""}`;
 
         // Layout dropdown
         currentCollectionLayouts = coll.layouts || [];
@@ -5718,10 +5712,9 @@
             currentLayoutId = null;
         } else {
             for (const layout of currentCollectionLayouts) {
-                const typeLabel = { flat: "Flat", alphabetical: "A\u2013Z", by_archive: "By Archive", segments: "Path" }[layout.type] || layout.type;
                 const opt = document.createElement("option");
                 opt.value = layout.id;
-                opt.textContent = `${layout.name} (${typeLabel})`;
+                opt.textContent = layout.name;
                 layoutSelect.appendChild(opt);
             }
             // Preserve selection or pick first
@@ -5945,10 +5938,6 @@
         editingCollectionId = coll ? coll.id : null;
         $("#modal-collection-title").textContent = coll ? "Edit Collection" : "New Collection";
         $("#collection-name-input").value = coll ? coll.name : "";
-        $("#collection-scope-input").value = coll ? coll.file_scope : "processed";
-        $("#collection-autotag-input").value = coll ? (coll.auto_tag || "") : "";
-        $("#collection-flatten-input").checked = coll ? !!coll.flatten : true;
-        $("#collection-media-units-input").checked = coll ? !!coll.use_media_units : true;
         $("#collection-modal-error").textContent = "";
         $("#modal-collection").classList.add("open");
         $("#collection-name-input").focus();
@@ -5965,13 +5954,7 @@
             $("#collection-modal-error").textContent = "Name is required.";
             return;
         }
-        const body = {
-            name,
-            file_scope: $("#collection-scope-input").value,
-            auto_tag: $("#collection-autotag-input").value.trim(),
-            flatten: $("#collection-flatten-input").checked ? 1 : 0,
-            use_media_units: $("#collection-media-units-input").checked ? 1 : 0,
-        };
+        const body = { name };
         try {
             if (editingCollectionId) {
                 await api("PUT", `/api/collections/${editingCollectionId}`, body);
@@ -6012,11 +5995,12 @@
 
     // --- Layout Modal ---
 
-    function openLayoutModal(name = "", type = "segments") {
+    function openLayoutModal(name = "", flatten = true, useMediaUnits = true) {
         const isEdit = !!editingLayoutId;
         $("#modal-layout-title").textContent = isEdit ? "Edit Layout" : "Add Layout";
         $("#layout-name-input").value = name;
-        $("#layout-type-input").value = type;
+        $("#layout-flatten-input").checked = flatten;
+        $("#layout-media-units-input").checked = useMediaUnits;
         $("#layout-modal-error").textContent = "";
         $("#modal-add-layout").classList.add("open");
         $("#layout-name-input").focus();
@@ -6034,8 +6018,11 @@
             $("#layout-modal-error").textContent = "Name is required.";
             return;
         }
-        const layoutType = $("#layout-type-input").value;
-        const body = { name, type: layoutType };
+        const body = {
+            name,
+            flatten: $("#layout-flatten-input").checked ? 1 : 0,
+            use_media_units: $("#layout-media-units-input").checked ? 1 : 0,
+        };
         try {
             let newLayout = null;
             if (editingLayoutId) {
@@ -6045,10 +6032,9 @@
             }
             closeLayoutModal();
             await openCollectionDetail(currentCollectionId);
-            // Auto-open path builder for new segment layouts
-            if (newLayout && (layoutType === "segments")) {
+            // Auto-open path builder for new layouts
+            if (newLayout) {
                 currentLayoutId = newLayout.id;
-                // Update the layout dropdown to select the new layout
                 const sel = $("#collection-layout-select");
                 if (sel) sel.value = newLayout.id;
                 openPathBuilder(newLayout.id);
@@ -6702,13 +6688,7 @@
         });
         $("#btn-edit-layout").addEventListener("click", () => {
             if (!currentLayoutId) return;
-            const layout = currentCollectionLayouts.find(l => l.id === currentLayoutId);
-            // Use path builder for segment-based or new layouts; legacy editor for old node-based
-            if (layout && (layout.type === "segments" || (layout.segments && layout.segments.length > 0))) {
-                openPathBuilder(currentLayoutId);
-            } else {
-                openLayoutEditor(currentLayoutId);
-            }
+            openPathBuilder(currentLayoutId);
         });
         $("#btn-delete-layout").addEventListener("click", async () => {
             if (!currentLayoutId || !currentCollectionId) return;

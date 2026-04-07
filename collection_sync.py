@@ -664,12 +664,7 @@ def sync_collection(collection_id):
     if not layouts:
         return {"error": "Collection has no layouts configured"}
 
-    flatten = bool(collection.get("flatten", 1))
-    use_media_units = bool(collection.get("use_media_units", 1))
-
     files = _build_file_list(collection)
-    units = _build_media_units(files, download_dir, flatten=flatten,
-                               use_media_units=use_media_units)
 
     # Build tag lookup for node-based layouts
     tag_lookup = _build_file_tag_lookup(collection_id, files=files)
@@ -683,12 +678,15 @@ def sync_collection(collection_id):
         "total_errors": 0,
     }
 
-    active_layout_dirs = set()
-
     for layout in layouts:
-        layout_name = _safe_name(layout["name"])
-        layout_dir = os.path.join(coll_dir, layout_name)
-        active_layout_dirs.add(layout_name)
+        # Each layout has its own flatten/media_units settings
+        flatten = bool(layout.get("flatten", 1))
+        use_media_units = bool(layout.get("use_media_units", 1))
+        units = _build_media_units(files, download_dir, flatten=flatten,
+                                   use_media_units=use_media_units)
+
+        # Layouts build paths directly in the collection root directory
+        layout_dir = coll_dir
 
         layout_stats = {
             "created": 0,
@@ -800,18 +798,6 @@ def sync_collection(collection_id):
         stats["total_removed"] += layout_stats["removed"]
         stats["total_errors"] += len(layout_stats["errors"])
 
-    # Remove layout directories that are no longer in the collection config
-    if os.path.isdir(coll_dir):
-        for entry in os.listdir(coll_dir):
-            entry_path = os.path.join(coll_dir, entry)
-            if os.path.isdir(entry_path) and entry not in active_layout_dirs:
-                try:
-                    shutil.rmtree(entry_path)
-                    log.info("collections", "Removed stale layout dir: %s", entry_path)
-                except OSError as e:
-                    stats["total_errors"] += 1
-                    log.error("collections", "Failed to remove stale layout dir %s: %s", entry_path, e)
-
     # If collection dir is now completely empty, remove it
     if os.path.isdir(coll_dir) and not os.listdir(coll_dir):
         try:
@@ -881,12 +867,7 @@ def preview_collection(collection_id):
     if not layouts:
         return {"rows": [], "total": 0}
 
-    flatten = bool(collection.get("flatten", 1))
-    use_media_units = bool(collection.get("use_media_units", 1))
-
     files = _build_file_list(collection)
-    units = _build_media_units(files, download_dir, flatten=flatten,
-                               use_media_units=use_media_units)
 
     # Build tag lookup for node-based layouts
     tag_lookup = _build_file_tag_lookup(collection_id, files=files)
@@ -895,6 +876,11 @@ def preview_collection(collection_id):
 
     for layout in layouts:
         lid = layout["id"]
+        # Each layout has its own flatten/media_units settings
+        flatten = bool(layout.get("flatten", 1))
+        use_media_units = bool(layout.get("use_media_units", 1))
+        units = _build_media_units(files, download_dir, flatten=flatten,
+                                   use_media_units=use_media_units)
         mapping = _evaluate_node_tree(layout, units, tag_lookup)
         _resolve_conflicts(mapping)
 

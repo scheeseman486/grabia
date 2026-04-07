@@ -2481,20 +2481,13 @@ def get_collections():
 @app.route("/api/collections", methods=["POST"])
 @login_required
 def create_collection():
-    """Create a new collection."""
+    """Create a new collection (name only — all other options are per-layout)."""
     data = request.get_json(force=True)
     name = data.get("name", "").strip()
     if not name:
         return jsonify({"error": "Name is required"}), 400
-    file_scope = data.get("file_scope", "processed")
-    if file_scope not in ("processed", "downloaded", "both"):
-        return jsonify({"error": "Invalid file_scope"}), 400
-    auto_tag = data.get("auto_tag", "").strip() or None
-    flatten = int(data.get("flatten", 1))
-    use_media_units = int(data.get("use_media_units", 1))
     try:
-        coll = db.create_collection(name, file_scope=file_scope, auto_tag=auto_tag,
-                                    flatten=flatten, use_media_units=use_media_units)
+        coll = db.create_collection(name)
     except Exception as e:
         if "UNIQUE" in str(e):
             return jsonify({"error": "A collection with that name already exists"}), 409
@@ -2516,7 +2509,7 @@ def get_collection(collection_id):
 @app.route("/api/collections/<int:collection_id>", methods=["PUT"])
 @login_required
 def update_collection(collection_id):
-    """Update a collection's name, file_scope, or auto_tag."""
+    """Update a collection's name or position."""
     coll = db.get_collection(collection_id)
     if not coll:
         return jsonify({"error": "Collection not found"}), 404
@@ -2527,18 +2520,8 @@ def update_collection(collection_id):
         if not name:
             return jsonify({"error": "Name cannot be empty"}), 400
         kwargs["name"] = name
-    if "file_scope" in data:
-        if data["file_scope"] not in ("processed", "downloaded", "both"):
-            return jsonify({"error": "Invalid file_scope"}), 400
-        kwargs["file_scope"] = data["file_scope"]
-    if "auto_tag" in data:
-        kwargs["auto_tag"] = data["auto_tag"].strip() or None
     if "position" in data:
         kwargs["position"] = int(data["position"])
-    if "flatten" in data:
-        kwargs["flatten"] = int(data["flatten"])
-    if "use_media_units" in data:
-        kwargs["use_media_units"] = int(data["use_media_units"])
     if kwargs:
         try:
             db.update_collection(collection_id, **kwargs)
@@ -2588,7 +2571,7 @@ def get_collection_layouts(collection_id):
 @app.route("/api/collections/<int:collection_id>/layouts", methods=["POST"])
 @login_required
 def add_collection_layout(collection_id):
-    """Add a layout to a collection."""
+    """Add a layout to a collection (always segments type)."""
     coll = db.get_collection(collection_id)
     if not coll:
         return jsonify({"error": "Collection not found"}), 404
@@ -2596,10 +2579,9 @@ def add_collection_layout(collection_id):
     name = data.get("name", "").strip()
     if not name:
         return jsonify({"error": "Layout name is required"}), 400
-    layout_type = data.get("type", "segments")
-    if layout_type not in ("flat", "alphabetical", "by_archive", "segments"):
-        return jsonify({"error": "Invalid layout type"}), 400
-    layout = db.add_collection_layout(collection_id, name, layout_type=layout_type)
+    flatten = int(data.get("flatten", 1))
+    use_media_units = int(data.get("use_media_units", 1))
+    layout = db.add_collection_layout(collection_id, name, flatten=flatten, use_media_units=use_media_units)
     updated = db.get_collection(collection_id)
     broadcast_sse("collection_updated", updated)
     return jsonify(layout), 201
@@ -2616,12 +2598,12 @@ def update_collection_layout(collection_id, layout_id):
         if not name:
             return jsonify({"error": "Layout name cannot be empty"}), 400
         kwargs["name"] = name
-    if "type" in data:
-        if data["type"] not in ("flat", "alphabetical", "by_archive", "segments"):
-            return jsonify({"error": "Invalid layout type"}), 400
-        kwargs["type"] = data["type"]
     if "position" in data:
         kwargs["position"] = int(data["position"])
+    if "flatten" in data:
+        kwargs["flatten"] = int(data["flatten"])
+    if "use_media_units" in data:
+        kwargs["use_media_units"] = int(data["use_media_units"])
     if kwargs:
         db.update_collection_layout(layout_id, **kwargs)
     updated = db.get_collection(collection_id)

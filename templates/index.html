@@ -585,27 +585,6 @@
             <label>Name
                 <input type="text" id="collection-name-input" placeholder="e.g. Xbox, PS1, SNES…">
             </label>
-            <label>File Scope
-                <select id="collection-scope-input">
-                    <option value="processed">Processed files only</option>
-                    <option value="downloaded">Downloaded files only</option>
-                    <option value="both">Both</option>
-                </select>
-            </label>
-            <label>Auto-tag <span class="label-hint">(optional — automatically include archives with this tag)</span>
-                <input type="text" id="collection-autotag-input" placeholder="e.g. xbox">
-            </label>
-            <div class="collection-modal-overrides">
-                <h4>Library Overrides</h4>
-                <label class="checkbox-label">
-                    <input type="checkbox" id="collection-flatten-input" checked>
-                    Flatten filenames <span class="label-hint">(strip subdirectory prefixes from symlinks)</span>
-                </label>
-                <label class="checkbox-label">
-                    <input type="checkbox" id="collection-media-units-input" checked>
-                    Group media units <span class="label-hint">(symlink multi-file media as directories)</span>
-                </label>
-            </div>
             <div class="modal-error" id="collection-modal-error"></div>
             <div class="modal-actions">
                 <button class="action-btn" id="btn-collection-modal-cancel">Cancel</button>
@@ -621,13 +600,13 @@
             <label>Name
                 <input type="text" id="layout-name-input" placeholder="e.g. All, A-Z, By Archive…">
             </label>
-            <label>Type
-                <select id="layout-type-input">
-                    <option value="segments">Path builder — customizable with tags</option>
-                    <option value="flat">Flat — all files in one directory</option>
-                    <option value="alphabetical">Alphabetical — files sorted A-Z</option>
-                    <option value="by_archive">By Archive — grouped by source archive</option>
-                </select>
+            <label class="checkbox-label">
+                <input type="checkbox" id="layout-flatten-input" checked>
+                Flatten filenames <span class="label-hint">(strip subdirectory prefixes from symlinks)</span>
+            </label>
+            <label class="checkbox-label">
+                <input type="checkbox" id="layout-media-units-input" checked>
+                Group media units <span class="label-hint">(symlink multi-file media as directories)</span>
             </label>
             <div class="modal-error" id="layout-modal-error"></div>
             <div class="modal-actions">

@@ -733,6 +733,9 @@ def init_db():
     # Migrate legacy layouts (flat/alphabetical/by_archive) to segment-based
     _migrate_legacy_layouts_to_segments(conn)
 
+    # Migration: move flatten/use_media_units from collections to layouts
+    _migrate_collection_options_to_layouts(conn)
+
     conn.commit()
     conn.close()
 
@@ -773,6 +776,70 @@ def _migrate_legacy_layouts_to_segments(conn):
 
         # Update type to 'segments'
         conn.execute("UPDATE collection_layouts SET type = 'segments' WHERE id = ?", (lid,))
+
+
+def _migrate_collection_options_to_layouts(conn):
+    """Move flatten/use_media_units from collections to layout-level columns.
+
+    Also auto-migrates file_scope into tag filter segments:
+      - processed → adds a 'tag_filter' segment for 'processed'
+      - downloaded → adds a 'tag_filter' segment for 'original'
+    """
+    # Add columns to collection_layouts if missing
+    try:
+        conn.execute("SELECT flatten FROM collection_layouts LIMIT 1")
+    except sqlite3.OperationalError:
+        conn.execute("ALTER TABLE collection_layouts ADD COLUMN flatten INTEGER NOT NULL DEFAULT 1")
+        conn.execute("ALTER TABLE collection_layouts ADD COLUMN use_media_units INTEGER NOT NULL DEFAULT 1")
+
+        # Copy values from each collection to its layouts
+        colls = conn.execute("SELECT id, flatten, use_media_units FROM collections").fetchall()
+        for c in colls:
+            conn.execute(
+                "UPDATE collection_layouts SET flatten = ?, use_media_units = ? WHERE collection_id = ?",
+                (c["flatten"], c["use_media_units"], c["id"]),
+            )
+
+    # Auto-migrate file_scope to tag filter segments.
+    # Only run once: check if any collection still has a non-'both' scope.
+    colls_with_scope = conn.execute(
+        "SELECT id, file_scope FROM collections WHERE file_scope != 'both'"
+    ).fetchall()
+    for c in colls_with_scope:
+        scope = c["file_scope"]
+        cid = c["id"]
+        # Map scope to a tag filter value
+        if scope == "processed":
+            tag_val = "processed"
+        elif scope == "downloaded":
+            tag_val = "original"
+        else:
+            continue
+
+        # Add a tag_filter segment to each layout in this collection (if not already present)
+        layouts = conn.execute(
+            "SELECT id FROM collection_layouts WHERE collection_id = ?", (cid,)
+        ).fetchall()
+        for layout in layouts:
+            lid = layout["id"]
+            already = conn.execute(
+                "SELECT 1 FROM collection_layout_segments WHERE layout_id = ? AND segment_type = 'tag_filter' AND segment_value = ? LIMIT 1",
+                (lid, tag_val),
+            ).fetchone()
+            if not already:
+                # Insert at position 0 (before other segments)
+                conn.execute(
+                    "UPDATE collection_layout_segments SET position = position + 1 WHERE layout_id = ?",
+                    (lid,),
+                )
+                conn.execute(
+                    "INSERT INTO collection_layout_segments (layout_id, position, segment_type, segment_value, visible, include_untagged) "
+                    "VALUES (?, 0, 'tag_filter', ?, 0, 0)",
+                    (lid, tag_val),
+                )
+
+        # Reset file_scope to 'both' (now handled by segments)
+        conn.execute("UPDATE collections SET file_scope = 'both' WHERE id = ?", (cid,))
 
 
 # --- Settings ---
@@ -2068,20 +2135,20 @@ def count_pending_processing_jobs():
 
 # ── Collections ──────────────────────────────────────────────────────────
 
-def create_collection(name, file_scope="processed", auto_tag=None, flatten=1, use_media_units=1):
+def create_collection(name):
     """Create a new collection. Returns the new collection dict."""
     with _db() as conn:
         pos = conn.execute("SELECT COALESCE(MAX(position), -1) + 1 FROM collections").fetchone()[0]
         cur = conn.execute(
-            "INSERT INTO collections (name, file_scope, auto_tag, position, created_at, flatten, use_media_units) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (name, file_scope, auto_tag or None, pos, time.time(), flatten, use_media_units),
+            "INSERT INTO collections (name, file_scope, position, created_at) VALUES (?, 'both', ?, ?)",
+            (name, pos, time.time()),
         )
         conn.commit()
         return get_collection(cur.lastrowid)
 
 
 def get_collection(collection_id):
-    """Return a single collection dict with archive/layout counts, or None."""
+    """Return a single collection dict with layout counts, or None."""
     with _db() as conn:
         row = conn.execute("SELECT * FROM collections WHERE id = ?", (collection_id,)).fetchone()
         if not row:
@@ -2090,7 +2157,6 @@ def get_collection(collection_id):
         d["layout_count"] = conn.execute(
             "SELECT COUNT(*) FROM collection_layouts WHERE collection_id = ?", (collection_id,)
         ).fetchone()[0]
-        d["file_count"] = _count_collection_files(conn, d["file_scope"])
         layouts = [dict(r) for r in conn.execute(
             "SELECT * FROM collection_layouts WHERE collection_id = ? ORDER BY position", (collection_id,)
         ).fetchall()]
@@ -2106,12 +2172,6 @@ def get_collections():
         rows = conn.execute("SELECT * FROM collections ORDER BY position").fetchall()
         if not rows:
             return []
-
-        # Pre-compute file counts for each scope in one pass (avoids N full-table scans)
-        _file_count_cache = {}
-        scopes_needed = set(r["file_scope"] for r in rows)
-        for scope in scopes_needed:
-            _file_count_cache[scope] = _count_collection_files(conn, scope)
 
         # Batch-load layout counts and layouts for all collections in two queries
         cids = [r["id"] for r in rows]
@@ -2136,15 +2196,14 @@ def get_collections():
             d = dict(row)
             cid = d["id"]
             d["layout_count"] = layout_counts.get(cid, 0)
-            d["file_count"] = _file_count_cache[d["file_scope"]]
             d["layouts"] = layouts_by_cid.get(cid, [])
             result.append(d)
         return result
 
 
 def update_collection(collection_id, **kwargs):
-    """Update collection fields. Accepted keys: name, file_scope, auto_tag, position, flatten, use_media_units."""
-    allowed = {"name", "file_scope", "auto_tag", "position", "flatten", "use_media_units"}
+    """Update collection fields. Accepted keys: name, position."""
+    allowed = {"name", "position"}
     updates = []
     params = []
     for key, val in kwargs.items():
@@ -2166,43 +2225,20 @@ def delete_collection(collection_id):
         conn.commit()
 
 
-def _count_collection_files(conn, file_scope):
-    """Count all files matching the given scope (no archive filtering)."""
-    if file_scope == "processed":
-        condition = "processing_status = 'processed'"
-    elif file_scope == "downloaded":
-        condition = "download_status = 'completed' AND origin = 'manifest'"
-    else:  # both
-        condition = "(processing_status = 'processed' OR (download_status = 'completed' AND origin = 'manifest'))"
-    row = conn.execute(
-        f"SELECT COUNT(*) FROM archive_files WHERE {condition}",
-    ).fetchone()
-    return row[0]
-
 
 def get_collection_files(collection_id):
-    """Return all files matching a collection's scope, with archive identifier.
+    """Return all completed/processed files with archive identifier.
 
-    Collections no longer scope by archive membership — all files matching the
-    file_scope are returned. Layout segment tag filters determine which files
-    appear in a specific collection view.
+    File scope filtering is now handled by layout tag segments, so this
+    returns all files that are either processed or downloaded originals.
     """
     with _db() as conn:
-        coll = conn.execute("SELECT * FROM collections WHERE id = ?", (collection_id,)).fetchone()
-        if not coll:
-            return []
-        scope = coll["file_scope"]
-        if scope == "processed":
-            condition = "af.processing_status = 'processed'"
-        elif scope == "downloaded":
-            condition = "af.download_status = 'completed' AND af.origin = 'manifest'"
-        else:
-            condition = "(af.processing_status = 'processed' OR (af.download_status = 'completed' AND af.origin = 'manifest'))"
         rows = conn.execute(
-            f"""SELECT af.*, a.identifier AS archive_identifier
-                FROM archive_files af
-                JOIN archives a ON af.archive_id = a.id
-                WHERE {condition}""",
+            """SELECT af.*, a.identifier AS archive_identifier
+               FROM archive_files af
+               JOIN archives a ON af.archive_id = a.id
+               WHERE af.processing_status = 'processed'
+                  OR (af.download_status = 'completed' AND af.origin = 'manifest')""",
         ).fetchall()
         return [dict(r) for r in rows]
 
@@ -2381,30 +2417,24 @@ def get_archive_files_all(archive_id):
 
 # ── Collection Layouts ────────────────────────────────────────────────
 
-def add_collection_layout(collection_id, name, layout_type="flat"):
-    """Add a layout to a collection with an auto-created root node. Returns the new layout dict."""
+def add_collection_layout(collection_id, name, flatten=1, use_media_units=1):
+    """Add a segments layout to a collection with an auto-created root node. Returns the new layout dict."""
     with _db() as conn:
         pos = conn.execute(
             "SELECT COALESCE(MAX(position), -1) + 1 FROM collection_layouts WHERE collection_id = ?",
             (collection_id,),
         ).fetchone()[0]
         cur = conn.execute(
-            "INSERT INTO collection_layouts (collection_id, name, type, position) VALUES (?, ?, ?, ?)",
-            (collection_id, name, layout_type, pos),
+            "INSERT INTO collection_layouts (collection_id, name, type, position, flatten, use_media_units) VALUES (?, ?, 'segments', ?, ?, ?)",
+            (collection_id, name, pos, flatten, use_media_units),
         )
         layout_id = cur.lastrowid
-        # Create root node based on layout type
-        if layout_type == "alphabetical":
-            node_type, sort_mode, tag_filter = "alphabetical", "flat", None
-        elif layout_type == "by_archive":
-            node_type, sort_mode, tag_filter = "tag_parent", "flat", "archive"
-        else:
-            node_type, sort_mode, tag_filter = "all", "flat", None
+        # Create root node for segments layout
         conn.execute(
             """INSERT INTO collection_layout_nodes
                (layout_id, parent_id, position, name, type, tag_filter, sort_mode)
-               VALUES (?, NULL, 0, 'Root', ?, ?, ?)""",
-            (layout_id, node_type, tag_filter, sort_mode),
+               VALUES (?, NULL, 0, 'Root', 'all', NULL, 'flat')""",
+            (layout_id,),
         )
         conn.commit()
         row = conn.execute("SELECT * FROM collection_layouts WHERE id = ?", (layout_id,)).fetchone()
@@ -2412,8 +2442,8 @@ def add_collection_layout(collection_id, name, layout_type="flat"):
 
 
 def update_collection_layout(layout_id, **kwargs):
-    """Update layout fields. Accepted keys: name, type, position."""
-    allowed = {"name", "type", "position"}
+    """Update layout fields. Accepted keys: name, position, flatten, use_media_units."""
+    allowed = {"name", "position", "flatten", "use_media_units"}
     updates = []
     params = []
     for key, val in kwargs.items():
