@@ -2359,9 +2359,8 @@
      *   { type: "file",      file, depth, processedPath?, processedExpanded? }
      *   { type: "divider" }
      *
-     * Processed files are merged with their .processed folder — the file row itself
-     * becomes expandable (with chevron + folder icon).  Processed children appear
-     * directly after the file row when expanded.
+     * Files with processed outputs become expandable (with chevron + folder icon).
+     * Processed children appear directly after the file row when expanded.
      */
     function vsFlattenTree(tree, isPriority) {
         const rows = [];
@@ -2519,7 +2518,7 @@
     }
 
     /**
-     * Build a processed-file <tr> (file inside a .processed folder).
+     * Build a processed-file <tr> (processed output of a source file).
      * desc = { type: "pfile", name, size, mtime, ppath, depth }
      */
     function buildProcessedFileRow(desc) {

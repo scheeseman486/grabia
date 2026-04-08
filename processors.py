@@ -1516,12 +1516,8 @@ class ExtractProcessor(BaseProcessor):
             if not extracted:
                 return {"skipped": True, "reason": "Archive is empty"}
 
-            # Determine output location:
-            # Extract into a .processed subfolder named after the source archive.
-            # This keeps processed contents grouped and visually distinct in the file list.
-            archive_basename = os.path.basename(file_path)  # e.g. "archive.zip"
-            dest_dir = os.path.join(download_dir, archive_basename + ".processed")
-            os.makedirs(dest_dir, exist_ok=True)
+            # Output directly into the flat processed directory
+            os.makedirs(download_dir, exist_ok=True)
 
             created = []
             all_relative = []  # paths relative to download_dir for DB tracking
@@ -1533,10 +1529,6 @@ class ExtractProcessor(BaseProcessor):
                     current=i + 1,
                     total=len(extracted),
                 )
-                # Validate source stays in temp_dir and dest stays in dest_dir
-                if _safe_relpath(rel, temp_dir) is None or _safe_relpath(rel, dest_dir) is None:
-                    log.warning("extract", "Skipping unsafe extracted path: %s", rel)
-                    continue
                 src = os.path.join(temp_dir, rel)
                 if not os.path.isfile(src):
                     continue
@@ -1545,22 +1537,31 @@ class ExtractProcessor(BaseProcessor):
                     log.warning("extract", "Skipping symlink in extraction: %s", rel)
                     continue
 
-                # Preserve subdirectory structure from the archive
-                dest = os.path.join(dest_dir, rel)
-                os.makedirs(os.path.dirname(dest), exist_ok=True)
+                # Flatten into download_dir (use basename only to avoid
+                # recreating archive subdirectory structure)
+                dest_name = os.path.basename(rel)
+                dest = os.path.join(download_dir, dest_name)
+                # Handle name collisions by appending a suffix
+                if os.path.exists(dest):
+                    stem, ext = os.path.splitext(dest_name)
+                    n = 1
+                    while os.path.exists(dest):
+                        dest_name = f"{stem}_{n}{ext}"
+                        dest = os.path.join(download_dir, dest_name)
+                        n += 1
                 shutil.move(src, dest)
                 created.append(dest)
-                all_relative.append(os.path.relpath(dest, download_dir))
+                all_relative.append(dest_name)
 
             if not created:
                 return {"skipped": True, "reason": "No files extracted"}
 
-            # Primary display name: always the .processed folder
-            processed_filename = archive_basename + ".processed" + os.sep
+            # Primary output is the first extracted file
+            processed_filename = all_relative[0]
 
             return {
                 "processed_filename": processed_filename,
-                "processed_files": all_relative,
+                "processed_files": all_relative if len(all_relative) > 1 else None,
                 "files_created": created,
                 "files_to_delete": [file_path],
                 "skipped": False,
