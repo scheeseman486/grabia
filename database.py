@@ -78,7 +78,11 @@ def init_db():
             status_pct INTEGER DEFAULT NULL,
             added_at REAL NOT NULL,
             server TEXT NOT NULL DEFAULT '',
-            dir TEXT NOT NULL DEFAULT ''
+            dir TEXT NOT NULL DEFAULT '',
+            group_id INTEGER DEFAULT NULL REFERENCES archive_groups(id) ON DELETE SET NULL,
+            processing_profile_id INTEGER DEFAULT NULL REFERENCES processing_profiles(id) ON DELETE SET NULL,
+            manifest_json TEXT DEFAULT NULL,
+            manifest_fetched_at REAL DEFAULT NULL
         );
 
         CREATE TABLE IF NOT EXISTS archive_files (
@@ -99,6 +103,14 @@ def init_db():
             change_detail TEXT NOT NULL DEFAULT '',
             queue_position INTEGER DEFAULT NULL,
             downloaded INTEGER NOT NULL DEFAULT 0,
+            origin TEXT NOT NULL DEFAULT 'manifest',
+            processing_status TEXT NOT NULL DEFAULT '',
+            processed_filename TEXT NOT NULL DEFAULT '',
+            processor_type TEXT NOT NULL DEFAULT '',
+            processing_error TEXT NOT NULL DEFAULT '',
+            processed_files_json TEXT NOT NULL DEFAULT '',
+            process_queue_status TEXT NOT NULL DEFAULT '',
+            media_root TEXT NOT NULL DEFAULT '',
             FOREIGN KEY (archive_id) REFERENCES archives(id) ON DELETE CASCADE,
             UNIQUE(archive_id, name)
         );
@@ -201,8 +213,10 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             collection_id INTEGER NOT NULL,
             name TEXT NOT NULL,
-            type TEXT NOT NULL DEFAULT 'flat',
+            type TEXT NOT NULL DEFAULT 'segments',
             position INTEGER NOT NULL DEFAULT 0,
+            flatten INTEGER NOT NULL DEFAULT 1,
+            use_media_units INTEGER NOT NULL DEFAULT 1,
             FOREIGN KEY (collection_id) REFERENCES collections(id) ON DELETE CASCADE
         );
 
@@ -329,343 +343,19 @@ def init_db():
             "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
             (key, value),
         )
-    # Migrations for existing databases
-    try:
-        conn.execute("SELECT change_status FROM archive_files LIMIT 1")
-    except sqlite3.OperationalError:
-        conn.execute("ALTER TABLE archive_files ADD COLUMN change_status TEXT NOT NULL DEFAULT ''")
-        conn.execute("ALTER TABLE archive_files ADD COLUMN change_detail TEXT NOT NULL DEFAULT ''")
-
-    # download_priority column is deprecated (replaced by queue_position).
-    # Existing databases may still have it — that's fine, it's simply unused.
-    # We no longer create it for new databases.
-
-    try:
-        conn.execute("SELECT group_id FROM archives LIMIT 1")
-    except sqlite3.OperationalError:
-        conn.execute("ALTER TABLE archives ADD COLUMN group_id INTEGER DEFAULT NULL REFERENCES archive_groups(id) ON DELETE SET NULL")
-
-    try:
-        conn.execute("SELECT origin FROM archive_files LIMIT 1")
-    except sqlite3.OperationalError:
-        conn.execute("ALTER TABLE archive_files ADD COLUMN origin TEXT NOT NULL DEFAULT 'manifest'")
-
-    # Processing pipeline columns on archive_files
-    try:
-        conn.execute("SELECT processing_status FROM archive_files LIMIT 1")
-    except sqlite3.OperationalError:
-        conn.execute("ALTER TABLE archive_files ADD COLUMN processing_status TEXT NOT NULL DEFAULT ''")
-        conn.execute("ALTER TABLE archive_files ADD COLUMN processed_filename TEXT NOT NULL DEFAULT ''")
-        conn.execute("ALTER TABLE archive_files ADD COLUMN processor_type TEXT NOT NULL DEFAULT ''")
-        conn.execute("ALTER TABLE archive_files ADD COLUMN processing_error TEXT NOT NULL DEFAULT ''")
-
-    # Multi-file processing output tracking (e.g. extraction)
-    try:
-        conn.execute("SELECT processed_files_json FROM archive_files LIMIT 1")
-    except sqlite3.OperationalError:
-        conn.execute("ALTER TABLE archive_files ADD COLUMN processed_files_json TEXT NOT NULL DEFAULT ''")
-
-    # Processing profile FK on archives
-    try:
-        conn.execute("SELECT processing_profile_id FROM archives LIMIT 1")
-    except sqlite3.OperationalError:
-        conn.execute("ALTER TABLE archives ADD COLUMN processing_profile_id INTEGER DEFAULT NULL REFERENCES processing_profiles(id) ON DELETE SET NULL")
-
-    # Add job_id to notifications for "View Log" linkage
-    try:
-        conn.execute("SELECT job_id FROM notifications LIMIT 1")
-    except sqlite3.OperationalError:
-        conn.execute("ALTER TABLE notifications ADD COLUMN job_id INTEGER DEFAULT NULL")
-
-    # --- Queue overhaul migrations ---
-
-    # Add queue_position column (replaces queued + download_priority)
-    try:
-        conn.execute("SELECT queue_position FROM archive_files LIMIT 1")
-    except sqlite3.OperationalError:
-        conn.execute("ALTER TABLE archive_files ADD COLUMN queue_position INTEGER DEFAULT NULL")
-        # Migrate from old queued + download_priority system if the columns exist
-        has_download_priority = False
-        try:
-            conn.execute("SELECT download_priority FROM archive_files LIMIT 1")
-            has_download_priority = True
-        except sqlite3.OperationalError:
-            pass
-        if has_download_priority:
-            conn.execute("""
-                UPDATE archive_files SET queue_position = (
-                    SELECT rn FROM (
-                        SELECT af.id,
-                               ROW_NUMBER() OVER (
-                                   ORDER BY a.position ASC, af.download_priority ASC
-                               ) AS rn
-                        FROM archive_files af
-                        JOIN archives a ON af.archive_id = a.id
-                        WHERE af.queued = 1
-                          AND af.download_status NOT IN ('downloaded', 'conflict')
-                    ) AS t
-                    WHERE t.id = archive_files.id
-                )
-                WHERE queued = 1
-                  AND download_status NOT IN ('downloaded', 'conflict')
-            """)
-            log.info("Migrated queued files to queue_position column")
-
-    # Add downloaded boolean column
-    try:
-        conn.execute("SELECT downloaded FROM archive_files LIMIT 1")
-    except sqlite3.OperationalError:
-        conn.execute("ALTER TABLE archive_files ADD COLUMN downloaded INTEGER NOT NULL DEFAULT 0")
-        # Migrate: set downloaded=1 for all completed files
-        conn.execute("UPDATE archive_files SET downloaded = 1 WHERE download_status = 'completed'")
-        log.info("Migrated downloaded column from download_status")
-
-    # Migration: drop queued and download_batch_id columns (replaced by queue_position)
-    try:
-        conn.execute("SELECT queued FROM archive_files LIMIT 1")
-        # Column exists — need to rebuild table to drop it
-        log.info("Dropping legacy 'queued' and 'download_batch_id' columns from archive_files")
-        conn.execute("PRAGMA foreign_keys=OFF")
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS archive_files_new (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                archive_id INTEGER NOT NULL,
-                name TEXT NOT NULL,
-                size INTEGER NOT NULL DEFAULT 0,
-                md5 TEXT NOT NULL DEFAULT '',
-                sha1 TEXT NOT NULL DEFAULT '',
-                format TEXT NOT NULL DEFAULT '',
-                source TEXT NOT NULL DEFAULT '',
-                mtime TEXT NOT NULL DEFAULT '',
-                download_status TEXT NOT NULL DEFAULT 'pending',
-                downloaded_bytes INTEGER NOT NULL DEFAULT 0,
-                error_message TEXT NOT NULL DEFAULT '',
-                retry_count INTEGER NOT NULL DEFAULT 0,
-                change_status TEXT NOT NULL DEFAULT '',
-                change_detail TEXT NOT NULL DEFAULT '',
-                queue_position INTEGER DEFAULT NULL,
-                downloaded INTEGER NOT NULL DEFAULT 0,
-                origin TEXT NOT NULL DEFAULT 'manifest',
-                processing_status TEXT NOT NULL DEFAULT '',
-                processed_filename TEXT NOT NULL DEFAULT '',
-                processor_type TEXT NOT NULL DEFAULT '',
-                processing_error TEXT NOT NULL DEFAULT '',
-                processed_files_json TEXT NOT NULL DEFAULT '',
-                FOREIGN KEY (archive_id) REFERENCES archives(id) ON DELETE CASCADE,
-                UNIQUE(archive_id, name)
-            )
-        """)
-        conn.execute("""
-            INSERT INTO archive_files_new (id, archive_id, name, size, md5, sha1, format, source, mtime,
-                download_status, downloaded_bytes, error_message, retry_count, change_status, change_detail,
-                queue_position, downloaded, origin, processing_status, processed_filename, processor_type,
-                processing_error, processed_files_json)
-            SELECT id, archive_id, name, size, md5, sha1, format, source, mtime,
-                download_status, downloaded_bytes, error_message, retry_count, change_status, change_detail,
-                queue_position, downloaded, origin, processing_status, processed_filename, processor_type,
-                processing_error, processed_files_json
-            FROM archive_files
-        """)
-        conn.execute("DROP TABLE archive_files")
-        conn.execute("ALTER TABLE archive_files_new RENAME TO archive_files")
-        conn.execute("PRAGMA foreign_keys=ON")
-        conn.commit()
-        log.info("Dropped 'queued' and 'download_batch_id' columns successfully")
-    except sqlite3.OperationalError:
-        pass  # Column already gone
-
-    # Migration: drop batches table and rebuild scan_queue if it still references it
-    conn.execute("DROP TABLE IF EXISTS batches")
-    # scan_queue may have been created with FK to batches — rebuild without it
-    try:
-        schema = conn.execute(
-            "SELECT sql FROM sqlite_master WHERE type='table' AND name='scan_queue'"
-        ).fetchone()
-        if schema and "batches" in (schema[0] or ""):
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS scan_queue_new (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    file_id INTEGER NOT NULL REFERENCES archive_files(id) ON DELETE CASCADE,
-                    archive_id INTEGER NOT NULL,
-                    batch_id INTEGER DEFAULT NULL,
-                    status TEXT NOT NULL DEFAULT 'pending',
-                    position INTEGER NOT NULL DEFAULT 0,
-                    created_at REAL NOT NULL
-                )
-            """)
-            conn.execute("""
-                INSERT INTO scan_queue_new (id, file_id, archive_id, batch_id, status, position, created_at)
-                SELECT id, file_id, archive_id, batch_id, status, position, created_at FROM scan_queue
-            """)
-            conn.execute("DROP TABLE scan_queue")
-            conn.execute("ALTER TABLE scan_queue_new RENAME TO scan_queue")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_scan_queue_status ON scan_queue(status, position)")
-            conn.commit()
-    except sqlite3.OperationalError:
-        pass
-
-    # Migration: add status_pct column to archives
-    try:
-        conn.execute("SELECT status_pct FROM archives LIMIT 1")
-    except sqlite3.OperationalError:
-        conn.execute("ALTER TABLE archives ADD COLUMN status_pct INTEGER DEFAULT NULL")
-
-    # Migration: drop position column from archives (no longer used)
-    try:
-        conn.execute("SELECT position FROM archives LIMIT 1")
-        # Column exists — just leave it for now (harmless), avoid table rebuild
-        # The column is simply ignored; removing it would require a full table rebuild
-    except sqlite3.OperationalError:
-        pass
-
-    # Migration: rename old status values to new ones
-    conn.execute("UPDATE archives SET status = 'complete' WHERE status = 'completed'")
-    conn.execute("UPDATE archives SET status = 'error' WHERE status = 'failed'")
-
-    # Migration: drop legacy notification columns (progress, scan_archive_id,
-    # processing_archive_id, adding_archive) — replaced by flash notifications.
-    try:
-        conn.execute("SELECT progress FROM notifications LIMIT 1")
-        # Old columns exist — rebuild the table to drop them
-        log.info("Dropping legacy columns from notifications table")
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS notifications_new (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                message TEXT NOT NULL,
-                type TEXT NOT NULL DEFAULT 'info',
-                created_at REAL NOT NULL,
-                dismissed INTEGER NOT NULL DEFAULT 0,
-                job_id INTEGER DEFAULT NULL
-            )
-        """)
-        conn.execute("""
-            INSERT INTO notifications_new (id, message, type, created_at, dismissed, job_id)
-            SELECT id, message, type, created_at, dismissed, job_id
-            FROM notifications
-        """)
-        conn.execute("DROP TABLE notifications")
-        conn.execute("ALTER TABLE notifications_new RENAME TO notifications")
-        conn.commit()
-        log.info("Dropped legacy notification columns successfully")
-    except sqlite3.OperationalError:
-        pass  # Columns already gone (fresh DB or already migrated)
-
-    # Migration: add job_id to notifications if missing (fresh DBs created before it was in schema)
-    try:
-        conn.execute("SELECT job_id FROM notifications LIMIT 1")
-    except sqlite3.OperationalError:
-        conn.execute("ALTER TABLE notifications ADD COLUMN job_id INTEGER DEFAULT NULL")
-        conn.commit()
-
-    # Migration: add file_id and archive_id to notifications for clickable error notifications
-    try:
-        conn.execute("SELECT file_id FROM notifications LIMIT 1")
-    except sqlite3.OperationalError:
-        conn.execute("ALTER TABLE notifications ADD COLUMN file_id INTEGER DEFAULT NULL")
-        conn.execute("ALTER TABLE notifications ADD COLUMN archive_id INTEGER DEFAULT NULL")
-        conn.commit()
-
-    # Migration: add auto column to archive_tags
-    try:
-        conn.execute("SELECT auto FROM archive_tags LIMIT 1")
-    except sqlite3.OperationalError:
-        conn.execute("ALTER TABLE archive_tags ADD COLUMN auto INTEGER NOT NULL DEFAULT 0")
-        conn.commit()
-
-    # Migration: create file_tags table
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS file_tags (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            file_id INTEGER NOT NULL,
-            tag TEXT NOT NULL,
-            auto INTEGER NOT NULL DEFAULT 0,
-            UNIQUE(file_id, tag),
-            FOREIGN KEY (file_id) REFERENCES archive_files(id) ON DELETE CASCADE
-        )
-    """)
+    # Ensure indexes exist
     conn.execute("CREATE INDEX IF NOT EXISTS idx_file_tags_file ON file_tags(file_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_file_tags_tag ON file_tags(tag)")
-    conn.commit()
-
-    # Performance indexes for collection file counting and queries
     conn.execute("CREATE INDEX IF NOT EXISTS idx_af_processing_status ON archive_files(processing_status)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_af_download_status ON archive_files(download_status)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_af_archive_id ON archive_files(archive_id)")
-    conn.commit()
 
-    # Add manifest cache columns to archives
-    try:
-        conn.execute("SELECT manifest_json FROM archives LIMIT 1")
-    except sqlite3.OperationalError:
-        conn.execute("ALTER TABLE archives ADD COLUMN manifest_json TEXT DEFAULT NULL")
-        conn.execute("ALTER TABLE archives ADD COLUMN manifest_fetched_at REAL DEFAULT NULL")
-
-    # Migration: add media_root column for multi-file media unit grouping
-    try:
-        conn.execute("SELECT media_root FROM archive_files LIMIT 1")
-    except sqlite3.OperationalError:
-        conn.execute("ALTER TABLE archive_files ADD COLUMN media_root TEXT NOT NULL DEFAULT ''")
-
-    # Migration: add library override columns to collections
-    try:
-        conn.execute("SELECT flatten FROM collections LIMIT 1")
-    except sqlite3.OperationalError:
-        conn.execute("ALTER TABLE collections ADD COLUMN flatten INTEGER NOT NULL DEFAULT 1")
-        conn.execute("ALTER TABLE collections ADD COLUMN use_media_units INTEGER NOT NULL DEFAULT 1")
-
-    # Migration: create collection_layout_nodes table and migrate existing layouts
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS collection_layout_nodes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            layout_id INTEGER NOT NULL,
-            parent_id INTEGER DEFAULT NULL,
-            position INTEGER NOT NULL DEFAULT 0,
-            name TEXT NOT NULL,
-            type TEXT NOT NULL,
-            tag_filter TEXT DEFAULT NULL,
-            sort_mode TEXT NOT NULL DEFAULT 'flat',
-            renames_json TEXT DEFAULT NULL,
-            include_untagged INTEGER NOT NULL DEFAULT 1,
-            FOREIGN KEY (layout_id) REFERENCES collection_layouts(id) ON DELETE CASCADE,
-            FOREIGN KEY (parent_id) REFERENCES collection_layout_nodes(id) ON DELETE CASCADE
-        )
-    """)
-    # Auto-migrate existing layouts that have no nodes yet
-    orphan_layouts = conn.execute("""
-        SELECT l.id, l.type FROM collection_layouts l
-        WHERE NOT EXISTS (SELECT 1 FROM collection_layout_nodes n WHERE n.layout_id = l.id)
-    """).fetchall()
-    for ol in orphan_layouts:
-        lid, ltype = ol["id"], ol["type"]
-        if ltype == "alphabetical":
-            node_type, sort_mode = "alphabetical", "flat"
-        elif ltype == "by_archive":
-            node_type, sort_mode, tag_filter = "tag_parent", "flat", "archive"
-            conn.execute(
-                "INSERT INTO collection_layout_nodes (layout_id, parent_id, position, name, type, tag_filter, sort_mode) VALUES (?, NULL, 0, 'Root', ?, ?, ?)",
-                (lid, node_type, tag_filter, sort_mode),
-            )
-            continue
-        else:
-            node_type, sort_mode = "all", "flat"
-        conn.execute(
-            "INSERT INTO collection_layout_nodes (layout_id, parent_id, position, name, type, sort_mode) VALUES (?, NULL, 0, 'Root', ?, ?)",
-            (lid, node_type, sort_mode),
-        )
-
-    # Queue state settings (download_state, processing_paused, scan_paused)
+    # Queue state settings
     conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('download_state', 'stopped')")
     conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('processing_paused', '0')")
     conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('scan_paused', '0')")
 
-    # Fix any scan-inserted rows incorrectly tagged as 'manifest'.
-    # Real IA files always have at least one metadata field populated;
-    # scan-inserted files have md5, sha1, format, source, and mtime all empty.
-    conn.execute("""
-        UPDATE archive_files SET origin = 'scan'
-        WHERE origin = 'manifest'
-          AND md5 = '' AND sha1 = '' AND format = '' AND source = '' AND mtime = ''
-    """)
+    # --- Startup crash recovery ---
 
     # Dequeue files that have already completed or hit a conflict
     conn.execute("""
@@ -673,13 +363,13 @@ def init_db():
         WHERE queue_position IS NOT NULL AND download_status IN ('downloaded', 'conflict')
     """)
 
-    # Fix archives stuck on 'downloading' or 'queued' from a previous session.
-    # Reset any files stuck in 'downloading' state back to pending.
+    # Reset files stuck in 'downloading' state back to pending
     conn.execute("""
         UPDATE archive_files SET download_status = 'pending'
         WHERE download_status = 'downloading'
     """)
-    # Recalculate status for all archives (ensures status_pct is populated)
+
+    # Recalculate status for all archives
     all_archives = conn.execute("SELECT id FROM archives").fetchall()
     for row in all_archives:
         aid = row["id"]
@@ -713,294 +403,30 @@ def init_db():
         conn.execute("UPDATE archives SET status = ?, status_pct = ? WHERE id = ?",
                       (status, pct, aid))
 
-    # Reset scan queue entries stuck from a crash
+    # Reset stuck queue entries
     conn.execute("UPDATE scan_queue SET status = 'pending' WHERE status = 'running'")
-    # Reset processing queue entries stuck from a crash
     conn.execute("UPDATE processing_queue SET status = 'pending' WHERE status = 'running'")
 
-    # Reset interrupted processing jobs back to pending so the worker picks them up.
-    # Jobs stuck in 'running' mean the server crashed mid-processing.
+    # Reset interrupted processing jobs
     conn.execute("UPDATE processing_jobs SET status = 'pending', started_at = NULL WHERE status = 'running'")
 
-    # Fail out orphaned processing jobs — pending/running jobs whose processing_queue
-    # entries are all gone (e.g. lost during a DB migration or table rebuild).
+    # Fail orphaned processing jobs
     conn.execute("""
         UPDATE processing_jobs SET status = 'failed',
-            error_message = 'Orphaned job: no queue entries remain (likely lost during migration)',
+            error_message = 'Orphaned job: no queue entries remain',
             completed_at = ?
         WHERE status IN ('pending', 'running')
           AND id NOT IN (SELECT DISTINCT job_id FROM processing_queue WHERE status IN ('pending', 'running'))
     """, (time.time(),))
 
-    # Reset archive_files stuck in processing states from a crash.
-    # Files marked 'queued' or 'processing' need to be reset so they can be
-    # re-queued when the recovered job runs.
-    # Guard: process_queue_status may not exist yet (added by overlay migration below).
-    _has_pqs = any(
-        r[1] == "process_queue_status"
-        for r in conn.execute("PRAGMA table_info(archive_files)").fetchall()
-    )
-    if _has_pqs:
-        conn.execute("""
-            UPDATE archive_files SET processing_status = '', processing_error = '',
-                   process_queue_status = ''
-            WHERE processing_status IN ('queued', 'processing')
-               OR process_queue_status IN ('queued', 'processing')
-        """)
-    else:
-        conn.execute("""
-            UPDATE archive_files SET processing_status = '', processing_error = ''
-            WHERE processing_status IN ('queued', 'processing')
-        """)
-
-    # Migrate legacy processing statuses: 'completed' and 'extracted' → 'processed'
+    # Reset files stuck in processing states from a crash
     conn.execute("""
-        UPDATE archive_files SET processing_status = 'processed'
-        WHERE processing_status IN ('completed', 'extracted')
+        UPDATE archive_files SET processing_error = '', process_queue_status = ''
+        WHERE process_queue_status IN ('queued', 'processing')
     """)
-
-    # Migration: drop legacy notification columns
-    # For existing databases, remove columns that are no longer used.
-    # SQLite doesn't support DROP COLUMN before 3.35, so we just leave them if present.
-    # They're harmless — the code no longer reads or writes them.
-
-    # Migrate legacy layouts (flat/alphabetical/by_archive) to segment-based
-    _migrate_legacy_layouts_to_segments(conn)
-
-    # Migration: move flatten/use_media_units from collections to layouts
-    _migrate_collection_options_to_layouts(conn)
-
-    # Migration: overlay DB — move processed outputs and local files to local_files table
-    _migrate_to_overlay_db(conn)
 
     conn.commit()
     conn.close()
-
-
-def _migrate_legacy_layouts_to_segments(conn):
-    """Auto-migrate old layout types to segment-based layouts.
-
-    flat → no segments (empty path = all files at root)
-    alphabetical → one alphabetical segment
-    by_archive → one tag_parent segment with value "archive"
-
-    Only migrates layouts that have no segments yet and are not type 'segments'.
-    """
-    rows = conn.execute(
-        "SELECT id, type FROM collection_layouts WHERE type != 'segments'"
-    ).fetchall()
-    for row in rows:
-        lid = row["id"]
-        ltype = row["type"]
-        # Check if already has segments
-        has_segments = conn.execute(
-            "SELECT 1 FROM collection_layout_segments WHERE layout_id = ? LIMIT 1", (lid,)
-        ).fetchone()
-        if has_segments:
-            continue
-
-        if ltype == "alphabetical":
-            conn.execute(
-                "INSERT INTO collection_layout_segments (layout_id, position, segment_type, segment_value, visible, include_untagged) "
-                "VALUES (?, 0, 'alphabetical', 'A-Z', 1, 0)", (lid,)
-            )
-        elif ltype == "by_archive":
-            conn.execute(
-                "INSERT INTO collection_layout_segments (layout_id, position, segment_type, segment_value, visible, include_untagged) "
-                "VALUES (?, 0, 'tag_parent', 'archive', 1, 1)", (lid,)
-            )
-        # flat = no segments needed (all files at root)
-
-        # Update type to 'segments'
-        conn.execute("UPDATE collection_layouts SET type = 'segments' WHERE id = ?", (lid,))
-
-
-def _migrate_collection_options_to_layouts(conn):
-    """Move flatten/use_media_units from collections to layout-level columns.
-
-    Also auto-migrates file_scope into tag filter segments:
-      - processed → adds a 'tag_filter' segment for 'processed'
-      - downloaded → adds a 'tag_filter' segment for 'original'
-    """
-    # Add columns to collection_layouts if missing
-    try:
-        conn.execute("SELECT flatten FROM collection_layouts LIMIT 1")
-    except sqlite3.OperationalError:
-        conn.execute("ALTER TABLE collection_layouts ADD COLUMN flatten INTEGER NOT NULL DEFAULT 1")
-        conn.execute("ALTER TABLE collection_layouts ADD COLUMN use_media_units INTEGER NOT NULL DEFAULT 1")
-
-        # Copy values from each collection to its layouts
-        colls = conn.execute("SELECT id, flatten, use_media_units FROM collections").fetchall()
-        for c in colls:
-            conn.execute(
-                "UPDATE collection_layouts SET flatten = ?, use_media_units = ? WHERE collection_id = ?",
-                (c["flatten"], c["use_media_units"], c["id"]),
-            )
-
-    # Auto-migrate file_scope to tag filter segments.
-    # Only run once: check if any collection still has a non-'both' scope.
-    colls_with_scope = conn.execute(
-        "SELECT id, file_scope FROM collections WHERE file_scope != 'both'"
-    ).fetchall()
-    for c in colls_with_scope:
-        scope = c["file_scope"]
-        cid = c["id"]
-        # Map scope to a tag filter value
-        if scope == "processed":
-            tag_val = "processed"
-        elif scope == "downloaded":
-            tag_val = "original"
-        else:
-            continue
-
-        # Add a tag_filter segment to each layout in this collection (if not already present)
-        layouts = conn.execute(
-            "SELECT id FROM collection_layouts WHERE collection_id = ?", (cid,)
-        ).fetchall()
-        for layout in layouts:
-            lid = layout["id"]
-            already = conn.execute(
-                "SELECT 1 FROM collection_layout_segments WHERE layout_id = ? AND segment_type = 'tag_filter' AND segment_value = ? LIMIT 1",
-                (lid, tag_val),
-            ).fetchone()
-            if not already:
-                # Insert at position 0 (before other segments)
-                conn.execute(
-                    "UPDATE collection_layout_segments SET position = position + 1 WHERE layout_id = ?",
-                    (lid,),
-                )
-                conn.execute(
-                    "INSERT INTO collection_layout_segments (layout_id, position, segment_type, segment_value, visible, include_untagged) "
-                    "VALUES (?, 0, 'tag_filter', ?, 0, 0)",
-                    (lid, tag_val),
-                )
-
-        # Reset file_scope to 'both' (now handled by segments)
-        conn.execute("UPDATE collections SET file_scope = 'both' WHERE id = ?", (cid,))
-
-
-def _migrate_to_overlay_db(conn):
-    """Migrate processed outputs and local files from archive_files to local_files.
-
-    Also renames download_status 'completed' → 'downloaded', origin 'scan' → 'local',
-    and adds process_queue_status column.
-
-    Idempotent — checks if migration already ran by looking for process_queue_status column.
-    """
-    # Check if already migrated
-    try:
-        conn.execute("SELECT process_queue_status FROM archive_files LIMIT 1")
-        return  # Already migrated
-    except sqlite3.OperationalError:
-        pass
-
-    now = time.time()
-
-    # Ensure local_files table exists (may already from schema)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS local_files (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            archive_id INTEGER NOT NULL,
-            source_file_id INTEGER DEFAULT NULL,
-            name TEXT NOT NULL,
-            size INTEGER NOT NULL DEFAULT 0,
-            origin TEXT NOT NULL DEFAULT 'local',
-            processor_type TEXT NOT NULL DEFAULT '',
-            processing_job_id INTEGER DEFAULT NULL,
-            created_at REAL NOT NULL,
-            FOREIGN KEY (archive_id) REFERENCES archives(id) ON DELETE CASCADE,
-            FOREIGN KEY (source_file_id) REFERENCES archive_files(id) ON DELETE SET NULL,
-            FOREIGN KEY (processing_job_id) REFERENCES processing_jobs(id) ON DELETE SET NULL
-        )
-    """)
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_lf_archive ON local_files(archive_id)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_lf_source ON local_files(source_file_id)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_lf_origin ON local_files(origin)")
-
-    # Step 1: Migrate processed outputs to local_files
-    processed_rows = conn.execute("""
-        SELECT id, archive_id, processed_filename, processed_files_json, processor_type
-        FROM archive_files
-        WHERE processing_status = 'processed' AND processed_filename != ''
-    """).fetchall()
-
-    for row in processed_rows:
-        fid = row["id"]
-        aid = row["archive_id"]
-        pf = row["processed_filename"]
-        pf_json = row["processed_files_json"]
-        ptype = row["processor_type"] or ""
-
-        # Strip .processed/ subfolder prefix from name to get flat path
-        pf_flat = _strip_processed_prefix(pf)
-
-        # Insert primary output
-        conn.execute(
-            "INSERT OR IGNORE INTO local_files (archive_id, source_file_id, name, origin, processor_type, created_at) "
-            "VALUES (?, ?, ?, 'processed', ?, ?)",
-            (aid, fid, pf_flat, ptype, now),
-        )
-
-        # Insert additional outputs from processed_files_json
-        if pf_json:
-            try:
-                extra_files = json.loads(pf_json)
-                for ef in extra_files:
-                    ef_flat = _strip_processed_prefix(ef)
-                    if ef_flat != pf_flat:
-                        conn.execute(
-                            "INSERT OR IGNORE INTO local_files (archive_id, source_file_id, name, origin, processor_type, created_at) "
-                            "VALUES (?, ?, ?, 'processed', ?, ?)",
-                            (aid, fid, ef_flat, ptype, now),
-                        )
-            except (json.JSONDecodeError, TypeError):
-                pass
-
-    # Step 2: Migrate local/scan files to local_files
-    scan_rows = conn.execute("""
-        SELECT id, archive_id, name, size FROM archive_files WHERE origin = 'scan'
-    """).fetchall()
-
-    for row in scan_rows:
-        conn.execute(
-            "INSERT OR IGNORE INTO local_files (archive_id, source_file_id, name, size, origin, created_at) "
-            "VALUES (?, NULL, ?, ?, 'local', ?)",
-            (row["archive_id"], row["name"], row["size"], now),
-        )
-
-    # Delete scan rows from archive_files (they don't belong in the manifest mirror)
-    conn.execute("DELETE FROM archive_files WHERE origin = 'scan'")
-
-    # Step 3: Rename statuses
-    conn.execute("UPDATE archive_files SET download_status = 'downloaded' WHERE download_status = 'completed'")
-
-    # Step 4: Add process_queue_status column
-    conn.execute("ALTER TABLE archive_files ADD COLUMN process_queue_status TEXT NOT NULL DEFAULT ''")
-    # Copy transient states only (not 'processed' which is now in local_files)
-    conn.execute("""
-        UPDATE archive_files SET process_queue_status = processing_status
-        WHERE processing_status IN ('queued', 'processing', 'failed', 'skipped')
-    """)
-
-    log.info("Overlay DB migration: migrated %d processed outputs and %d local files",
-             len(processed_rows), len(scan_rows))
-
-
-def _strip_processed_prefix(path):
-    """Strip .processed/ subfolder prefix from a path to get the flat filename.
-
-    Examples:
-        'Game.zip.processed/Game.chd' → 'Game.chd'
-        'Game.zip.processed/'         → 'Game.zip.processed'  (folder ref stays as-is)
-        'Game.chd'                    → 'Game.chd'  (already flat)
-    """
-    import os as _os
-    path = path.rstrip("/").rstrip(_os.sep)
-    parts = path.replace("\\", "/").split("/")
-    # If first part ends with .processed, strip it
-    if len(parts) > 1 and parts[0].endswith(".processed"):
-        return "/".join(parts[1:])
-    return path
 
 
 # --- Settings ---
@@ -1937,34 +1363,25 @@ def set_archive_processing_profile(archive_id, profile_id):
 
 # --- Processing Status Helpers ---
 
-def set_file_processing_status(file_id, status, processed_filename=None, processor_type=None, error=None, processed_files=None):
-    """Update processing state on a file.
+def set_file_processing_status(file_id, status, error=None, **_kwargs):
+    """Update processing queue state on a file.
 
-    Writes to both legacy columns (processing_status etc.) and the new
-    process_queue_status column for backward compatibility during transition.
+    Only writes to process_queue_status and processing_error.
+    Processed output metadata is tracked in the local_files overlay table.
     """
     with _db() as conn:
-        updates = ["processing_status = ?"]
-        params = [status]
-        # Also update overlay-era queue status column
         # 'processed' is not a queue status — clear it when done
         queue_status = "" if status == "processed" else status
-        updates.append("process_queue_status = ?")
-        params.append(queue_status)
-        if processed_filename is not None:
-            updates.append("processed_filename = ?")
-            params.append(processed_filename)
-        if processor_type is not None:
-            updates.append("processor_type = ?")
-            params.append(processor_type)
         if error is not None:
-            updates.append("processing_error = ?")
-            params.append(error)
-        if processed_files is not None:
-            updates.append("processed_files_json = ?")
-            params.append(json.dumps(processed_files))
-        params.append(file_id)
-        conn.execute(f"UPDATE archive_files SET {', '.join(updates)} WHERE id = ?", params)
+            conn.execute(
+                "UPDATE archive_files SET process_queue_status = ?, processing_error = ? WHERE id = ?",
+                (queue_status, error, file_id),
+            )
+        else:
+            conn.execute(
+                "UPDATE archive_files SET process_queue_status = ? WHERE id = ?",
+                (queue_status, file_id),
+            )
         conn.commit()
 
 
@@ -2087,25 +1504,6 @@ def assign_as_processed_output(target_file_id, unknown_file_id):
                VALUES (?, ?, ?, ?, 'processed', '', ?)""",
             (target["archive_id"], target_file_id, unknown["name"], unknown["size"] or 0, time.time()),
         )
-
-        # Also update legacy columns for backward compat during transition
-        existing = []
-        if target["processed_files_json"]:
-            try:
-                existing = json.loads(target["processed_files_json"])
-            except (json.JSONDecodeError, TypeError):
-                existing = []
-        if unknown["name"] not in existing:
-            existing.append(unknown["name"])
-        updates = ["processed_files_json = ?"]
-        params = [json.dumps(existing)]
-        if target["processing_status"] != "processed":
-            updates.append("processing_status = 'processed'")
-        if not target["processed_filename"]:
-            updates.append("processed_filename = ?")
-            params.append(unknown["name"])
-        params.append(target_file_id)
-        conn.execute(f"UPDATE archive_files SET {', '.join(updates)} WHERE id = ?", params)
 
         # Delete the unknown file record
         conn.execute("DELETE FROM archive_files WHERE id = ?", (unknown_file_id,))

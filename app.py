@@ -284,105 +284,6 @@ def update_settings():
     return jsonify({"ok": True})
 
 
-@app.route("/api/settings/migrate-processed", methods=["POST"])
-@login_required
-def migrate_processed_folders():
-    """Flatten processed files: move files out of ``.processed`` subfolders
-    into the flat ``processed/{identifier}/`` layout, and move any processed
-    files still in ``downloads/`` into ``processed/``.
-
-    This is the reverse of the old migration — it produces the flat overlay
-    layout that matches the new ``local_files`` database table.
-
-    Idempotent — files already in the flat layout are skipped.
-    """
-    import shutil
-
-    download_dir = db.get_download_dir()
-    processed_dir = db.get_processed_dir()
-
-    stats = {"flattened": 0, "moved_to_processed": 0, "skipped": 0, "errors": 0, "archives": 0}
-
-    # Get all archives
-    archives = db.get_archives()
-    for archive in archives:
-        identifier = archive["identifier"]
-        proc_ident_dir = os.path.join(processed_dir, identifier)
-        dl_ident_dir = os.path.join(download_dir, identifier)
-        touched = False
-
-        # Phase 1: Flatten .processed subfolders in processed/{identifier}/
-        if os.path.isdir(proc_ident_dir):
-            for entry in os.listdir(proc_ident_dir):
-                if not entry.endswith(".processed"):
-                    continue
-                subfolder = os.path.join(proc_ident_dir, entry)
-                if not os.path.isdir(subfolder):
-                    continue
-                # Move all files out of subfolder into parent
-                for fname in os.listdir(subfolder):
-                    src = os.path.join(subfolder, fname)
-                    dst = os.path.join(proc_ident_dir, fname)
-                    if os.path.exists(dst):
-                        stats["skipped"] += 1
-                        continue
-                    try:
-                        shutil.move(src, dst)
-                        stats["flattened"] += 1
-                        touched = True
-                    except OSError as e:
-                        log.error("migrate", "Failed to move %s -> %s: %s", src, dst, e)
-                        stats["errors"] += 1
-                # Remove empty subfolder
-                try:
-                    if not os.listdir(subfolder):
-                        os.rmdir(subfolder)
-                except OSError:
-                    pass
-
-        # Phase 2: Move processed files from downloads/ to processed/
-        # Check local_files overlay for this archive's processed outputs
-        overlay_files = db.get_all_processed_files(archive["id"])
-        for rel_name in overlay_files:
-            dl_path = os.path.join(dl_ident_dir, rel_name)
-            if not os.path.exists(dl_path):
-                continue
-            proc_path = os.path.join(proc_ident_dir, rel_name)
-            if os.path.exists(proc_path):
-                stats["skipped"] += 1
-                continue
-            try:
-                os.makedirs(os.path.dirname(proc_path), exist_ok=True)
-                shutil.move(dl_path, proc_path)
-                stats["moved_to_processed"] += 1
-                touched = True
-            except OSError as e:
-                log.error("migrate", "Failed to move %s -> %s: %s", dl_path, proc_path, e)
-                stats["errors"] += 1
-
-        # Phase 3: Update local_files names to flat paths (strip .processed/ prefixes)
-        if touched:
-            with db._db() as conn:
-                lf_rows = conn.execute(
-                    "SELECT id, name FROM local_files WHERE archive_id = ?",
-                    (archive["id"],),
-                ).fetchall()
-                for lf in lf_rows:
-                    old_name = lf["name"]
-                    # Strip any .processed/ prefix from the name
-                    new_name = db._strip_processed_prefix(old_name)
-                    if new_name != old_name:
-                        conn.execute(
-                            "UPDATE local_files SET name = ? WHERE id = ?",
-                            (new_name, lf["id"]),
-                        )
-                conn.commit()
-            stats["archives"] += 1
-
-    log.info("migrate", "Flatten migration complete: %d flattened, %d moved to processed/, %d skipped, %d errors across %d archives",
-             stats["flattened"], stats["moved_to_processed"], stats["skipped"], stats["errors"], stats["archives"])
-    return jsonify({"ok": True, **stats})
-
 
 @app.route("/api/settings/test-credentials", methods=["POST"])
 @login_required
@@ -607,7 +508,6 @@ def delete_archive_folder(archive_id):
     conn = db.get_db()
     conn.execute(
         "UPDATE archive_files SET download_status = 'pending', downloaded_bytes = 0, "
-        "processing_status = '', processed_filename = '', processed_files_json = '', "
         "processing_error = '', error_message = '', process_queue_status = '' WHERE archive_id = ?",
         (archive_id,),
     )
@@ -722,38 +622,15 @@ def _run_single_file_scan(entry):
 
 
 def _resolve_processed_file(identifier, rel_path, base_dir):
-    """Locate a processed file using a fallback chain.
+    """Locate a processed file.
 
-    Checks in order:
-    1. Flat overlay: processed_dir/{identifier}/{rel_path}
-    2. Legacy .processed subfolder: processed_dir/{identifier}/*.processed/{rel_path}
-    3. Legacy download dir: base_dir/{rel_path}
-
-    This means files are found before, during, and after the migration
-    that flattens .processed subfolders.
+    Checks processed_dir/{identifier}/{rel_path} first, then falls back
+    to base_dir/{rel_path} (download dir).
     """
     processed_dir = db.get_processed_dir()
-    # 1. Flat overlay layout (target state)
     candidate = os.path.join(processed_dir, identifier, rel_path)
     if os.path.exists(candidate):
         return candidate
-    # 2. Legacy .processed subfolder layout
-    ident_dir = os.path.join(processed_dir, identifier)
-    if os.path.isdir(ident_dir):
-        basename = os.path.basename(rel_path)
-        rel_dir = os.path.dirname(rel_path)
-        try:
-            for entry in os.listdir(ident_dir):
-                if entry.endswith(".processed"):
-                    if rel_dir:
-                        sub_candidate = os.path.join(ident_dir, entry, rel_dir, basename)
-                    else:
-                        sub_candidate = os.path.join(ident_dir, entry, basename)
-                    if os.path.exists(sub_candidate):
-                        return sub_candidate
-        except OSError:
-            pass
-    # 3. Legacy fallback — processed file alongside downloads
     return os.path.join(base_dir, rel_path)
 
 
@@ -797,9 +674,7 @@ def _scan_single_file_on_disk(f, base_dir, entry_id=None, identifier=None):
         # Failed processing with no overlay outputs — clear stale state
         with db._db() as conn:
             conn.execute(
-                "UPDATE archive_files SET processing_status = '', processed_filename = '', "
-                "processed_files_json = '', processor_type = '', processing_error = '', "
-                "process_queue_status = '' WHERE id = ?",
+                "UPDATE archive_files SET processing_error = '', process_queue_status = '' WHERE id = ?",
                 (file_id,),
             )
             conn.commit()
@@ -1267,8 +1142,7 @@ def _finish_archive_scan(archive_id):
             import time as _time
             with db._db() as conn:
                 for rel_name, local_size, source_fid in auto_matched:
-                    # Strip any .processed/ prefix for a clean overlay name
-                    clean_name = db._strip_processed_prefix(rel_name)
+                    clean_name = rel_name
                     conn.execute(
                         """INSERT OR IGNORE INTO local_files
                            (archive_id, source_file_id, name, size, origin, processor_type, created_at)
@@ -1660,9 +1534,7 @@ def delete_file(file_id):
             # No overlay outputs — clear stale processing state
             conn = db.get_db()
             conn.execute(
-                "UPDATE archive_files SET processing_status = '', processed_filename = '', "
-                "processed_files_json = '', processing_error = '', processor_type = '', "
-                "process_queue_status = '' WHERE id = ?",
+                "UPDATE archive_files SET processing_error = '', process_queue_status = '' WHERE id = ?",
                 (file_id,),
             )
             conn.commit()
@@ -1687,26 +1559,9 @@ def get_processed_tree(file_id):
     download_dir = db.get_setting("download_dir", os.path.expanduser("~/ia-downloads"))
     base_dir = os.path.realpath(os.path.join(download_dir, ident))
 
-    # Build the set of root paths to scan from the overlay table.
-    # Falls back to legacy columns if the overlay has nothing.
+    # Build the set of root paths to scan from the overlay table
     overlay_outputs = db.get_processed_outputs(file_id)
     root_paths = [lf["name"].rstrip("/").rstrip(os.sep) for lf in overlay_outputs]
-
-    # Fallback to legacy columns if overlay is empty (pre-migration data)
-    if not root_paths:
-        pf = (f.get("processed_filename") or "").rstrip("/").rstrip(os.sep)
-        if pf:
-            root_paths.append(pf)
-        if f.get("processed_files_json"):
-            try:
-                extra = json.loads(f["processed_files_json"])
-                for p in extra:
-                    p = p.rstrip("/").rstrip(os.sep)
-                    if any(p == r or p.startswith(r + "/") or p.startswith(r + os.sep) for r in root_paths):
-                        continue
-                    root_paths.append(p)
-            except (json.JSONDecodeError, TypeError):
-                pass
 
     # Build tree from disk (verify each entry actually exists)
     # Check processed_dir first, fall back to download_dir (legacy location)
@@ -1800,76 +1655,17 @@ def delete_processed_file(file_id):
 
     if delete_all:
         # Delete every processed output for this file
-        paths_to_delete = []
-        if f["processed_files_json"]:
-            try:
-                paths_to_delete = json.loads(f["processed_files_json"])
-            except (json.JSONDecodeError, TypeError):
-                pass
-        if not paths_to_delete and f.get("processed_filename"):
-            paths_to_delete = [f["processed_filename"]]
-        for p in paths_to_delete:
-            _safe_delete(p.rstrip("/").rstrip(os.sep))
-        # Also delete files listed in overlay
         overlay_outputs = db.get_processed_outputs(file_id)
         for lf in overlay_outputs:
             _safe_delete(lf["name"].rstrip("/").rstrip(os.sep))
-        # Clear overlay rows and legacy processing state
+        # Clear overlay rows and processing state
         db.delete_local_files_for_source(file_id)
-        conn = db.get_db()
-        conn.execute(
-            "UPDATE archive_files SET processing_status = '', processed_filename = '', "
-            "processed_files_json = '', processing_error = '', processor_type = '', "
-            "process_queue_status = '' WHERE id = ?",
-            (file_id,),
-        )
-        conn.commit()
-        conn.close()
+        db.set_file_process_queue_status(file_id, "")
     elif filename:
         # Delete a single processed output
         _safe_delete(filename.rstrip("/").rstrip(os.sep))
-
         # Remove the overlay row for this specific output
         db.delete_local_file_by_name(file_id, filename.rstrip("/").rstrip(os.sep))
-
-        # Update processed_files_json to remove the deleted entry (legacy compat)
-        remaining = []
-        if f["processed_files_json"]:
-            try:
-                all_files = json.loads(f["processed_files_json"])
-                remaining = [p for p in all_files if p.rstrip("/").rstrip(os.sep) != filename.rstrip("/").rstrip(os.sep)
-                             and not p.startswith(filename.rstrip("/") + "/")
-                             and not p.startswith(filename.rstrip(os.sep) + os.sep)]
-            except (json.JSONDecodeError, TypeError):
-                pass
-
-        # Check if we deleted the processed_filename itself
-        pf = (f.get("processed_filename") or "").rstrip("/").rstrip(os.sep)
-        deleted_pf = filename.rstrip("/").rstrip(os.sep)
-        pf_was_deleted = pf and (pf == deleted_pf or pf.startswith(deleted_pf + "/") or pf.startswith(deleted_pf + os.sep))
-
-        conn = db.get_db()
-        if not remaining:
-            # No processed files left — clear path fields but keep processing status
-            # so the file still shows as processed/extracted (like automated processing
-            # that deletes the source file)
-            conn.execute(
-                "UPDATE archive_files SET processed_filename = '', "
-                "processed_files_json = '' WHERE id = ?",
-                (file_id,),
-            )
-        else:
-            updates = {"processed_files_json": json.dumps(remaining)}
-            if pf_was_deleted:
-                # The primary processed_filename was deleted; pick the first remaining as new root
-                updates["processed_filename"] = remaining[0]
-            parts = ", ".join(f"{k} = ?" for k in updates)
-            conn.execute(
-                f"UPDATE archive_files SET {parts} WHERE id = ?",
-                (*updates.values(), file_id),
-            )
-        conn.commit()
-        conn.close()
 
     return jsonify({"ok": True})
 
@@ -1910,36 +1706,6 @@ def rename_processed_file(file_id):
 
     if (os.path.isfile(old_abs) or os.path.isdir(old_abs)):
         os.rename(old_abs, new_abs)
-
-    # Update processed_filename if it matches
-    conn = db.get_db()
-    pf = f.get("processed_filename", "")
-    if pf.rstrip("/").rstrip(os.sep) == old_path.rstrip("/").rstrip(os.sep):
-        suffix = "/" if pf.endswith("/") or pf.endswith(os.sep) else ""
-        conn.execute("UPDATE archive_files SET processed_filename = ? WHERE id = ?",
-                     (new_rel + suffix, file_id))
-
-    # Update processed_files_json entries
-    if f["processed_files_json"]:
-        try:
-            all_files = json.loads(f["processed_files_json"])
-            old_stripped = old_path.rstrip("/").rstrip(os.sep)
-            updated = []
-            for p in all_files:
-                ps = p.rstrip("/").rstrip(os.sep)
-                if ps == old_stripped:
-                    updated.append(new_rel + ("/" if p.endswith("/") else ""))
-                elif ps.startswith(old_stripped + "/") or ps.startswith(old_stripped + os.sep):
-                    updated.append(new_rel + ps[len(old_stripped):])
-                else:
-                    updated.append(p)
-            conn.execute("UPDATE archive_files SET processed_files_json = ? WHERE id = ?",
-                         (json.dumps(updated), file_id))
-        except (json.JSONDecodeError, TypeError):
-            pass
-
-    conn.commit()
-    conn.close()
 
     # Update the overlay row name to match
     old_clean = old_path.rstrip("/").rstrip(os.sep)

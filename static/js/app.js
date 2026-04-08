@@ -6573,23 +6573,6 @@
         $("#btn-settings-back-bottom").addEventListener("click", closeSettings);
         $("#btn-test-credentials").addEventListener("click", testCredentials);
         $("#btn-change-password").addEventListener("click", changePassword);
-        $("#btn-migrate-processed").addEventListener("click", async () => {
-            const btn = $("#btn-migrate-processed");
-            const result = $("#migrate-processed-result");
-            btn.disabled = true;
-            btn.textContent = "Flattening...";
-            result.style.display = "none";
-            try {
-                const r = await api("POST", "/api/settings/migrate-processed");
-                result.textContent = `Done: ${r.flattened} flattened, ${r.moved_to_processed} moved to processed/, ${r.skipped} skipped, ${r.errors} errors across ${r.archives} archives.`;
-                result.style.display = "block";
-            } catch (e) {
-                result.textContent = "Flatten failed: " + e.message;
-                result.style.display = "block";
-            }
-            btn.disabled = false;
-            btn.textContent = "Flatten Processed Files";
-        });
         // Tab switching
         $$(".settings-tab").forEach((tab) => {
             tab.addEventListener("click", () => switchTab(tab.dataset.tab));

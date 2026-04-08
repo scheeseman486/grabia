@@ -108,36 +108,15 @@ def _resolve_filepath(file_row, download_dir):
 
 
 def _resolve_processed_path(identifier, rel_path, download_dir):
-    """Locate a processed file using a fallback chain.
+    """Locate a processed file.
 
-    Checks in order:
-    1. Flat overlay: processed_dir/{identifier}/{name}
-    2. Legacy .processed subfolder: processed_dir/{identifier}/{source}.processed/{name}
-       (scans for any .processed subfolder containing the file)
-    3. Legacy download dir: download_dir/{identifier}/{name}
-
-    This means files are found before, during, and after the file migration
-    that flattens .processed subfolders.
+    Checks processed_dir/{identifier}/{rel_path} first, then falls back
+    to download_dir/{identifier}/{rel_path}.
     """
     processed_dir = get_processed_dir()
-    # 1. Flat overlay layout (target state)
     candidate = os.path.join(processed_dir, identifier, rel_path)
     if os.path.exists(candidate):
         return candidate
-    # 2. Legacy .processed subfolder layout
-    ident_dir = os.path.join(processed_dir, identifier)
-    if os.path.isdir(ident_dir):
-        basename = os.path.basename(rel_path)
-        rel_dir = os.path.dirname(rel_path)
-        for entry in os.listdir(ident_dir):
-            if entry.endswith(".processed"):
-                if rel_dir:
-                    sub_candidate = os.path.join(ident_dir, entry, rel_dir, basename)
-                else:
-                    sub_candidate = os.path.join(ident_dir, entry, basename)
-                if os.path.exists(sub_candidate):
-                    return sub_candidate
-    # 3. Legacy fallback — processed file alongside downloads
     return os.path.join(download_dir, identifier, rel_path)
 
 

@@ -745,10 +745,9 @@ def _reset_stuck_files(archive_id):
     try:
         with db._db() as conn:
             conn.execute(
-                "UPDATE archive_files SET processing_status = '', process_queue_status = '', "
+                "UPDATE archive_files SET process_queue_status = '', "
                 "processing_error = 'Interrupted by error' "
-                "WHERE archive_id = ? AND (processing_status IN ('processing', 'queued') "
-                "OR process_queue_status IN ('processing', 'queued'))",
+                "WHERE archive_id = ? AND process_queue_status IN ('processing', 'queued')",
                 (archive_id,),
             )
             conn.commit()
