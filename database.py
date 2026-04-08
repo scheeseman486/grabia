@@ -425,6 +425,27 @@ def init_db():
         WHERE process_queue_status IN ('queued', 'processing')
     """)
 
+    # Backfill overlay files with missing sizes from disk
+    _dl_row = conn.execute("SELECT value FROM settings WHERE key = 'download_dir'").fetchone()
+    download_dir = _dl_row["value"] if _dl_row else os.path.expanduser("~/ia-downloads")
+    _pd_row = conn.execute("SELECT value FROM settings WHERE key = 'processed_dir'").fetchone()
+    processed_dir = _pd_row["value"] if _pd_row else os.path.join(download_dir, ".processed")
+    zero_size_rows = conn.execute(
+        "SELECT lf.id, lf.name, a.identifier FROM local_files lf "
+        "JOIN archives a ON lf.archive_id = a.id WHERE lf.size = 0"
+    ).fetchall()
+    for r in zero_size_rows:
+        for base in (os.path.join(processed_dir, r["identifier"]),
+                     os.path.join(download_dir, r["identifier"])):
+            p = os.path.join(base, r["name"])
+            if os.path.isfile(p):
+                try:
+                    conn.execute("UPDATE local_files SET size = ? WHERE id = ?",
+                                 (os.path.getsize(p), r["id"]))
+                except OSError:
+                    pass
+                break
+
     conn.commit()
     conn.close()
 
@@ -1841,6 +1862,7 @@ def get_collection_files(collection_id):
                FROM archive_files af
                JOIN archives a ON af.archive_id = a.id
                WHERE af.download_status = 'downloaded' AND af.origin = 'manifest'
+                 AND af.downloaded = 1
 
                UNION ALL
 
