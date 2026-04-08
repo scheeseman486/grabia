@@ -429,7 +429,7 @@ def init_db():
     _dl_row = conn.execute("SELECT value FROM settings WHERE key = 'download_dir'").fetchone()
     download_dir = _dl_row["value"] if _dl_row else os.path.expanduser("~/ia-downloads")
     _pd_row = conn.execute("SELECT value FROM settings WHERE key = 'processed_dir'").fetchone()
-    processed_dir = _pd_row["value"] if _pd_row else os.path.join(download_dir, ".processed")
+    processed_dir = _pd_row["value"] if _pd_row else os.path.join(os.path.dirname(download_dir), "processed")
     zero_size_rows = conn.execute(
         "SELECT lf.id, lf.name, a.identifier FROM local_files lf "
         "JOIN archives a ON lf.archive_id = a.id WHERE lf.size = 0"
