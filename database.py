@@ -1783,6 +1783,12 @@ def get_collection(collection_id):
         ).fetchall()]
         for layout in layouts:
             layout["nodes"] = _get_layout_node_tree(conn, layout["id"])
+        for layout in layouts:
+            seg_rows = conn.execute(
+                "SELECT * FROM collection_layout_segments WHERE layout_id = ? ORDER BY position",
+                (layout["id"],),
+            ).fetchall()
+            layout["segments"] = [dict(r) for r in seg_rows]
         d["layouts"] = layouts
         return d
 

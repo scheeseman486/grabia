@@ -80,6 +80,7 @@
     let cpExpandedDirs = new Set(); // expanded directory unit display_names
     let cpScrollRAF = null;
     let cpLastRange = null;
+    let cpLayoutLookup = {};        // layout id -> layout object (with segments)
 
     // --- Notifications ---
     let notifications = [];
@@ -5707,29 +5708,12 @@
         const layoutCount = (coll.layouts || []).length;
         $("#collection-detail-meta").textContent = `${layoutCount} layout${layoutCount !== 1 ? "s" : ""}`;
 
-        // Layout dropdown
         currentCollectionLayouts = coll.layouts || [];
-        const layoutSelect = $("#collection-layout-select");
-        layoutSelect.innerHTML = "";
-        if (currentCollectionLayouts.length === 0) {
-            layoutSelect.innerHTML = '<option value="">No layouts</option>';
-            currentLayoutId = null;
-        } else {
-            for (const layout of currentCollectionLayouts) {
-                const opt = document.createElement("option");
-                opt.value = layout.id;
-                opt.textContent = layout.name;
-                layoutSelect.appendChild(opt);
-            }
-            // Preserve selection or pick first
-            if (currentLayoutId && currentCollectionLayouts.some(l => l.id === currentLayoutId)) {
-                layoutSelect.value = currentLayoutId;
-            } else {
-                currentLayoutId = currentCollectionLayouts[0].id;
-                layoutSelect.value = currentLayoutId;
-            }
+        // Build lookup: layout id -> layout object (with segments)
+        cpLayoutLookup = {};
+        for (const layout of currentCollectionLayouts) {
+            cpLayoutLookup[layout.id] = layout;
         }
-
     }
 
     function closeCollectionDetail() {
@@ -5776,6 +5760,36 @@
         } catch (e) {
             section.style.display = "none";
         }
+    }
+
+    function cpLayoutVisualHTML(layoutId) {
+        /* Render an inline path-builder-visual string for a layout.
+           Reuses pbSegmentLabel() logic for segment display names. */
+        const layout = cpLayoutLookup[layoutId];
+        if (!layout) return esc("Layout #" + layoutId);
+        const segs = layout.segments || [];
+        if (segs.length === 0) return `<span class="path-segment-root">/</span><span class="path-segment-wildcard">*</span>`;
+
+        const typeIcons = {
+            literal: "\uD83D\uDCC1",
+            tag_parent: "\uD83C\uDFF7\uFE0F",
+            tag_specific: "\uD83C\uDFF7\uFE0F",
+            tag_group: "\uD83C\uDFF7\uFE0F+",
+            hidden_filter: "\uD83D\uDD12",
+            alphabetical: "Az",
+        };
+        let html = '<span class="path-segment-root">/</span>';
+        for (let i = 0; i < segs.length; i++) {
+            const seg = segs[i];
+            const typeClass = "seg-" + seg.segment_type.replace(/_/g, "-");
+            const label = pbSegmentLabel(seg);
+            html += `<span class="path-segment-card ${typeClass}${seg.visible ? "" : " seg-hidden"}">`
+                + `<span class="seg-type-icon">${typeIcons[seg.segment_type] || "?"}</span>`
+                + `<span class="seg-label">${esc(label)}</span></span>`;
+            if (i < segs.length - 1) html += '<span class="path-segment-sep">/</span>';
+        }
+        html += '<span class="path-segment-sep">/</span><span class="path-segment-wildcard">*</span>';
+        return html;
     }
 
     function cpGetVisibleRows() {
@@ -5845,8 +5859,6 @@
         listEl.style.height = totalHeight + "px";
         listEl.style.position = "relative";
 
-        const selectedLid = currentLayoutId;
-
         for (let i = startRow; i <= endRow; i++) {
             const row = allRows[i];
             const div = document.createElement("div");
@@ -5858,17 +5870,47 @@
             div.style.height = CP_ROW_HEIGHT + "px";
             div.style.paddingLeft = (12 + row.depth * 20) + "px";
 
-            // Highlight rows belonging to the selected layout
-            const rowLayouts = row.layout_ids || [];
-            if (selectedLid && rowLayouts.includes(selectedLid)) {
-                div.classList.add("cp-highlighted");
-            }
-
             if (row.type === "bucket_header") {
                 div.classList.add("bucket-header", "cp-folder");
                 const arrow = row._expanded ? "\u25BE" : "\u25B8";
-                const countStr = row.file_count ? ` <span style="opacity:0.4;font-weight:400">(${row.file_count})</span>` : "";
-                div.innerHTML = `<span class="preview-name">${arrow} ${esc(row.name)}/${countStr}</span>`;
+                const lids = row.layout_ids || [];
+                const isLayoutRoot = row.depth === 1 && lids.length === 1;
+
+                if (isLayoutRoot) {
+                    // Layout root: show path-builder-visual + file count + edit/delete
+                    const lid = lids[0];
+                    const countStr = row.file_count ? `<span class="cp-layout-count">${row.file_count}</span>` : "";
+                    div.classList.add("cp-layout-row");
+                    div.innerHTML = `<span class="cp-layout-arrow">${arrow}</span>`
+                        + `<span class="preview-name cp-layout-visual">${cpLayoutVisualHTML(lid)}</span>`
+                        + countStr
+                        + `<button class="cp-layout-btn cp-layout-edit" data-layout-id="${lid}" title="Edit layout">`
+                        +   `<svg viewBox="0 0 24 24" width="14" height="14"><path d="M19.14 12.94c.04-.31.06-.63.06-.94 0-.31-.02-.63-.06-.94l2.03-1.58a.49.49 0 00.12-.61l-1.92-3.32a.488.488 0 00-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54a.484.484 0 00-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.04.31-.06.63-.06.94 0 .31.02.63.06.94l-2.03 1.58a.49.49 0 00-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6A3.6 3.6 0 1115.6 12 3.611 3.611 0 0112 15.6z" fill="currentColor"/></svg>`
+                        + `</button>`
+                        + `<button class="cp-layout-btn cp-layout-delete" data-layout-id="${lid}" title="Delete layout">`
+                        +   `<svg viewBox="0 0 24 24" width="14" height="14"><path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z" fill="currentColor"/></svg>`
+                        + `</button>`;
+
+                    // Wire edit/delete buttons (stop propagation so click doesn't toggle expand)
+                    div.querySelector(".cp-layout-edit").addEventListener("click", (e) => {
+                        e.stopPropagation();
+                        currentLayoutId = lid;
+                        openPathBuilder(lid);
+                    });
+                    div.querySelector(".cp-layout-delete").addEventListener("click", (e) => {
+                        e.stopPropagation();
+                        confirmAction("confirm_delete_layout", "Delete Layout", "Delete this layout?", async () => {
+                            await api("DELETE", `/api/collections/${currentCollectionId}/layouts/${lid}`);
+                            currentLayoutId = null;
+                            openCollectionDetail(currentCollectionId);
+                        }, { confirmText: "Delete" });
+                    });
+                } else {
+                    // Sub-bucket: show folder name + count
+                    const countStr = row.file_count ? ` <span style="opacity:0.4;font-weight:400">(${row.file_count})</span>` : "";
+                    div.innerHTML = `<span class="preview-name">${arrow} ${esc(row.name)}/${countStr}</span>`;
+                }
+
                 div.addEventListener("click", () => {
                     if (cpExpandedDirs.has(row._key)) cpExpandedDirs.delete(row._key);
                     else cpExpandedDirs.add(row._key);
@@ -6013,8 +6055,6 @@
             // Auto-open path builder for new layouts
             if (newLayout) {
                 currentLayoutId = newLayout.id;
-                const sel = $("#collection-layout-select");
-                if (sel) sel.value = newLayout.id;
                 openPathBuilder(newLayout.id);
             }
         } catch (e) {
@@ -6642,23 +6682,6 @@
         $("#btn-layout-modal-save").addEventListener("click", saveLayout);
         $("#layout-name-input").addEventListener("keydown", (e) => { if (e.key === "Enter") saveLayout(); });
         $("#btn-delete-collection").addEventListener("click", deleteCurrentCollection);
-        // Layout selector
-        $("#collection-layout-select").addEventListener("change", (e) => {
-            currentLayoutId = parseInt(e.target.value) || null;
-            if (currentCollectionId) loadCollectionPreview(currentCollectionId);
-        });
-        $("#btn-edit-layout").addEventListener("click", () => {
-            if (!currentLayoutId) return;
-            openPathBuilder(currentLayoutId);
-        });
-        $("#btn-delete-layout").addEventListener("click", async () => {
-            if (!currentLayoutId || !currentCollectionId) return;
-            confirmAction("confirm_delete_layout", "Delete Layout", "Delete this layout?", async () => {
-                await api("DELETE", `/api/collections/${currentCollectionId}/layouts/${currentLayoutId}`);
-                currentLayoutId = null;
-                openCollectionDetail(currentCollectionId);
-            }, { confirmText: "Delete" });
-        });
         // Layout editor (legacy)
         $("#btn-layout-editor-close").addEventListener("click", () => {
             $("#modal-layout-editor").classList.remove("open");

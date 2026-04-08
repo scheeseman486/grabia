@@ -955,27 +955,67 @@ def preview_collection(collection_id):
                             "layout_ids": {lid},
                         }
 
+    # ── Build parent bucket headers for intermediate path components ──
+    # If we have "Alphabetical/A" at depth 2, we need a synthetic parent
+    # "Alphabetical" at depth 1 so the tree is complete and collapse works.
+    parent_buckets: dict[str, dict] = {}  # path -> {layout_ids, file_count}
+    for subdir in merged_buckets:
+        if not subdir:
+            continue
+        parts = [p for p in subdir.replace("\\", "/").split("/") if p]
+        # Create parent entries for every prefix that isn't itself a real bucket
+        for i in range(1, len(parts)):
+            parent_path = "/".join(parts[:i])
+            if parent_path not in merged_buckets:
+                if parent_path not in parent_buckets:
+                    parent_buckets[parent_path] = {
+                        "layout_ids": set(),
+                        "file_count": 0,
+                    }
+                parent_buckets[parent_path]["layout_ids"].update(
+                    bucket_layout_ids.get(subdir, set())
+                )
+                parent_buckets[parent_path]["file_count"] += len(
+                    merged_buckets[subdir]
+                )
+
     # ── Flatten into row list ──
+    all_subdirs = sorted(set(merged_buckets.keys()) | set(parent_buckets.keys()))
     rows = []
-    for subdir in sorted(merged_buckets.keys()):
-        bucket_entries = merged_buckets[subdir]
+    for subdir in all_subdirs:
+        is_real = subdir in merged_buckets
+        is_synthetic = subdir in parent_buckets
+
         if subdir:
             parts = [p for p in subdir.replace("\\", "/").split("/") if p]
             depth = len(parts)
+
+            if is_synthetic and not is_real:
+                # Synthetic parent — aggregate info from children
+                rows.append({
+                    "type": "bucket_header",
+                    "depth": depth,
+                    "name": parts[-1],
+                    "path": subdir,
+                    "layout_ids": sorted(parent_buckets[subdir]["layout_ids"]),
+                    "file_count": parent_buckets[subdir]["file_count"],
+                })
+                continue  # no direct entries
+
             rows.append({
                 "type": "bucket_header",
                 "depth": depth,
                 "name": parts[-1],
                 "path": subdir,
                 "layout_ids": sorted(bucket_layout_ids[subdir]),
-                "file_count": len(bucket_entries),
+                "file_count": len(merged_buckets[subdir]),
             })
             entry_depth = depth + 1
         else:
             entry_depth = 1
 
-        for display_name in sorted(bucket_entries.keys(), key=str.lower):
-            entry = bucket_entries[display_name]
+        for display_name in sorted(merged_buckets[subdir].keys(), key=str.lower):
+            entry = merged_buckets[subdir][display_name]
             row = {k: v for k, v in entry.items() if k != "layout_ids"}
             row["depth"] = entry_depth
             row["layout_ids"] = sorted(entry["layout_ids"])

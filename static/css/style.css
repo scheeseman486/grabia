@@ -2397,22 +2397,6 @@ details[open] > .collection-archives-summary::before {
     font-size: 11px;
     min-height: auto;
 }
-/* Layout selector row */
-.layout-selector-row {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    flex-wrap: wrap;
-}
-.layout-selector-row label {
-    font-weight: 600;
-    font-size: 13px;
-    color: var(--text-dim);
-}
-.layout-select {
-    flex: 1;
-    max-width: 300px;
-}
 /* Layout editor */
 .modal-wide { max-width: 640px; }
 .layout-editor-tree {
@@ -2598,9 +2582,58 @@ details[open] > .collection-archives-summary::before {
     padding: 8px 0;
 }
 
-/* Preview highlight for selected layout */
-.collection-preview-row.cp-highlighted { background: rgba(59,130,246,0.08); }
-.collection-preview-row.cp-highlighted.bucket-header { background: rgba(59,130,246,0.12); }
+/* Layout root rows in collection preview */
+.collection-preview-row.cp-layout-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+.cp-layout-arrow {
+    flex-shrink: 0;
+    width: 14px;
+    font-size: 13px;
+}
+.cp-layout-visual {
+    display: inline-flex;
+    align-items: center;
+    gap: 0;
+    flex: 1;
+    overflow: hidden;
+    min-width: 0;
+}
+.cp-layout-visual .path-segment-card {
+    padding: 1px 5px;
+    font-size: 11px;
+    line-height: 1.3;
+    cursor: default;
+}
+.cp-layout-visual .path-segment-card .seg-remove { display: none; }
+.cp-layout-visual .path-segment-root,
+.cp-layout-visual .path-segment-sep,
+.cp-layout-visual .path-segment-wildcard {
+    font-size: 11px;
+}
+.cp-layout-count {
+    flex-shrink: 0;
+    font-size: 11px;
+    font-weight: 400;
+    color: var(--text-dim);
+    margin-left: auto;
+    padding: 0 4px;
+}
+.cp-layout-btn {
+    flex-shrink: 0;
+    background: none;
+    border: none;
+    color: var(--text-dim);
+    cursor: pointer;
+    padding: 2px 4px;
+    border-radius: 3px;
+    display: flex;
+    align-items: center;
+}
+.cp-layout-btn:hover { color: var(--text-primary); background: rgba(255,255,255,0.08); }
+.cp-layout-btn.cp-layout-delete:hover { color: var(--danger, #e74c3c); }
 .collection-preview-row.cp-folder { cursor: pointer; }
 .collection-preview-row.cp-folder:hover { background: rgba(255,255,255,0.04); }
 
