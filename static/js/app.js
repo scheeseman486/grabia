@@ -762,6 +762,8 @@
                     archive_id: data.archive_id || null,
                     phase: data.phase || "",
                     message: data.message || "",
+                    current: data.current || 0,
+                    total: data.total || 0,
                 };
                 if (idx >= 0) ongoingMetadata[idx] = entry;
                 else ongoingMetadata.push(entry);
@@ -4913,12 +4915,20 @@
                 : meta.phase === "storing" ? "Storing files"
                 : meta.phase === "comparing" ? "Comparing files"
                 : meta.phase === "tagging" ? "Auto-tagging"
+                : meta.phase === "contents" ? "Scanning archives"
                 : "Metadata";
+            const hasProgress = meta.phase === "contents" && meta.total > 0;
+            const pct = hasProgress ? Math.min(100, (meta.current / meta.total) * 100) : 0;
+            const statsText = hasProgress ? `${meta.current}/${meta.total}` : "";
             html += `<div class="activity-ongoing-row activity-dl-row"${meta.archive_id ? ` data-navigate="metadata" data-archive-id="${meta.archive_id}"` : ""}>`;
             html += `<div class="activity-dl-info">`;
             html += `<span class="activity-dl-name"><strong>${escapeHtml(phaseLabel)}</strong> — ${escapeHtml(label)}</span>`;
-            html += `<span class="activity-dl-stats"></span></div>`;
-            html += `<div class="activity-dl-bar"><div class="activity-dl-fill activity-dl-fill-indeterminate"></div></div>`;
+            html += `<span class="activity-dl-stats">${statsText}</span></div>`;
+            if (hasProgress) {
+                html += `<div class="activity-dl-bar"><div class="activity-dl-fill" style="width:${pct.toFixed(1)}%"></div></div>`;
+            } else {
+                html += `<div class="activity-dl-bar"><div class="activity-dl-fill activity-dl-fill-indeterminate"></div></div>`;
+            }
             html += `</div>`;
         }
 

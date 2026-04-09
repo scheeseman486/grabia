@@ -517,11 +517,9 @@ def _add_archive_bg(identifier, options):
     archive = db.get_archive(archive_id)
     broadcast_sse("archive_added", archive)
 
-    # Queue content fetch for compressed files
-    try:
-        queue_archive_contents_fetch(archive_id)
-    except Exception as e:
-        log.warning("Content fetch queueing failed for archive %d: %s", archive_id, e)
+    # Fetch view_archive.php contents inline with progress
+    fetched, total_archives = _fetch_archive_contents_inline(
+        archive_id, identifier, act_job_id=act_job_id)
 
     broadcast_sse("metadata_progress", {
         "identifier": identifier,
@@ -530,12 +528,15 @@ def _add_archive_bg(identifier, options):
         "message": f"Added {meta['title'] or identifier} ({meta['files_count']} files)",
     })
 
+    summary_parts = [f"{meta['files_count']} files"]
+    if fetched:
+        summary_parts.append(f"{fetched} archive(s) inspected")
     activity.log(act_job_id, "success",
-                 f"Added {meta['title'] or identifier}: {meta['files_count']} files",
+                 f"Added {meta['title'] or identifier}: {', '.join(summary_parts)}",
                  archive_id=archive_id)
     activity.flush()
     activity.finish_job(act_job_id, "completed",
-                        summary=f"Added: {meta['files_count']} files")
+                        summary=f"Added: {', '.join(summary_parts)}")
 
 
 @app.route("/api/archives/<int:archive_id>", methods=["GET"])
@@ -661,11 +662,9 @@ def _refresh_archive_bg(archive_id):
     updated = db.get_archive(archive_id)
     broadcast_sse("archive_updated", updated)
 
-    # Re-queue content fetch for any new/changed compressed files
-    try:
-        queue_archive_contents_fetch(archive_id)
-    except Exception as e:
-        log.warning("Content fetch queueing failed for archive %d: %s", archive_id, e)
+    # Fetch view_archive.php contents inline with progress
+    fetched, _ = _fetch_archive_contents_inline(
+        archive_id, identifier, act_job_id=act_job_id)
 
     parts = []
     if summary.get("new", 0) > 0:
@@ -684,9 +683,11 @@ def _refresh_archive_bg(archive_id):
         "summary": summary,
     })
 
+    summary_msg = f"Refreshed {title}: {changes_text}"
+    if fetched:
+        summary_msg += f" ({fetched} archive(s) inspected)"
     activity.log(act_job_id, "success" if parts else "info",
-                 f"Refreshed {title}: {changes_text}",
-                 archive_id=archive_id)
+                 summary_msg, archive_id=archive_id)
     activity.flush()
     activity.finish_job(act_job_id, "completed",
                         summary=f"Refresh: {changes_text}")
@@ -785,6 +786,94 @@ def queue_archive_contents_fetch(archive_id, file_id=None):
     if count:
         wake_content_fetch_worker()
     return count
+
+
+def _fetch_archive_contents_inline(archive_id, identifier, act_job_id=None):
+    """Fetch view_archive.php contents for all compressed files in an archive,
+    running inline (not via the queue worker) with progress broadcasting.
+    Used by the metadata background workers so content discovery is part of
+    the same activity job.  Returns (fetched_count, total_count)."""
+    import activity as _activity
+
+    archive = db.get_archive(archive_id)
+    if not archive:
+        return 0, 0
+
+    ia_email = db.get_setting("ia_email", "")
+    ia_password = db.get_setting("ia_password", "")
+    use_http = db.get_setting("use_http", "0") == "1"
+
+    files, _ = db.get_archive_files(archive_id)
+    targets = []
+    for f in files:
+        ext = os.path.splitext(f["name"])[1].lower()
+        if ext in ARCHIVE_EXTENSIONS and f.get("origin", "manifest") == "manifest":
+            if not f.get("contents_fetched_at"):
+                targets.append(f)
+
+    if not targets:
+        return 0, 0
+
+    total = len(targets)
+    fetched = 0
+
+    broadcast_sse("metadata_progress", {
+        "identifier": identifier,
+        "archive_id": archive_id,
+        "phase": "contents",
+        "message": f"Fetching archive contents (0/{total})...",
+        "current": 0,
+        "total": total,
+    })
+
+    for i, f in enumerate(targets):
+        # Hash-based staleness: skip if already fetched and hash exists
+        if f.get("contents_fetched_at") and f.get("md5"):
+            fetched += 1
+            continue
+
+        try:
+            contents = ia_client.fetch_archive_contents(
+                identifier, f["name"],
+                server=archive.get("server"), dir_path=archive.get("dir"),
+                ia_email=ia_email, ia_password=ia_password,
+                use_http=use_http,
+            )
+        except Exception as e:
+            log.warning("content_fetch", "Failed to fetch contents for %s: %s",
+                        f["name"], e)
+            if act_job_id:
+                _activity.log(act_job_id, "warning",
+                              f"Could not fetch contents for {f['name']}: {e}",
+                              archive_id=archive_id, file_id=f["id"])
+            continue
+
+        if contents is not None:
+            count = db.add_archive_content_files(archive_id, f["id"], contents)
+            db.set_contents_fetched(f["id"])
+            fetched += 1
+            if count > 0:
+                broadcast_sse("archive_updated", {"id": archive_id})
+                if act_job_id:
+                    _activity.log(act_job_id, "info",
+                                  f"Discovered {count} files inside {f['name']}",
+                                  archive_id=archive_id, file_id=f["id"])
+            # Check for nested archives
+            _queue_nested_archive_inspection(archive_id, f["id"])
+
+        broadcast_sse("metadata_progress", {
+            "identifier": identifier,
+            "archive_id": archive_id,
+            "phase": "contents",
+            "message": f"Fetching archive contents ({i + 1}/{total})...",
+            "current": i + 1,
+            "total": total,
+        })
+
+    if act_job_id:
+        _activity.flush()
+
+    return fetched, total
 
 
 def _content_fetch_worker():
