@@ -769,6 +769,9 @@
                 startUiTick();
             }
             refreshOngoingActivity();
+            // Update metadata queue tab
+            _refreshMetadataQueueIfVisible();
+            updateQueueBadges();
         });
 
         es.addEventListener("notification_created", (e) => {
@@ -1056,7 +1059,7 @@
             queueDisplayText.textContent = `Scanning${prog}`;
             queueDisplay.title = `Scanning files`;
         } else {
-            const total = (queueCounts.download || 0) + (queueCounts.processing || 0) + (queueCounts.scan || 0);
+            const total = (queueCounts.download || 0) + (queueCounts.processing || 0) + (queueCounts.scan || 0) + (queueCounts.metadata || 0);
             if (total > 0) {
                 queueDisplayText.textContent = total + (total === 1 ? " item queued" : " items queued");
                 queueDisplay.title = total + " pending across queues";
@@ -1078,7 +1081,7 @@
         }
 
         // Update badge
-        const total = (queueCounts.download || 0) + (queueCounts.processing || 0) + (queueCounts.scan || 0);
+        const total = (queueCounts.download || 0) + (queueCounts.processing || 0) + (queueCounts.scan || 0) + (queueCounts.metadata || 0);
         if (total > 0) {
             queueDisplayBadge.textContent = total > 999 ? "999+" : total;
             queueDisplayBadge.style.display = "";
@@ -4969,9 +4972,9 @@
     }
 
     // ── Queue Page ──────────────────────────────────────────────────
-    let queueCounts = { download: 0, processing: 0, scan: 0 };
-    let queueData = { download: [], processing: [], scan: [] };
-    let queueStale = { download: true, processing: true, scan: true };
+    let queueCounts = { download: 0, processing: 0, scan: 0, metadata: 0 };
+    let queueData = { download: [], processing: [], scan: [], metadata: [] };
+    let queueStale = { download: true, processing: true, scan: true, metadata: true };
     let activeQueueTab = "download";
     // Track items completing with 3-second grey-out before removal
     // Map of "queueType:entryId" -> setTimeout handle
@@ -5026,13 +5029,52 @@
         const dlBadge = $("#queue-tab-download-badge");
         const procBadge = $("#queue-tab-processing-badge");
         const scanBadge = $("#queue-tab-scan-badge");
+        const metaBadge = $("#queue-tab-metadata-badge");
         dlBadge.textContent = queueCounts.download > 0 ? `(${queueCounts.download})` : "";
         procBadge.textContent = queueCounts.processing > 0 ? `(${queueCounts.processing})` : "";
         scanBadge.textContent = queueCounts.scan > 0 ? `(${queueCounts.scan})` : "";
+        if (metaBadge) {
+            // Metadata count comes from server OR from live ongoingMetadata array
+            const metaCount = queueCounts.metadata || ongoingMetadata.length;
+            metaBadge.textContent = metaCount > 0 ? `(${metaCount})` : "";
+        }
     }
 
     async function loadQueueTab(tab) {
         queueStale[tab] = false;
+        if (tab === "metadata") {
+            // Metadata queue is driven by the live ongoingMetadata array + API seed
+            try {
+                const jobs = await api("GET", "/api/metadata/queue");
+                // Merge: API gives us archive info, ongoingMetadata gives live phase/pct
+                const merged = [];
+                const seen = new Set();
+                for (const m of ongoingMetadata) {
+                    seen.add(m.identifier);
+                    merged.push(m);
+                }
+                // Add any API jobs not yet tracked by SSE
+                for (const j of jobs) {
+                    const key = j.archive_identifier || j.archive_id;
+                    if (!seen.has(key) && !seen.has(String(j.archive_id))) {
+                        merged.push({
+                            identifier: j.archive_identifier || "",
+                            archive_id: j.archive_id,
+                            phase: j.summary || "running",
+                            message: j.archive_title || j.archive_identifier || "",
+                            pct: null,
+                            _job_id: j.id,
+                        });
+                    }
+                }
+                queueData.metadata = merged;
+            } catch (e) {
+                // Fallback to ongoingMetadata only
+                queueData.metadata = [...ongoingMetadata];
+            }
+            renderQueueTable(tab);
+            return;
+        }
         const endpoints = {
             download: "/api/download/queue",
             processing: "/api/processing/queue",
@@ -5047,23 +5089,35 @@
         }
     }
 
+    function _refreshMetadataQueueIfVisible() {
+        if ($("#page-queues").classList.contains("active") && activeQueueTab === "metadata") {
+            // For metadata, we can update queueData directly from ongoingMetadata without an API call
+            queueData.metadata = [...ongoingMetadata];
+            renderQueueTable("metadata");
+        } else {
+            queueStale.metadata = true;
+        }
+    }
+
     // Queue selection state (separate from file list selection)
     let selectedQueueIds = new Set();
     let lastClickedQueueIdx = null;
     let queueDragSrcIdx = null;
     let queueFilterTimers = {};
-    let queueFilterText = { download: "", processing: "", scan: "" };
-    let queueSortBy = { download: "position", processing: "position", scan: "position" };
+    let queueFilterText = { download: "", processing: "", scan: "", metadata: "" };
+    let queueSortBy = { download: "position", processing: "position", scan: "position", metadata: "position" };
     // Filtered+sorted view of queueData, rebuilt on each render
-    let queueView = { download: [], processing: [], scan: [] };
+    let queueView = { download: [], processing: [], scan: [], metadata: [] };
     // Queue virtual scroll state
     const QS_ROW_HEIGHT = 37;
     const QS_OVERSCAN = 15;
-    let qsLastRange = { download: null, processing: null, scan: null };
-    let qsScrollRAF = { download: null, processing: null, scan: null };
+    let qsLastRange = { download: null, processing: null, scan: null, metadata: null };
+    let qsScrollRAF = { download: null, processing: null, scan: null, metadata: null };
 
     function getQueueItemId(tab, item) {
-        return tab === "download" ? (item.file_id || item.id) : item.id;
+        if (tab === "download") return item.file_id || item.id;
+        if (tab === "metadata") return item.identifier || item.archive_id || item._job_id || "";
+        return item.id;
     }
 
     function getQueueItemPos(tab, item) {
@@ -5114,13 +5168,13 @@
         if (sortKey === "position") {
             sorted.sort((a, b) => getQueueItemPos(tab, a) - getQueueItemPos(tab, b));
         } else if (sortKey === "name") {
-            sorted.sort((a, b) => (a.file_name || a.name || "").localeCompare(b.file_name || b.name || ""));
+            sorted.sort((a, b) => (a.file_name || a.name || a.identifier || "").localeCompare(b.file_name || b.name || b.identifier || ""));
         } else if (sortKey === "size") {
             sorted.sort((a, b) => (b.size || b.file_size || 0) - (a.size || a.file_size || 0));
         } else if (sortKey === "status") {
             sorted.sort((a, b) => {
-                const sa = tab === "download" ? (a.download_status || "") : (a.status || "");
-                const sb = tab === "download" ? (b.download_status || "") : (b.status || "");
+                const sa = tab === "download" ? (a.download_status || "") : tab === "metadata" ? (a.phase || "") : (a.status || "");
+                const sb = tab === "download" ? (b.download_status || "") : tab === "metadata" ? (b.phase || "") : (b.status || "");
                 return sa.localeCompare(sb);
             });
         } else if (sortKey === "archive") {
@@ -5139,7 +5193,7 @@
     }
 
     function getQueueColspan(tab) {
-        return tab === "download" ? 7 : tab === "processing" ? 5 : 3;
+        return tab === "download" ? 7 : tab === "processing" ? 5 : 3; // scan=3, metadata=3
     }
 
     function buildQueueRow(tab, item, i, lastIdx, byPosition) {
@@ -5215,7 +5269,7 @@
             html += `<td class="col-archive-q" title="${escapeHtml(archiveLabel)}">${escapeHtml(archiveLabel)}</td>`;
             html += `<td class="col-profile-q" title="${escapeHtml(item.profile_name || "")}">${escapeHtml(item.profile_name || "")}</td>`;
             html += `<td class="col-status"><span class="file-status ${statusClass}"${statusPctStyle}>${statusLabel}</span></td>`;
-        } else {
+        } else if (tab === "scan") {
             const status = item.status || "pending";
             const statusClass = (status === "running" || status === "scanning") ? "scanning" : status;
             let statusLabel = status;
@@ -5228,6 +5282,20 @@
             html += `<td class="col-name"><div class="file-name-wrap">${renderFileName(fname, bold)}</div></td>`;
             html += `<td class="col-archive-q" title="${escapeHtml(archiveLabel)}">${escapeHtml(archiveLabel)}</td>`;
             html += `<td class="col-status"><span class="file-status ${statusClass}"${statusPctStyle}>${statusLabel}</span></td>`;
+        } else if (tab === "metadata") {
+            const phase = item.phase || "queued";
+            const phaseClass = (phase === "queued") ? "pending" : (phase === "error") ? "error" : "scanning";
+            const label = item.identifier || item.message || "";
+            const pct = item.pct != null ? item.pct : null;
+            let progressHtml = "";
+            if (pct != null) {
+                progressHtml = `<div class="meta-progress-wrap"><div class="meta-progress-bar" style="width:${Math.min(100, pct).toFixed(1)}%"></div><span class="meta-progress-label">${pct.toFixed(1)}%</span></div>`;
+            } else {
+                progressHtml = `<span class="meta-progress-label">${escapeHtml(item.message || phase)}</span>`;
+            }
+            html += `<td class="col-name"><div class="file-name-wrap">${escapeHtml(label)}</div></td>`;
+            html += `<td class="col-status"><span class="file-status ${phaseClass}">${escapeHtml(phase)}</span></td>`;
+            html += `<td class="col-progress-q">${progressHtml}</td>`;
         }
 
         tr.innerHTML = html;
@@ -5261,14 +5329,15 @@
 
             const n = selectedQueueIds.size;
             const byPos = isQueueSortedByPosition(tab);
-            const items = [
-                { label: `Remove from Queue (${n})`, action: () => batchRemoveFromQueue(tab) },
-            ];
-            if (byPos) {
+            const items = [];
+            if (tab !== "metadata") {
+                items.push({ label: `Remove from Queue (${n})`, action: () => batchRemoveFromQueue(tab) });
+            }
+            if (byPos && tab !== "metadata") {
                 items.push({ label: "Move to Top", action: () => batchMoveQueue(tab, "top") });
                 items.push({ label: "Move to Bottom", action: () => batchMoveQueue(tab, "bottom") });
             }
-            items.push({ separator: true });
+            if (items.length > 0) items.push({ separator: true });
             items.push({ label: "Deselect", action: () => { selectedQueueIds.clear(); renderQueueTable(tab); } });
 
             showContextMenu(e, items);
@@ -5305,8 +5374,12 @@
     }
 
     // Called when data or filter/sort changes — recomputes view and triggers virtual render
+    function queueAbbr(tab) {
+        return tab === "download" ? "dl" : tab === "processing" ? "proc" : tab === "metadata" ? "meta" : "scan";
+    }
+
     function renderQueueTable(tab) {
-        const abbr = tab === "download" ? "dl" : tab === "processing" ? "proc" : "scan";
+        const abbr = queueAbbr(tab);
         const empty = $(`#queue-${abbr}-empty`);
         const wrap = $(`#queue-${abbr}-wrap`);
 
@@ -5342,7 +5415,7 @@
         }
         if (idx === -1) return;
 
-        const abbr = tab === "download" ? "dl" : tab === "processing" ? "proc" : "scan";
+        const abbr = queueAbbr(tab);
         const wrap = $(`#queue-${abbr}-wrap`);
         if (!wrap) return;
 
@@ -5372,7 +5445,7 @@
         // Don't rebuild rows during drag
         if (queueDragSrcIdx !== null) return;
 
-        const abbr = tab === "download" ? "dl" : tab === "processing" ? "proc" : "scan";
+        const abbr = queueAbbr(tab);
         const tbody = $(`#queue-${abbr}-tbody`);
         const wrap = $(`#queue-${abbr}-wrap`);
         const view = queueView[tab];
@@ -5685,8 +5758,8 @@
         });
 
         // Virtual scroll for queue table wraps
-        ["dl", "proc", "scan"].forEach((abbr, idx) => {
-            const qTab = ["download", "processing", "scan"][idx];
+        ["dl", "proc", "scan", "meta"].forEach((abbr, idx) => {
+            const qTab = ["download", "processing", "scan", "metadata"][idx];
             const wrap = $(`#queue-${abbr}-wrap`);
             if (wrap) {
                 wrap.addEventListener("scroll", () => {

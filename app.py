@@ -2520,6 +2520,18 @@ def get_scan_queue_endpoint():
     return jsonify(db.get_scan_queue(limit))
 
 
+@app.route("/api/metadata/queue", methods=["GET"])
+@login_required
+def get_metadata_queue():
+    """Return running and queued metadata activity jobs for the queue display."""
+    import activity as _activity
+    jobs = _activity.get_jobs(category="metadata", limit=200)
+    # Only include running jobs (not completed/failed)
+    active = [j for j in jobs if j.get("status") == "running"]
+    # Enrich with the ongoingMetadata state so the frontend can show phase/pct
+    return jsonify(active)
+
+
 @app.route("/api/scan/queue/reorder", methods=["POST"])
 @login_required
 def reorder_scan_queue():

@@ -381,6 +381,9 @@
                 <button class="queue-tab" data-queue="scan">
                     File Scans <span class="queue-tab-badge" id="queue-tab-scan-badge"></span>
                 </button>
+                <button class="queue-tab" data-queue="metadata">
+                    Metadata <span class="queue-tab-badge" id="queue-tab-metadata-badge"></span>
+                </button>
             </div>
             <!-- Download Queue Tab -->
             <div class="queue-panel active" id="queue-panel-download">
@@ -514,6 +517,37 @@
                     </table>
                 </div>
                 <div class="queue-empty" id="queue-scan-empty" style="display:none">No files in scan queue</div>
+            </div>
+            <!-- Metadata Queue Tab -->
+            <div class="queue-panel" id="queue-panel-metadata">
+                <div class="queue-controls">
+                    <span class="queue-progress-text" id="queue-meta-progress"></span>
+                </div>
+                <div class="file-toolbar">
+                    <div class="file-search">
+                        <svg viewBox="0 0 24 24" width="14" height="14"><path d="M15.5 14h-.79l-.28-.27A6.471 6.471 0 0016 9.5 6.5 6.5 0 109.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z" fill="currentColor"/></svg>
+                        <input type="text" class="queue-filter" data-queue="metadata" placeholder="Filter archives…">
+                    </div>
+                    <div class="sort-control">
+                        <label>Sort by</label>
+                        <select class="queue-sort" data-queue="metadata">
+                            <option value="position">Queue Order</option>
+                            <option value="name">Name</option>
+                            <option value="status">Status</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="file-table-wrap" id="queue-meta-wrap">
+                    <table class="file-table queue-file-table" id="queue-meta-table">
+                        <thead><tr>
+                            <th class="col-name">Archive</th>
+                            <th class="col-status">Phase</th>
+                            <th class="col-progress-q">Progress</th>
+                        </tr></thead>
+                        <tbody id="queue-meta-tbody"></tbody>
+                    </table>
+                </div>
+                <div class="queue-empty" id="queue-meta-empty" style="display:none">No metadata operations in progress</div>
             </div>
         </section>
 

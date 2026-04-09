@@ -3221,7 +3221,7 @@ def clear_completed_scan_entries(archive_id=None):
 # ── Queue Overhaul: Queue Counts ─────────────────────────────────────
 
 def get_queue_counts():
-    """Return total queue counts across all three queue types for the topbar badge,
+    """Return total queue counts across all four queue types for the topbar badge,
     plus pause states so the UI can seed button appearance."""
     with _db() as conn:
         download = conn.execute(
@@ -3233,10 +3233,14 @@ def get_queue_counts():
         scan = conn.execute(
             "SELECT COUNT(*) FROM scan_queue WHERE status IN ('pending', 'running')"
         ).fetchone()[0]
+        metadata = conn.execute(
+            "SELECT COUNT(*) FROM activity_jobs WHERE category = 'metadata' AND status = 'running'"
+        ).fetchone()[0]
         return {
             "download": download,
             "processing": processing,
             "scan": scan,
+            "metadata": metadata,
             "processing_paused": is_processing_paused(),
             "scan_paused": get_setting("scan_paused", "0") == "1",
         }
