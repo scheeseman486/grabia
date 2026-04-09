@@ -421,13 +421,58 @@ def add_archive():
     if existing:
         return jsonify({"error": f"Archive '{identifier}' already exists"}), 409
 
+    # Run in background so the request returns immediately
+    options = {
+        "enable": data.get("enable", False),
+        "select_all": data.get("select_all", True),
+        "group_id": data.get("group_id"),
+    }
+    threading.Thread(
+        target=_add_archive_bg,
+        args=(identifier, options),
+        daemon=True,
+    ).start()
+
+    return jsonify({"ok": True, "identifier": identifier, "status": "fetching"}), 202
+
+
+def _add_archive_bg(identifier, options):
+    """Background worker: fetch IA metadata, create archive, broadcast progress."""
+    import activity
+
+    act_job_id = activity.start_job("metadata", archive_id=None)
+    activity.log(act_job_id, "info", f"Fetching metadata for {identifier}",
+                 detail=identifier)
+    activity.flush()
+
+    broadcast_sse("metadata_progress", {
+        "identifier": identifier,
+        "phase": "fetching",
+        "message": f"Fetching metadata for {identifier}...",
+    })
+
     try:
         ia_email = db.get_setting("ia_email", "")
         ia_password = db.get_setting("ia_password", "")
         use_http = db.get_setting("use_http", "0") == "1"
         meta = ia_client.fetch_metadata(identifier, ia_email, ia_password, use_http=use_http)
     except Exception as e:
-        return jsonify({"error": f"Failed to fetch metadata: {str(e)}"}), 502
+        broadcast_sse("metadata_progress", {
+            "identifier": identifier,
+            "phase": "error",
+            "message": f"Failed to fetch metadata: {e}",
+        })
+        activity.log(act_job_id, "error", f"Failed to fetch metadata: {e}",
+                     detail=identifier)
+        activity.flush()
+        activity.finish_job(act_job_id, "failed", summary=f"Failed: {e}")
+        return
+
+    broadcast_sse("metadata_progress", {
+        "identifier": identifier,
+        "phase": "storing",
+        "message": f"Storing {meta['files_count']} files...",
+    })
 
     archive_id = db.add_archive(
         identifier=meta["identifier"],
@@ -442,7 +487,19 @@ def add_archive():
     )
     db.add_archive_files(archive_id, meta["files"])
 
+    # Update the activity job now that we have an archive_id
+    with db._db() as conn:
+        conn.execute("UPDATE activity_jobs SET archive_id = ? WHERE id = ?",
+                     (archive_id, act_job_id))
+        conn.commit()
+
     # Auto-tag based on filenames
+    broadcast_sse("metadata_progress", {
+        "identifier": identifier,
+        "archive_id": archive_id,
+        "phase": "tagging",
+        "message": "Auto-tagging files...",
+    })
     try:
         from auto_tagger import auto_tag_archive
         auto_tag_archive(archive_id)
@@ -450,15 +507,12 @@ def add_archive():
         log.warning("Auto-tag failed for archive %d: %s", archive_id, e)
 
     # Apply options from the add modal
-    enable = data.get("enable", False)
-    select_all = data.get("select_all", True)
-    group_id = data.get("group_id")
-    if enable:
+    if options.get("enable"):
         db.set_archive_download_enabled(archive_id, True)
-    if not select_all:
+    if not options.get("select_all", True):
         db.set_all_files_queued(archive_id, False)
-    if group_id:
-        db.set_archive_group(archive_id, group_id)
+    if options.get("group_id"):
+        db.set_archive_group(archive_id, options["group_id"])
 
     archive = db.get_archive(archive_id)
     broadcast_sse("archive_added", archive)
@@ -469,7 +523,19 @@ def add_archive():
     except Exception as e:
         log.warning("Content fetch queueing failed for archive %d: %s", archive_id, e)
 
-    return jsonify(archive), 201
+    broadcast_sse("metadata_progress", {
+        "identifier": identifier,
+        "archive_id": archive_id,
+        "phase": "done",
+        "message": f"Added {meta['title'] or identifier} ({meta['files_count']} files)",
+    })
+
+    activity.log(act_job_id, "success",
+                 f"Added {meta['title'] or identifier}: {meta['files_count']} files",
+                 archive_id=archive_id)
+    activity.flush()
+    activity.finish_job(act_job_id, "completed",
+                        summary=f"Added: {meta['files_count']} files")
 
 
 @app.route("/api/archives/<int:archive_id>", methods=["GET"])
@@ -534,13 +600,62 @@ def refresh_archive(archive_id):
     if not archive:
         return jsonify({"error": "Not found"}), 404
 
+    # Run in background so the request returns immediately
+    threading.Thread(
+        target=_refresh_archive_bg,
+        args=(archive_id,),
+        daemon=True,
+    ).start()
+
+    return jsonify({"ok": True, "status": "refreshing"}), 202
+
+
+def _refresh_archive_bg(archive_id):
+    """Background worker: refresh archive metadata and broadcast progress."""
+    import activity
+
+    archive = db.get_archive(archive_id)
+    if not archive:
+        return
+    identifier = archive["identifier"]
+    title = archive.get("title") or identifier
+
+    act_job_id = activity.start_job("metadata", archive_id=archive_id)
+    activity.log(act_job_id, "info", f"Refreshing metadata for {title}",
+                 archive_id=archive_id)
+    activity.flush()
+
+    broadcast_sse("metadata_progress", {
+        "identifier": identifier,
+        "archive_id": archive_id,
+        "phase": "fetching",
+        "message": f"Refreshing metadata for {title}...",
+    })
+
     try:
         ia_email = db.get_setting("ia_email", "")
         ia_password = db.get_setting("ia_password", "")
         use_http = db.get_setting("use_http", "0") == "1"
-        meta = ia_client.fetch_metadata(archive["identifier"], ia_email, ia_password, use_http=use_http)
+        meta = ia_client.fetch_metadata(identifier, ia_email, ia_password, use_http=use_http)
     except Exception as e:
-        return jsonify({"error": f"Failed to fetch metadata: {str(e)}"}), 502
+        broadcast_sse("metadata_progress", {
+            "identifier": identifier,
+            "archive_id": archive_id,
+            "phase": "error",
+            "message": f"Failed to fetch metadata: {e}",
+        })
+        activity.log(act_job_id, "error", f"Refresh failed: {e}",
+                     archive_id=archive_id)
+        activity.flush()
+        activity.finish_job(act_job_id, "failed", summary=f"Failed: {e}")
+        return
+
+    broadcast_sse("metadata_progress", {
+        "identifier": identifier,
+        "archive_id": archive_id,
+        "phase": "comparing",
+        "message": f"Comparing {len(meta['files'])} files...",
+    })
 
     summary = db.refresh_archive_metadata(archive_id, meta["files"])
     updated = db.get_archive(archive_id)
@@ -552,7 +667,29 @@ def refresh_archive(archive_id):
     except Exception as e:
         log.warning("Content fetch queueing failed for archive %d: %s", archive_id, e)
 
-    return jsonify({"ok": True, "summary": summary})
+    parts = []
+    if summary.get("new", 0) > 0:
+        parts.append(f"{summary['new']} new")
+    if summary.get("removed", 0) > 0:
+        parts.append(f"{summary['removed']} removed")
+    if summary.get("changed", 0) > 0:
+        parts.append(f"{summary['changed']} changed")
+    changes_text = ", ".join(parts) if parts else "no changes"
+
+    broadcast_sse("metadata_progress", {
+        "identifier": identifier,
+        "archive_id": archive_id,
+        "phase": "done",
+        "message": f"Refreshed {title}: {changes_text}",
+        "summary": summary,
+    })
+
+    activity.log(act_job_id, "success" if parts else "info",
+                 f"Refreshed {title}: {changes_text}",
+                 archive_id=archive_id)
+    activity.flush()
+    activity.finish_job(act_job_id, "completed",
+                        summary=f"Refresh: {changes_text}")
 
 
 # --- Scan Queue (DB-backed) ---

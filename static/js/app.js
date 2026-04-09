@@ -735,6 +735,41 @@
             refreshOngoingActivity();
         });
 
+        es.addEventListener("metadata_progress", (e) => {
+            const data = JSON.parse(e.data);
+            const key = data.identifier || data.archive_id || "";
+            if (data.phase === "done" || data.phase === "error") {
+                ongoingMetadata = ongoingMetadata.filter(m => m.identifier !== key && m.archive_id !== data.archive_id);
+                _refreshActivityIfVisible();
+                if (data.phase === "done") {
+                    refreshArchives();
+                    if (data.archive_id && currentArchiveId === data.archive_id) loadFiles();
+                    addNotification(data.message || "Metadata operation complete", "success");
+                    // Re-enable refresh button if viewing this archive
+                    const btn = $("#btn-refresh-meta");
+                    if (btn) { btn.disabled = false; btn.textContent = "Refresh Archive Metadata"; }
+                }
+                if (data.phase === "error") {
+                    addNotification(data.message || "Metadata operation failed", "error");
+                    const btn = $("#btn-refresh-meta");
+                    if (btn) { btn.disabled = false; btn.textContent = "Refresh Archive Metadata"; }
+                }
+            } else {
+                // Update or add
+                const idx = ongoingMetadata.findIndex(m => m.identifier === key);
+                const entry = {
+                    identifier: data.identifier || "",
+                    archive_id: data.archive_id || null,
+                    phase: data.phase || "",
+                    message: data.message || "",
+                };
+                if (idx >= 0) ongoingMetadata[idx] = entry;
+                else ongoingMetadata.push(entry);
+                startUiTick();
+            }
+            refreshOngoingActivity();
+        });
+
         es.addEventListener("notification_created", (e) => {
             const notif = JSON.parse(e.data);
             // Don't add duplicates
@@ -1686,16 +1721,14 @@
         btn.disabled = true;
         btn.textContent = "Refreshing…";
         try {
-            let changes = 0;
+            // Each refresh now runs in the background; queue them all.
+            // The SSE metadata_progress events will show ongoing activity.
             for (const a of archives) {
                 try {
-                    const result = await api("POST", `/api/archives/${a.id}/refresh`);
-                    const s = result.summary;
-                    changes += (s.new || 0) + (s.removed || 0) + (s.changed || 0);
+                    await api("POST", `/api/archives/${a.id}/refresh`);
                 } catch (e) {}
             }
-            addNotification(changes > 0 ? `Metadata refresh: ${changes} change(s) across all archives` : "Metadata refresh: no changes detected", changes > 0 ? "warning" : "info");
-            await refreshArchives();
+            addNotification(`Queued metadata refresh for ${archives.length} archive(s)`, "info");
         } finally {
             btn.disabled = false;
             btn.textContent = "Refresh All Metadata";
@@ -1846,25 +1879,15 @@
         if (!currentArchiveId) return;
         const btn = $("#btn-refresh-meta");
         btn.disabled = true;
-        btn.textContent = "Checking...";
+        btn.textContent = "Refreshing...";
 
         try {
-            const result = await api("POST", `/api/archives/${currentArchiveId}/refresh`);
-            const s = result.summary;
-            const parts = [];
-            if (s.new > 0) parts.push(`${s.new} new`);
-            if (s.removed > 0) parts.push(`${s.removed} removed`);
-            if (s.changed > 0) parts.push(`${s.changed} changed`);
-            if (parts.length === 0) {
-                addNotification("Metadata refresh: no changes detected", "info");
-            } else {
-                addNotification("Metadata refresh: " + parts.join(", "), parts.length > 0 ? "warning" : "info");
-            }
-            await loadFiles();
-            await refreshArchives();
+            await api("POST", `/api/archives/${currentArchiveId}/refresh`);
+            // The background worker delivers progress and results via SSE
+            // metadata_progress events.  The button is re-enabled when the
+            // "done" or "error" event arrives (see metadata_progress handler).
         } catch (e) {
             addNotification("Metadata refresh failed: " + e.message, "error");
-        } finally {
             btn.disabled = false;
             btn.textContent = "Refresh Archive Metadata";
         }
@@ -3630,35 +3653,15 @@
     }
 
     async function addArchiveSingle(url, enable, selectAll, groupId) {
-        // Create a server-side notification for the adding operation
-        const label = url.length > 40 ? url.substring(0, 37) + "..." : url;
-        let serverNotifId = null;
+        // The endpoint now returns 202 immediately and runs in the background.
+        // Progress and completion are delivered via SSE metadata_progress events
+        // which appear in the Ongoing activity panel.
         try {
-            const nRes = await api("POST", "/api/notifications", {
-                message: `Adding "${label}": fetching metadata...`,
-                type: "info",
-            });
-            serverNotifId = nRes.id;
-        } catch (_) {
-            const nid = "local-" + (++notifIdCounter);
-            notifications.unshift({ id: nid, message: `Adding "${label}": fetching metadata...`, type: "info", created_at: Date.now() / 1000 });
-            serverNotifId = nid;
-            renderNotifBadge();
-            renderNotifList();
-        }
-
-        try {
-            const result = await api("POST", "/api/archives", { url, enable, select_all: selectAll, group_id: groupId });
-            // Remove progress notification and add success
-            if (typeof serverNotifId === "number") api("DELETE", "/api/notifications/" + serverNotifId).catch(() => {});
-            notifications = notifications.filter(n => n.id !== serverNotifId);
-            const title = result.title || result.identifier || url;
-            addNotification(`Added "${title}"`, "success");
-            refreshArchives();
+            await api("POST", "/api/archives", { url, enable, select_all: selectAll, group_id: groupId });
+            // The background worker will broadcast archive_added and
+            // metadata_progress done/error via SSE — no need to wait here.
         } catch (e) {
-            // Remove progress notification and add error
-            if (typeof serverNotifId === "number") api("DELETE", "/api/notifications/" + serverNotifId).catch(() => {});
-            notifications = notifications.filter(n => n.id !== serverNotifId);
+            const label = url.length > 40 ? url.substring(0, 37) + "..." : url;
             addNotification(`Failed to add "${label}": ${e.message}`, "error");
         }
     }
@@ -4832,6 +4835,7 @@
     // Tracks what's happening now, shared by Phase 2 (activity page) and Phase 4 (dropdown)
     let ongoingProcessing = null;  // {archive_id, filename, current, total, phase}
     let ongoingScanning = null;    // {archive_id, phase, current, total}
+    let ongoingMetadata = [];      // [{identifier, archive_id, phase, message}]
 
     /**
      * Render the compact ongoing-activity rows.
@@ -4899,6 +4903,22 @@
             } else {
                 html += `<div class="activity-dl-bar"><div class="activity-dl-fill activity-dl-fill-indeterminate"></div></div>`;
             }
+            html += `</div>`;
+        }
+
+        // Metadata fetch/refresh rows (can have multiple concurrent)
+        for (const meta of ongoingMetadata) {
+            const label = meta.identifier || "archive";
+            const phaseLabel = meta.phase === "fetching" ? "Fetching metadata"
+                : meta.phase === "storing" ? "Storing files"
+                : meta.phase === "comparing" ? "Comparing files"
+                : meta.phase === "tagging" ? "Auto-tagging"
+                : "Metadata";
+            html += `<div class="activity-ongoing-row activity-dl-row"${meta.archive_id ? ` data-navigate="metadata" data-archive-id="${meta.archive_id}"` : ""}>`;
+            html += `<div class="activity-dl-info">`;
+            html += `<span class="activity-dl-name"><strong>${escapeHtml(phaseLabel)}</strong> — ${escapeHtml(label)}</span>`;
+            html += `<span class="activity-dl-stats"></span></div>`;
+            html += `<div class="activity-dl-bar"><div class="activity-dl-fill activity-dl-fill-indeterminate"></div></div>`;
             html += `</div>`;
         }
 
