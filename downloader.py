@@ -515,6 +515,8 @@ class DownloadManager:
             activity.flush()
             # Auto-process: queue this file for processing if the archive has a profile set
             self._try_auto_process(archive_id, file_id)
+            # Inspect downloaded archive for contents (zip-in-zip discovery)
+            self._try_inspect_archive_contents(archive_id, file_id, filename)
         elif skip_event.is_set() and not self._stop_event.is_set():
             # File was skipped/dequeued mid-download — keep partial bytes on disk
             partial = 0
@@ -751,6 +753,21 @@ class DownloadManager:
             auto_process_file(archive_id, profile_id, file_id)
         except Exception as e:
             log.warning("Auto-process error for file %s: %s", file_id, e)
+
+    def _try_inspect_archive_contents(self, archive_id, file_id, filename):
+        """If the downloaded file is a compressed archive, queue local
+        inspection to discover its contents (nested archives, etc.)."""
+        try:
+            ext = os.path.splitext(filename)[1].lower()
+            archive_exts = {".zip", ".7z", ".rar", ".tar", ".tar.gz", ".tgz"}
+            if ext in archive_exts:
+                db.queue_content_fetch(file_id, archive_id, method="local")
+                # Also cascade status to any known contained files
+                db.update_contained_status(file_id, "contained_queued")
+                from app import wake_content_fetch_worker
+                wake_content_fetch_worker()
+        except Exception as e:
+            log.warning("Content inspection queue error for file %s: %s", file_id, e)
 
     def _check_archive_completion(self, archive_id):
         """Recompute archive status after a file finishes downloading.

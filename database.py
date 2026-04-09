@@ -56,6 +56,44 @@ def _db():
         conn.close()
 
 
+def _has_column(conn, table, column):
+    """Check if a column exists in a table."""
+    cols = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    return any(c["name"] == column for c in cols)
+
+
+def _migrate_schema(conn):
+    """Apply incremental schema migrations for existing databases."""
+    # -- archive_files: add parent_file_id --
+    if not _has_column(conn, "archive_files", "parent_file_id"):
+        conn.execute("ALTER TABLE archive_files ADD COLUMN parent_file_id INTEGER DEFAULT NULL REFERENCES archive_files(id) ON DELETE CASCADE")
+
+    # -- archive_files: add contents_fetched_at --
+    if not _has_column(conn, "archive_files", "contents_fetched_at"):
+        conn.execute("ALTER TABLE archive_files ADD COLUMN contents_fetched_at REAL DEFAULT NULL")
+
+    # -- processing_profile_steps: migrate existing single-step profiles --
+    existing_steps = conn.execute(
+        "SELECT COUNT(*) as cnt FROM processing_profile_steps"
+    ).fetchone()["cnt"]
+    if existing_steps == 0:
+        # Migrate existing profiles that still have processor_type set
+        profiles = conn.execute(
+            "SELECT id, processor_type, options_json FROM processing_profiles WHERE processor_type != ''"
+        ).fetchall()
+        for p in profiles:
+            conn.execute(
+                "INSERT OR IGNORE INTO processing_profile_steps (profile_id, position, processor_type, options_json) "
+                "VALUES (?, 0, ?, ?)",
+                (p["id"], p["processor_type"], p["options_json"] or "{}"),
+            )
+
+    # -- content_fetch_queue: reset stuck entries --
+    conn.execute("UPDATE content_fetch_queue SET status = 'pending' WHERE status = 'running'")
+
+    conn.commit()
+
+
 def init_db():
     conn = get_db()
     conn.executescript("""
@@ -111,7 +149,10 @@ def init_db():
             processed_files_json TEXT NOT NULL DEFAULT '',
             process_queue_status TEXT NOT NULL DEFAULT '',
             media_root TEXT NOT NULL DEFAULT '',
+            parent_file_id INTEGER DEFAULT NULL,
+            contents_fetched_at REAL DEFAULT NULL,
             FOREIGN KEY (archive_id) REFERENCES archives(id) ON DELETE CASCADE,
+            FOREIGN KEY (parent_file_id) REFERENCES archive_files(id) ON DELETE CASCADE,
             UNIQUE(archive_id, name)
         );
 
@@ -322,6 +363,39 @@ def init_db():
             created_at REAL NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_scan_queue_status ON scan_queue(status, position);
+
+        -- Archive contents: junction table for multi-input processing
+        CREATE TABLE IF NOT EXISTS local_file_sources (
+            local_file_id INTEGER NOT NULL REFERENCES local_files(id) ON DELETE CASCADE,
+            source_file_id INTEGER NOT NULL REFERENCES archive_files(id) ON DELETE CASCADE,
+            role TEXT NOT NULL DEFAULT 'primary',
+            UNIQUE(local_file_id, source_file_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_lfs_local ON local_file_sources(local_file_id);
+        CREATE INDEX IF NOT EXISTS idx_lfs_source ON local_file_sources(source_file_id);
+
+        -- Pipeline profiles: ordered steps per profile
+        CREATE TABLE IF NOT EXISTS processing_profile_steps (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            profile_id INTEGER NOT NULL REFERENCES processing_profiles(id) ON DELETE CASCADE,
+            position INTEGER NOT NULL DEFAULT 0,
+            processor_type TEXT NOT NULL,
+            options_json TEXT NOT NULL DEFAULT '{}',
+            UNIQUE(profile_id, position)
+        );
+
+        -- Content fetch queue: background tasks for fetching/inspecting archive contents
+        CREATE TABLE IF NOT EXISTS content_fetch_queue (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            file_id INTEGER NOT NULL REFERENCES archive_files(id) ON DELETE CASCADE,
+            archive_id INTEGER NOT NULL,
+            method TEXT NOT NULL DEFAULT 'remote',
+            status TEXT NOT NULL DEFAULT 'pending',
+            position INTEGER NOT NULL DEFAULT 0,
+            error_message TEXT NOT NULL DEFAULT '',
+            created_at REAL NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_cfq_status ON content_fetch_queue(status, position);
     """)
 
     # Default settings
@@ -349,6 +423,10 @@ def init_db():
     conn.execute("CREATE INDEX IF NOT EXISTS idx_af_processing_status ON archive_files(processing_status)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_af_download_status ON archive_files(download_status)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_af_archive_id ON archive_files(archive_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_af_parent ON archive_files(parent_file_id)")
+
+    # --- Schema migrations for existing databases ---
+    _migrate_schema(conn)
 
     # Queue state settings
     conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('download_state', 'stopped')")
@@ -802,6 +880,13 @@ def get_archive_files(archive_id, sort="name", sort_dir=None, search=""):
                 d["processed_outputs"] = "|".join(r2["name"] for r2 in outs)
             else:
                 d["processed_outputs"] = ""
+            # Check for contained archive files (archive_content children)
+            children_row = conn.execute(
+                "SELECT COUNT(*) as cnt FROM archive_files WHERE parent_file_id = ?",
+                (fid,),
+            ).fetchone()
+            d["has_contents"] = children_row["cnt"] > 0
+            d["children_count"] = children_row["cnt"]
             result.append(d)
         return result, total
 
@@ -1330,13 +1415,28 @@ def change_password(old_password, new_password):
 def get_processing_profiles():
     with _db() as conn:
         rows = conn.execute("SELECT * FROM processing_profiles ORDER BY position ASC").fetchall()
-        return [dict(r) for r in rows]
+        profiles = [dict(r) for r in rows]
+        for p in profiles:
+            steps = conn.execute(
+                "SELECT * FROM processing_profile_steps WHERE profile_id = ? ORDER BY position ASC",
+                (p["id"],),
+            ).fetchall()
+            p["steps"] = [dict(s) for s in steps]
+        return profiles
 
 
 def get_processing_profile(profile_id):
     with _db() as conn:
         row = conn.execute("SELECT * FROM processing_profiles WHERE id = ?", (profile_id,)).fetchone()
-        return dict(row) if row else None
+        if not row:
+            return None
+        p = dict(row)
+        steps = conn.execute(
+            "SELECT * FROM processing_profile_steps WHERE profile_id = ? ORDER BY position ASC",
+            (profile_id,),
+        ).fetchall()
+        p["steps"] = [dict(s) for s in steps]
+        return p
 
 
 def add_processing_profile(name, processor_type, options=None):
@@ -1373,6 +1473,241 @@ def delete_processing_profile(profile_id):
         # Unlink any archives using this profile
         conn.execute("UPDATE archives SET processing_profile_id = NULL WHERE processing_profile_id = ?", (profile_id,))
         conn.execute("DELETE FROM processing_profiles WHERE id = ?", (profile_id,))
+        conn.commit()
+
+
+# --- Processing Profile Steps ---
+
+def get_profile_steps(profile_id):
+    """Get ordered steps for a processing profile."""
+    with _db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM processing_profile_steps WHERE profile_id = ? ORDER BY position ASC",
+            (profile_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def set_profile_steps(profile_id, steps):
+    """Replace all steps for a profile. steps is a list of dicts with
+    processor_type and options_json (or options dict)."""
+    with _db() as conn:
+        conn.execute("DELETE FROM processing_profile_steps WHERE profile_id = ?", (profile_id,))
+        for i, step in enumerate(steps):
+            opts = step.get("options_json", step.get("options", {}))
+            if isinstance(opts, dict):
+                opts = json.dumps(opts)
+            conn.execute(
+                "INSERT INTO processing_profile_steps (profile_id, position, processor_type, options_json) "
+                "VALUES (?, ?, ?, ?)",
+                (profile_id, i, step["processor_type"], opts),
+            )
+        conn.commit()
+
+
+def add_profile_step(profile_id, processor_type, options=None, position=None):
+    """Append or insert a step into a profile pipeline."""
+    with _db() as conn:
+        if position is None:
+            row = conn.execute(
+                "SELECT COALESCE(MAX(position), -1) + 1 as next_pos FROM processing_profile_steps WHERE profile_id = ?",
+                (profile_id,),
+            ).fetchone()
+            position = row["next_pos"]
+        conn.execute(
+            "INSERT INTO processing_profile_steps (profile_id, position, processor_type, options_json) "
+            "VALUES (?, ?, ?, ?)",
+            (profile_id, position, processor_type, json.dumps(options or {})),
+        )
+        step_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        conn.commit()
+        return step_id
+
+
+def delete_profile_step(step_id):
+    """Delete a step and re-compact positions."""
+    with _db() as conn:
+        row = conn.execute("SELECT profile_id FROM processing_profile_steps WHERE id = ?", (step_id,)).fetchone()
+        if not row:
+            return
+        profile_id = row["profile_id"]
+        conn.execute("DELETE FROM processing_profile_steps WHERE id = ?", (step_id,))
+        # Re-compact positions
+        steps = conn.execute(
+            "SELECT id FROM processing_profile_steps WHERE profile_id = ? ORDER BY position ASC",
+            (profile_id,),
+        ).fetchall()
+        for i, s in enumerate(steps):
+            conn.execute("UPDATE processing_profile_steps SET position = ? WHERE id = ?", (i, s["id"]))
+        conn.commit()
+
+
+# --- Archive Contents (contained files) ---
+
+def add_archive_content_files(archive_id, parent_file_id, files):
+    """Insert archive_content rows for files discovered inside a compressed archive.
+    `files` is a list of dicts with keys: name, size, mtime, is_dir.
+    Returns count of inserted rows."""
+    count = 0
+    with _db() as conn:
+        for f in files:
+            if f.get("is_dir"):
+                continue
+            try:
+                conn.execute(
+                    "INSERT INTO archive_files (archive_id, name, size, mtime, origin, "
+                    "download_status, parent_file_id) VALUES (?, ?, ?, ?, 'archive_content', 'contained', ?)",
+                    (archive_id, f["name"], f.get("size", 0), f.get("mtime", ""), parent_file_id),
+                )
+                count += 1
+            except Exception:
+                # UNIQUE constraint — file already exists, update instead
+                conn.execute(
+                    "UPDATE archive_files SET size = ?, mtime = ?, parent_file_id = ? "
+                    "WHERE archive_id = ? AND name = ?",
+                    (f.get("size", 0), f.get("mtime", ""), parent_file_id, archive_id, f["name"]),
+                )
+        conn.commit()
+    return count
+
+
+def get_archive_content_files(parent_file_id):
+    """Get all files contained inside a given archive file."""
+    with _db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM archive_files WHERE parent_file_id = ? ORDER BY name",
+            (parent_file_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_all_contained_files(archive_id):
+    """Get all archive_content files for an archive."""
+    with _db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM archive_files WHERE archive_id = ? AND origin = 'archive_content' ORDER BY name",
+            (archive_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def delete_archive_content_files(parent_file_id):
+    """Remove all contained file rows for a parent archive."""
+    with _db() as conn:
+        conn.execute(
+            "DELETE FROM archive_files WHERE parent_file_id = ? AND origin = 'archive_content'",
+            (parent_file_id,),
+        )
+        conn.commit()
+
+
+def set_contents_fetched(file_id):
+    """Mark a file as having had its contents fetched/inspected."""
+    with _db() as conn:
+        conn.execute(
+            "UPDATE archive_files SET contents_fetched_at = ? WHERE id = ?",
+            (time.time(), file_id),
+        )
+        conn.commit()
+
+
+def update_contained_status(parent_file_id, new_status):
+    """Cascade status update to all contained files when host status changes.
+    new_status should be 'contained', 'contained_queued', or 'extracted'."""
+    with _db() as conn:
+        conn.execute(
+            "UPDATE archive_files SET download_status = ? "
+            "WHERE parent_file_id = ? AND origin = 'archive_content'",
+            (new_status, parent_file_id),
+        )
+        conn.commit()
+
+
+# --- Local File Sources (multi-input processing) ---
+
+def add_local_file_source(local_file_id, source_file_id, role="primary"):
+    """Record a source relationship for a local file."""
+    with _db() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO local_file_sources (local_file_id, source_file_id, role) "
+            "VALUES (?, ?, ?)",
+            (local_file_id, source_file_id, role),
+        )
+        conn.commit()
+
+
+def get_local_file_sources(local_file_id):
+    """Get all source files for a local file."""
+    with _db() as conn:
+        rows = conn.execute(
+            "SELECT lfs.*, af.name as source_name, af.size as source_size "
+            "FROM local_file_sources lfs "
+            "JOIN archive_files af ON lfs.source_file_id = af.id "
+            "WHERE lfs.local_file_id = ? ORDER BY lfs.role",
+            (local_file_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_dependents_of_source(source_file_id):
+    """Get all local files that depend on a given source file."""
+    with _db() as conn:
+        rows = conn.execute(
+            "SELECT lf.* FROM local_files lf "
+            "JOIN local_file_sources lfs ON lf.id = lfs.local_file_id "
+            "WHERE lfs.source_file_id = ?",
+            (source_file_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+# --- Content Fetch Queue ---
+
+def queue_content_fetch(file_id, archive_id, method="remote"):
+    """Queue a background task to fetch/inspect archive contents."""
+    with _db() as conn:
+        # Don't double-queue
+        existing = conn.execute(
+            "SELECT id FROM content_fetch_queue WHERE file_id = ? AND status IN ('pending', 'running')",
+            (file_id,),
+        ).fetchone()
+        if existing:
+            return existing["id"]
+        row = conn.execute(
+            "SELECT COALESCE(MAX(position), -1) + 1 as next_pos FROM content_fetch_queue"
+        ).fetchone()
+        cur = conn.execute(
+            "INSERT INTO content_fetch_queue (file_id, archive_id, method, status, position, created_at) "
+            "VALUES (?, ?, ?, 'pending', ?, ?)",
+            (file_id, archive_id, method, row["next_pos"], time.time()),
+        )
+        conn.commit()
+        return cur.lastrowid
+
+
+def get_next_content_fetch():
+    """Get next pending content fetch task. Returns dict or None."""
+    with _db() as conn:
+        row = conn.execute(
+            "SELECT * FROM content_fetch_queue WHERE status = 'pending' ORDER BY position ASC LIMIT 1"
+        ).fetchone()
+        if not row:
+            return None
+        conn.execute(
+            "UPDATE content_fetch_queue SET status = 'running' WHERE id = ?", (row["id"],)
+        )
+        conn.commit()
+        return dict(row)
+
+
+def complete_content_fetch(entry_id, error=None):
+    """Mark a content fetch task as completed or failed."""
+    with _db() as conn:
+        status = "failed" if error else "completed"
+        conn.execute(
+            "UPDATE content_fetch_queue SET status = ?, error_message = ? WHERE id = ?",
+            (status, error or "", entry_id),
+        )
         conn.commit()
 
 
@@ -1872,6 +2207,15 @@ def get_collection_files(collection_id):
 
                UNION ALL
 
+               SELECT af.id, af.archive_id, af.name, af.size, 'extracted' AS file_type,
+                      a.identifier AS archive_identifier, af.media_root,
+                      af.parent_file_id AS source_file_id
+               FROM archive_files af
+               JOIN archives a ON af.archive_id = a.id
+               WHERE af.download_status = 'extracted' AND af.origin = 'archive_content'
+
+               UNION ALL
+
                SELECT lf.id, lf.archive_id, lf.name, lf.size,
                       lf.origin AS file_type,
                       a.identifier AS archive_identifier, '' AS media_root,
@@ -2079,6 +2423,47 @@ def get_file_tags_bulk(file_ids):
         for r in rows:
             result[r["file_id"]].append({"tag": r["tag"], "auto": bool(r["auto"])})
     return result
+
+
+def get_inherited_file_tags(file_id):
+    """Get tags inherited from parent archive files via parent_file_id chain.
+    Returns list of tag dicts with source='inherited'."""
+    inherited = []
+    seen_tags = set()
+    with _db() as conn:
+        # Walk up parent_file_id chain
+        current_id = file_id
+        while current_id is not None:
+            row = conn.execute(
+                "SELECT parent_file_id FROM archive_files WHERE id = ?", (current_id,)
+            ).fetchone()
+            if not row or row["parent_file_id"] is None:
+                break
+            parent_id = row["parent_file_id"]
+            # Get parent's tags
+            parent_tags = conn.execute(
+                "SELECT tag, auto FROM file_tags WHERE file_id = ? ORDER BY tag",
+                (parent_id,),
+            ).fetchall()
+            for t in parent_tags:
+                if t["tag"] not in seen_tags:
+                    seen_tags.add(t["tag"])
+                    inherited.append({"tag": t["tag"], "auto": True, "inherited": True})
+            # Also get archive-level tags if parent is a top-level file
+            parent_info = conn.execute(
+                "SELECT archive_id FROM archive_files WHERE id = ?", (parent_id,)
+            ).fetchone()
+            if parent_info:
+                archive_tags = conn.execute(
+                    "SELECT tag, auto FROM archive_tags WHERE archive_id = ?",
+                    (parent_info["archive_id"],),
+                ).fetchall()
+                for t in archive_tags:
+                    if t["tag"] not in seen_tags:
+                        seen_tags.add(t["tag"])
+                        inherited.append({"tag": t["tag"], "auto": True, "inherited": True})
+            current_id = parent_id
+    return inherited
 
 
 def clear_auto_file_tags(file_id):

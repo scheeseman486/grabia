@@ -987,16 +987,17 @@
 
     <!-- Add/Edit Processing Profile Modal -->
     <div class="modal-overlay" id="modal-edit-profile">
-        <div class="modal" style="min-width:400px">
+        <div class="modal" style="min-width:460px;max-width:560px">
             <h3 id="edit-profile-title">Add Profile</h3>
             <div class="settings-form">
                 <label>Name
-                    <input type="text" id="edit-profile-name" placeholder="e.g. PS1 to CHD">
+                    <input type="text" id="edit-profile-name" placeholder="e.g. Extract → CHD (CD)">
                 </label>
-                <label>Processor Type
-                    <select id="edit-profile-type"></select>
-                </label>
-                <div id="edit-profile-options"></div>
+                <div class="pipeline-steps-section">
+                    <div class="pipeline-steps-label">Pipeline Steps</div>
+                    <div id="pipeline-steps-list"></div>
+                    <button class="action-btn small" id="btn-add-pipeline-step" type="button">+ Add Step</button>
+                </div>
             </div>
             <div class="modal-actions">
                 <button class="action-btn" id="btn-edit-profile-cancel">Cancel</button>

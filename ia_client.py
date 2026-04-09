@@ -127,6 +127,80 @@ def fetch_metadata(identifier, ia_email=None, ia_password=None, use_http=False):
     }
 
 
+def fetch_archive_contents(identifier, filename, server=None, dir_path=None,
+                           ia_email=None, ia_password=None, use_http=False):
+    """Fetch the file listing inside a compressed archive from IA's view_archive.php.
+
+    Returns list of dicts:
+        [{"name": "sonic cd.bin", "size": 640000, "mtime": "1996-12-24 17:32:00", "is_dir": False}, ...]
+
+    Only yields the first level of contents — nested archives (zip-in-zip)
+    are discovered later via local inspection.
+    """
+    cookies, _ = get_download_cookies(ia_email or "", ia_password or "")
+    scheme = "http" if use_http else "https"
+
+    # Prefer direct URL via server/dir (avoids redirect)
+    if server and dir_path:
+        url = f"{scheme}://{server}/view_archive.php?archive={dir_path}/{filename}"
+    else:
+        # Canonical URL with trailing slash triggers redirect to view_archive.php
+        url = f"{scheme}://archive.org/download/{identifier}/{requests.utils.quote(filename)}/"
+
+    try:
+        resp = requests.get(url, cookies=cookies, timeout=60, allow_redirects=True)
+        resp.raise_for_status()
+        html = resp.text
+    except requests.exceptions.RequestException as e:
+        log.warning("Failed to fetch archive contents for %s/%s: %s", identifier, filename, e)
+        return None
+    finally:
+        try:
+            resp.close()
+        except Exception:
+            pass
+
+    return _parse_view_archive_html(html)
+
+
+def _parse_view_archive_html(html):
+    """Parse the HTML response from view_archive.php into structured file entries."""
+    entries = []
+    # view_archive.php outputs lines like:
+    #   <a href="...">filename</a>  2024-01-15 12:30:00  12345
+    # Some entries may show directory markers (trailing /)
+    import re as _re
+
+    # Match each table row or line containing a link + optional timestamp + size
+    # Pattern handles both table-based and pre-formatted text layouts
+    for match in _re.finditer(
+        r'<a\s[^>]*>([^<]+)</a>\s*'           # link text (filename)
+        r'(?:(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}(?::\d{2})?)\s+)?'  # optional timestamp
+        r'(\d+)?',                              # optional size in bytes
+        html,
+    ):
+        name = match.group(1).strip()
+        mtime = match.group(2) or ""
+        size_str = match.group(3)
+
+        # Skip parent directory link
+        if name in (".", "..", "../"):
+            continue
+
+        is_dir = name.endswith("/")
+        if is_dir:
+            name = name.rstrip("/")
+
+        entries.append({
+            "name": name,
+            "size": int(size_str) if size_str else 0,
+            "mtime": mtime.strip(),
+            "is_dir": is_dir,
+        })
+
+    return entries
+
+
 def get_download_url(identifier, filename, server=None, dir_path=None, use_http=False):
     """Construct a download URL for a specific file."""
     scheme = "http" if use_http else "https"

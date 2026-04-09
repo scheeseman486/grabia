@@ -462,6 +462,13 @@ def add_archive():
 
     archive = db.get_archive(archive_id)
     broadcast_sse("archive_added", archive)
+
+    # Queue content fetch for compressed files
+    try:
+        queue_archive_contents_fetch(archive_id)
+    except Exception as e:
+        log.warning("Content fetch queueing failed for archive %d: %s", archive_id, e)
+
     return jsonify(archive), 201
 
 
@@ -538,6 +545,13 @@ def refresh_archive(archive_id):
     summary = db.refresh_archive_metadata(archive_id, meta["files"])
     updated = db.get_archive(archive_id)
     broadcast_sse("archive_updated", updated)
+
+    # Re-queue content fetch for any new/changed compressed files
+    try:
+        queue_archive_contents_fetch(archive_id)
+    except Exception as e:
+        log.warning("Content fetch queueing failed for archive %d: %s", archive_id, e)
+
     return jsonify({"ok": True, "summary": summary})
 
 
@@ -596,6 +610,184 @@ def _scan_worker():
 
 _scan_thread = threading.Thread(target=_scan_worker, daemon=True)
 _scan_thread.start()
+
+
+# --- Content Fetch Worker (archive contents discovery) ---
+
+_content_fetch_wake = threading.Event()
+
+ARCHIVE_EXTENSIONS = {".zip", ".7z", ".rar", ".tar", ".tar.gz", ".tgz"}
+
+
+def wake_content_fetch_worker():
+    """Signal the content fetch worker that new entries are available."""
+    _content_fetch_wake.set()
+
+
+def queue_archive_contents_fetch(archive_id, file_id=None):
+    """Queue content fetch tasks for compressed files in an archive.
+    If file_id is given, queue only that file. Otherwise queue all
+    compressed files that haven't been fetched yet."""
+    archive = db.get_archive(archive_id)
+    if not archive:
+        return 0
+
+    if file_id:
+        db.queue_content_fetch(file_id, archive_id, method="remote")
+        wake_content_fetch_worker()
+        return 1
+
+    files, _ = db.get_archive_files(archive_id)
+    count = 0
+    for f in files:
+        ext = os.path.splitext(f["name"])[1].lower()
+        if ext in ARCHIVE_EXTENSIONS and f.get("origin", "manifest") == "manifest":
+            if not f.get("contents_fetched_at"):
+                db.queue_content_fetch(f["id"], archive_id, method="remote")
+                count += 1
+    if count:
+        wake_content_fetch_worker()
+    return count
+
+
+def _content_fetch_worker():
+    """Background worker that fetches/inspects archive contents."""
+    while True:
+        entry = db.get_next_content_fetch()
+        if not entry:
+            _content_fetch_wake.wait(timeout=5.0)
+            _content_fetch_wake.clear()
+            continue
+
+        try:
+            _process_content_fetch(entry)
+        except Exception as e:
+            db.complete_content_fetch(entry["id"], error=str(e))
+            log.error("content_fetch", "Content fetch %d failed: %s", entry["id"], e)
+
+
+def _process_content_fetch(entry):
+    """Process a single content fetch queue entry."""
+    file_id = entry["file_id"]
+    archive_id = entry["archive_id"]
+    method = entry["method"]
+
+    f = db.get_file(file_id)
+    if not f:
+        db.complete_content_fetch(entry["id"], error="File not found")
+        return
+
+    archive = db.get_archive(archive_id)
+    if not archive:
+        db.complete_content_fetch(entry["id"], error="Archive not found")
+        return
+
+    contents = None
+
+    if method == "remote":
+        # Fetch from IA's view_archive.php
+        ia_email = db.get_setting("ia_email", "")
+        ia_password = db.get_setting("ia_password", "")
+        use_http = db.get_setting("use_http", "0") == "1"
+
+        # Hash-based staleness check: skip if the file hash hasn't changed
+        if f.get("contents_fetched_at") and f.get("md5"):
+            # Already fetched and hash available — skip unless forced
+            db.complete_content_fetch(entry["id"])
+            return
+
+        contents = ia_client.fetch_archive_contents(
+            archive["identifier"], f["name"],
+            server=archive.get("server"), dir_path=archive.get("dir"),
+            ia_email=ia_email, ia_password=ia_password,
+            use_http=use_http,
+        )
+    elif method == "local":
+        # Inspect a local archive on disk
+        contents = _inspect_local_archive(archive, f)
+
+    if contents is None:
+        db.complete_content_fetch(entry["id"], error="Could not fetch contents")
+        return
+
+    # Store discovered files as archive_content rows
+    count = db.add_archive_content_files(archive_id, file_id, contents)
+    db.set_contents_fetched(file_id)
+    db.complete_content_fetch(entry["id"])
+
+    if count > 0:
+        broadcast_sse("archive_updated", {"id": archive_id})
+
+    # Check for nested archives in the discovered contents and queue local
+    # inspection for any that are on disk
+    _queue_nested_archive_inspection(archive_id, file_id)
+
+
+def _inspect_local_archive(archive, file_info):
+    """Inspect a local archive on disk to list its contents without extracting."""
+    from processors import _list_archive_contents as list_contents
+
+    download_dir = db.get_setting("download_dir", os.path.expanduser("~/ia-downloads"))
+    processed_dir = db.get_setting("processed_dir", "")
+    if not processed_dir:
+        processed_dir = os.path.join(os.path.dirname(download_dir), "processed")
+
+    # Try both download and processed directories
+    for base in (os.path.join(download_dir, archive["identifier"]),
+                 os.path.join(processed_dir, archive["identifier"])):
+        file_path = os.path.join(base, file_info["name"])
+        if os.path.isfile(file_path):
+            names = list_contents(file_path)
+            if names is not None:
+                # Convert flat name list to structured entries
+                import zipfile as _zipfile
+                entries = []
+                ext = os.path.splitext(file_path)[1].lower()
+                try:
+                    if ext == ".zip":
+                        with _zipfile.ZipFile(file_path, "r") as zf:
+                            for info in zf.infolist():
+                                if info.is_dir():
+                                    continue
+                                dt = info.date_time
+                                mtime = f"{dt[0]:04d}-{dt[1]:02d}-{dt[2]:02d} {dt[3]:02d}:{dt[4]:02d}:{dt[5]:02d}" if dt else ""
+                                entries.append({
+                                    "name": info.filename,
+                                    "size": info.file_size,
+                                    "mtime": mtime,
+                                    "is_dir": False,
+                                })
+                    else:
+                        # For 7z/rar, we only get names from _list_archive_contents
+                        for name in names:
+                            entries.append({
+                                "name": name,
+                                "size": 0,
+                                "mtime": "",
+                                "is_dir": False,
+                            })
+                except Exception as e:
+                    log.warning("content_fetch", "Failed to inspect %s: %s", file_path, e)
+                    return None
+                return entries
+    return None
+
+
+def _queue_nested_archive_inspection(archive_id, parent_file_id):
+    """After discovering contents of an archive, check if any of the contained
+    files are themselves archives. If they're on disk, queue local inspection."""
+    contained = db.get_archive_content_files(parent_file_id)
+    for f in contained:
+        ext = os.path.splitext(f["name"])[1].lower()
+        if ext in ARCHIVE_EXTENSIONS and not f.get("contents_fetched_at"):
+            # Only queue local inspection if the file might be on disk
+            if f["download_status"] in ("downloaded", "extracted"):
+                db.queue_content_fetch(f["id"], archive_id, method="local")
+    wake_content_fetch_worker()
+
+
+_content_fetch_thread = threading.Thread(target=_content_fetch_worker, daemon=True)
+_content_fetch_thread.start()
 
 
 def _run_single_file_scan(entry):
@@ -1098,6 +1290,13 @@ def _finish_archive_scan(archive_id):
             ).fetchall()
             manifest_names = {r["name"] for r in manifest_rows}
 
+            # Also include contained file names (archive_content) for recognition
+            contained_rows = conn.execute(
+                "SELECT id, name FROM archive_files WHERE archive_id = ? AND origin = 'archive_content'",
+                (archive_id,),
+            ).fetchall()
+            contained_names = {r["name"]: r["id"] for r in contained_rows}
+
             # Build stem→file_id lookup for match-by-name (stem = name without extension)
             # Includes subdirectory path: "subdir/Game (USA)" maps to file_id
             stem_to_manifest = {}
@@ -1105,6 +1304,11 @@ def _finish_archive_scan(archive_id):
                 for r in manifest_rows:
                     stem = os.path.splitext(r["name"])[0]
                     # Only keep first match per stem (closest manifest entry)
+                    if stem not in stem_to_manifest:
+                        stem_to_manifest[stem] = r["id"]
+                # Also include contained files in stem matching
+                for r in contained_rows:
+                    stem = os.path.splitext(r["name"])[0]
                     if stem not in stem_to_manifest:
                         stem_to_manifest[stem] = r["id"]
 
@@ -1119,6 +1323,17 @@ def _finish_archive_scan(archive_id):
                 full = os.path.join(root, fname)
                 rel = os.path.relpath(full, base_dir)
                 if rel in manifest_names or rel in processed_names:
+                    continue
+                # Recognize contained files found on disk (post-extraction)
+                if rel in contained_names:
+                    # Mark the contained file as extracted
+                    cfid = contained_names[rel]
+                    with db._db() as _conn:
+                        _conn.execute(
+                            "UPDATE archive_files SET download_status = 'extracted' WHERE id = ? AND download_status IN ('contained', 'contained_queued')",
+                            (cfid,),
+                        )
+                        _conn.commit()
                     continue
 
                 # Try stem-matching: does this file's stem match a manifest entry?
@@ -1602,6 +1817,38 @@ def get_processed_tree(file_id):
     return jsonify({"tree": tree})
 
 
+# --- Archive Contents (contained files) ---
+
+@app.route("/api/files/<int:file_id>/contents", methods=["GET"])
+@login_required
+def get_file_contents(file_id):
+    """Get the contained files inside an archive file."""
+    contents = db.get_archive_content_files(file_id)
+    return jsonify({"contents": contents, "total": len(contents)})
+
+
+@app.route("/api/files/<int:file_id>/fetch-contents", methods=["POST"])
+@login_required
+def fetch_file_contents(file_id):
+    """Manually trigger fetching/inspecting contents of an archive file."""
+    f = db.get_file(file_id)
+    if not f:
+        return jsonify({"error": "File not found"}), 404
+
+    method = "local" if f["download_status"] in ("downloaded", "extracted") else "remote"
+    db.queue_content_fetch(file_id, f["archive_id"], method=method)
+    wake_content_fetch_worker()
+    return jsonify({"ok": True, "method": method})
+
+
+@app.route("/api/archives/<int:archive_id>/contained-files", methods=["GET"])
+@login_required
+def get_contained_files(archive_id):
+    """Get all archive_content files for an archive."""
+    files = db.get_all_contained_files(archive_id)
+    return jsonify({"files": files, "total": len(files)})
+
+
 @app.route("/api/files/<int:target_file_id>/assign-output", methods=["POST"])
 @login_required
 def assign_output(target_file_id):
@@ -2041,6 +2288,9 @@ def list_processing_profiles():
     import json as _json
     for p in profiles:
         p["options"] = _json.loads(p.get("options_json", "{}"))
+        # Parse step options too
+        for step in p.get("steps", []):
+            step["options"] = _json.loads(step.get("options_json", "{}"))
     return jsonify(profiles)
 
 
@@ -2051,12 +2301,25 @@ def create_processing_profile():
     name = data.get("name", "").strip()
     processor_type = data.get("processor_type", "")
     options = data.get("options", {})
+    steps = data.get("steps")
     if not name:
         return jsonify({"error": "Name is required"}), 400
     from processors import get_processor_types
-    if processor_type not in get_processor_types():
+    valid_types = get_processor_types()
+    if processor_type and processor_type not in valid_types:
         return jsonify({"error": f"Unknown processor type: {processor_type}"}), 400
-    profile_id = db.add_processing_profile(name, processor_type, options)
+    # If steps provided, validate each
+    if steps:
+        for s in steps:
+            if s.get("processor_type") not in valid_types:
+                return jsonify({"error": f"Unknown processor type in step: {s.get('processor_type')}"}), 400
+    profile_id = db.add_processing_profile(name, processor_type or (steps[0]["processor_type"] if steps else ""), options)
+    # Set pipeline steps if provided
+    if steps:
+        db.set_profile_steps(profile_id, steps)
+    elif processor_type:
+        # Create single step from legacy fields
+        db.set_profile_steps(profile_id, [{"processor_type": processor_type, "options": options}])
     return jsonify({"ok": True, "id": profile_id})
 
 
@@ -2070,6 +2333,10 @@ def update_processing_profile_endpoint(profile_id):
         processor_type=data.get("processor_type"),
         options=data.get("options"),
     )
+    # Update pipeline steps if provided
+    steps = data.get("steps")
+    if steps is not None:
+        db.set_profile_steps(profile_id, steps)
     return jsonify({"ok": True})
 
 
@@ -2648,17 +2915,25 @@ def trigger_auto_tag_files():
 @app.route("/api/files/<int:file_id>/tags", methods=["GET"])
 @login_required
 def get_file_tags(file_id):
-    """Return tags for a file (own + inherited from archive)."""
+    """Return tags for a file (own + inherited from archive + inherited from parent chain)."""
     own_tags = db.get_file_tags(file_id)
     # Get inherited archive-level tags
     file_info = db.get_file(file_id)
     inherited = []
+    own_tag_set = {t["tag"] for t in own_tags}
     if file_info:
         archive_tags = db.get_archive_tags(file_info["archive_id"])
-        own_tag_set = {t["tag"] for t in own_tags}
         for at in archive_tags:
             if at["tag"] not in own_tag_set:
                 inherited.append({"tag": at["tag"], "auto": True, "inherited": True})
+                own_tag_set.add(at["tag"])
+        # Walk parent_file_id chain for containment inheritance
+        if file_info.get("parent_file_id"):
+            parent_tags = db.get_inherited_file_tags(file_id)
+            for pt in parent_tags:
+                if pt["tag"] not in own_tag_set:
+                    inherited.append(pt)
+                    own_tag_set.add(pt["tag"])
     return jsonify({"own": own_tags, "inherited": inherited})
 
 

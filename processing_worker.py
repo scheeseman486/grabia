@@ -267,7 +267,17 @@ def _populate_processing_queue(job_id, archive_id, profile_id, file_ids, options
     if not profile:
         return
 
-    processor_cls = get_processor(profile["processor_type"])
+    # Use the first pipeline step's processor for determining eligible files
+    steps = profile.get("steps", [])
+    if steps:
+        first_step = steps[0]
+        processor_cls = get_processor(first_step["processor_type"])
+        first_proc_type = first_step["processor_type"]
+    else:
+        # Legacy: single-step profile
+        processor_cls = get_processor(profile["processor_type"])
+        first_proc_type = profile["processor_type"]
+
     if not processor_cls:
         return
 
@@ -291,15 +301,21 @@ def _populate_processing_queue(job_id, archive_id, profile_id, file_ids, options
     if not files:
         return
 
-    # Build entries
-    options_json = {**(json.loads(profile.get("options_json", "{}")) if profile.get("options_json") else {}),
-                    **(options_override or {})}
+    # Build entries — include pipeline step index for chaining
+    step_options = {}
+    if steps:
+        step_opts = json.loads(steps[0].get("options_json", "{}")) if isinstance(steps[0].get("options_json"), str) else steps[0].get("options_json", {})
+        step_options = {**step_opts, "_pipeline_step": 0}
+    else:
+        step_options = json.loads(profile.get("options_json", "{}")) if profile.get("options_json") else {}
+
+    options_json = {**step_options, **(options_override or {})}
     entries = [(f["id"], archive_id, profile_id, options_json) for f in files]
     db.add_processing_queue_entries_batch(job_id, entries)
 
     # Mark all files as queued so the file list shows correct status immediately
     for f in files:
-        db.set_file_processing_status(f["id"], "queued", processor_type=profile["processor_type"])
+        db.set_file_processing_status(f["id"], "queued", processor_type=first_proc_type)
 
     _broadcast("queue_changed", {"queue_type": "processing", "count": len(entries), "archive_id": archive_id})
 
@@ -349,19 +365,37 @@ def _build_job_context(job):
         db.complete_processing_job(job["id"], error_message=msg)
         return None
 
-    processor_cls = get_processor(profile["processor_type"])
-    if not processor_cls:
-        msg = f"Unknown processor type: {profile['processor_type']}"
-        if act_job_id:
-            activity.log(act_job_id, "error", msg, archive_id=archive_id)
-            activity.flush()
-            activity.finish_job(act_job_id, "failed", summary=msg)
-        _broadcast("processing_progress", {
-            "archive_id": archive_id, "phase": "error", "error": msg,
-        })
-        db.complete_processing_job(job["id"], error_message=msg)
-        return None
+    # Build pipeline steps — use profile steps if available, fall back to legacy single-step
+    steps = profile.get("steps", [])
+    if not steps:
+        # Legacy: single-step profile
+        steps = [{"processor_type": profile["processor_type"],
+                  "options_json": profile.get("options_json", "{}")}]
 
+    # Validate all step processors
+    pipeline = []
+    for step in steps:
+        proc_cls = get_processor(step["processor_type"])
+        if not proc_cls:
+            msg = f"Unknown processor type in pipeline: {step['processor_type']}"
+            if act_job_id:
+                activity.log(act_job_id, "error", msg, archive_id=archive_id)
+                activity.flush()
+                activity.finish_job(act_job_id, "failed", summary=msg)
+            _broadcast("processing_progress", {
+                "archive_id": archive_id, "phase": "error", "error": msg,
+            })
+            db.complete_processing_job(job["id"], error_message=msg)
+            return None
+        step_options = json.loads(step.get("options_json", "{}")) if isinstance(step.get("options_json"), str) else step.get("options_json", {})
+        pipeline.append({
+            "processor_cls": proc_cls,
+            "processor_type": step["processor_type"],
+            "options": step_options,
+        })
+
+    # For backwards compatibility, the first step is the "primary" processor
+    processor_cls = pipeline[0]["processor_cls"]
     profile_options = json.loads(profile.get("options_json", "{}"))
     merged_options = {**profile_options, **options_override}
 
@@ -377,6 +411,7 @@ def _build_job_context(job):
         "archive_name": archive_name,
         "profile": profile,
         "processor_cls": processor_cls,
+        "pipeline": pipeline,
         "merged_options": merged_options,
         "archive_dir": archive_dir,
         "output_dir": output_dir,
@@ -406,7 +441,30 @@ def _process_single_entry(entry, ctx):
         return
 
     filename = file_info["name"]
+
+    # Determine which pipeline step this entry is for
+    entry_options = json.loads(entry.get("options_json", "{}")) if isinstance(entry.get("options_json"), str) else (entry.get("options_json") or {})
+    pipeline_step_idx = entry_options.get("_pipeline_step", 0)
+    pipeline = ctx.get("pipeline", [])
+
+    if pipeline and pipeline_step_idx < len(pipeline):
+        step = pipeline[pipeline_step_idx]
+        active_processor_cls = step["processor_cls"]
+        step_options = step.get("options", {})
+        active_merged_options = {**step_options, **(entry_options or {})}
+        active_proc_type = step["processor_type"]
+    else:
+        active_processor_cls = processor_cls
+        active_merged_options = merged_options
+        active_proc_type = profile["processor_type"]
+
+    # Remove internal pipeline tracking key from options passed to the processor
+    active_merged_options.pop("_pipeline_step", None)
+
+    # For chained steps, the file may be in the output dir rather than the archive dir
     file_path = os.path.join(archive_dir, filename)
+    if not os.path.isfile(file_path):
+        file_path = os.path.join(output_dir, filename)
 
     # Claim the queue entry
     if not db.claim_processing_queue_entry(entry["id"]):
@@ -435,9 +493,9 @@ def _process_single_entry(entry, ctx):
         })
 
     try:
-        log.debug("worker", "Processing file: %s (entry %d)", filename, entry["id"])
-        processor = processor_cls(
-            options=merged_options,
+        log.debug("worker", "Processing file: %s (entry %d, step %d)", filename, entry["id"], pipeline_step_idx)
+        processor = active_processor_cls(
+            options=active_merged_options,
             cancel_check=_cancelled,
             progress_callback=progress_cb,
         )
@@ -458,7 +516,7 @@ def _process_single_entry(entry, ctx):
                              archive_id=archive_id, file_id=file_id,
                              detail=reason)
         else:
-            delete_original = merged_options.get("delete_original", "yes") == "yes"
+            delete_original = active_merged_options.get("delete_original", "yes") == "yes"
             if delete_original:
                 for to_delete in result.get("files_to_delete", []):
                     try:
@@ -476,43 +534,70 @@ def _process_single_entry(entry, ctx):
             db.set_file_processing_status(
                 file_id, "processed",
                 processed_filename=result["processed_filename"],
-                processor_type=profile["processor_type"],
+                processor_type=active_proc_type,
                 processed_files=result.get("processed_files"),
             )
 
-            # Write processed outputs to overlay table
+            # Determine origin: 'extract' step produces extracted files, others produce processed
+            is_extract_step = active_proc_type == "extract"
+            overlay_origin = "processed"
+
+            # Write processed outputs to overlay table.
+            # Keep the relative path as-is from the result — extract outputs
+            # may include subdirectory prefixes (e.g. "disc1/game.cue") that
+            # must be preserved so the scan, pipeline chaining, and file tree
+            # all resolve correctly.
             pf = result["processed_filename"]
-            pf_flat = os.path.basename(pf.rstrip("/").rstrip(os.sep)) if "/" in pf or os.sep in pf else pf
+            pf_name = pf.rstrip("/").rstrip(os.sep)
             try:
-                output_path = os.path.join(ctx["output_dir"], pf_flat)
+                output_path = os.path.join(ctx["output_dir"], pf_name)
                 pf_size = os.path.getsize(output_path) if os.path.isfile(output_path) else 0
             except OSError:
                 pf_size = 0
-            db.add_local_file(
-                archive_id, name=pf_flat, origin="processed",
+            lf_id = db.add_local_file(
+                archive_id, name=pf_name, origin=overlay_origin,
                 source_file_id=file_id, size=pf_size,
-                processor_type=profile["processor_type"],
+                processor_type=active_proc_type,
                 processing_job_id=ctx.get("job_id"),
             )
+            # Record source relationship in junction table
+            if lf_id:
+                db.add_local_file_source(lf_id, file_id, role="primary")
+
+            # If extraction step, update contained file statuses
+            if is_extract_step:
+                db.update_contained_status(file_id, "extracted")
+                # Queue local inspection for newly extracted archives
+                try:
+                    from app import _queue_nested_archive_inspection
+                    _queue_nested_archive_inspection(archive_id, file_id)
+                except Exception:
+                    pass
+
             # Additional outputs
             for extra in result.get("processed_files", []) or []:
-                extra_flat = os.path.basename(extra.rstrip("/").rstrip(os.sep)) if "/" in extra or os.sep in extra else extra
-                if extra_flat != pf_flat:
+                extra_name = extra.rstrip("/").rstrip(os.sep)
+                if extra_name != pf_name:
                     try:
-                        extra_path = os.path.join(ctx["output_dir"], extra_flat)
+                        extra_path = os.path.join(ctx["output_dir"], extra_name)
                         ex_size = os.path.getsize(extra_path) if os.path.isfile(extra_path) else 0
                     except OSError:
                         ex_size = 0
-                    db.add_local_file(
-                        archive_id, name=extra_flat, origin="processed",
+                    extra_lf_id = db.add_local_file(
+                        archive_id, name=extra_name, origin=overlay_origin,
                         source_file_id=file_id, size=ex_size,
-                        processor_type=profile["processor_type"],
+                        processor_type=active_proc_type,
                         processing_job_id=ctx.get("job_id"),
                     )
+                    if extra_lf_id:
+                        db.add_local_file_source(extra_lf_id, file_id, role="primary")
             if act_job_id:
                 activity.log(act_job_id, "success",
                              f"Converted: {filename} → {result['processed_filename']}",
                              archive_id=archive_id, file_id=file_id)
+
+            # Pipeline chaining: if there are more steps, auto-queue matching outputs
+            _chain_pipeline_step(entry, ctx, result)
 
         _broadcast("processing_progress", {
             "archive_id": archive_id,
@@ -563,6 +648,133 @@ def _process_single_entry(entry, ctx):
             "phase": "file_error",
             "error": str(e),
         })
+
+
+def _chain_pipeline_step(entry, ctx, result):
+    """After a step completes, check if the pipeline has more steps.
+    If so, auto-queue matching output files for the next step."""
+    pipeline = ctx.get("pipeline", [])
+    if len(pipeline) <= 1:
+        return  # Single-step profile, nothing to chain
+
+    # Determine which step index just ran
+    entry_options = json.loads(entry.get("options_json", "{}")) if isinstance(entry.get("options_json"), str) else (entry.get("options_json") or {})
+    current_step_idx = entry_options.get("_pipeline_step", 0)
+    next_step_idx = current_step_idx + 1
+
+    if next_step_idx >= len(pipeline):
+        return  # No more steps
+
+    next_step = pipeline[next_step_idx]
+    next_proc_cls = next_step["processor_cls"]
+    next_input_exts = set(getattr(next_proc_cls, "input_extensions", []))
+
+    if not next_input_exts:
+        return
+
+    # Gather output file names from the result.  These may be bare basenames
+    # (e.g. "game.chd" from a CHD step) or relative paths that include
+    # subdirectories (e.g. "disc1/game.cue" from an extract step).
+    outputs = []
+    pf = result.get("processed_filename")
+    if pf:
+        pf_name = pf.rstrip("/").rstrip(os.sep)
+        outputs.append(pf_name)
+    for extra in result.get("processed_files", []) or []:
+        extra_name = extra.rstrip("/").rstrip(os.sep)
+        if extra_name not in outputs:
+            outputs.append(extra_name)
+
+    # Filter outputs to those that match the next step's input extensions
+    matching = [f for f in outputs if os.path.splitext(f)[1].lower() in next_input_exts]
+    if not matching:
+        return
+
+    archive_id = ctx["archive_id"]
+    job_id = ctx["job_id"]
+    profile_id = ctx["profile"]["id"]
+    file_id = entry["file_id"]  # the parent file that was just processed
+
+    # Find archive_files rows for outputs.  Extracted outputs may exist as
+    # archive_content rows (from view_archive.php or local inspection) OR may
+    # only exist in local_files / on disk if no prior content discovery happened.
+    # Basename fallback handles path representation differences between the
+    # extract output (e.g. "disc1/game.cue") and content discovery rows.
+    queued_count = 0
+    with db._db() as conn:
+        # Pre-load archive_content children of this file for basename matching
+        children = conn.execute(
+            "SELECT id, name FROM archive_files "
+            "WHERE archive_id = ? AND parent_file_id = ? AND origin = 'archive_content'",
+            (archive_id, file_id),
+        ).fetchall()
+        children_by_basename = {}
+        for ch in children:
+            bn = os.path.basename(ch["name"])
+            children_by_basename.setdefault(bn, ch)
+
+        for output_name in matching:
+            af_id = None
+
+            # 1) Exact name match in archive_files
+            af_row = conn.execute(
+                "SELECT id FROM archive_files WHERE archive_id = ? AND name = ?",
+                (archive_id, output_name),
+            ).fetchone()
+            if af_row:
+                af_id = af_row["id"]
+
+            # 2) Basename match against contained children (handles path
+            #    differences between extract output and content discovery)
+            if af_id is None:
+                output_basename = os.path.basename(output_name)
+                ch = children_by_basename.get(output_basename)
+                if ch:
+                    af_id = ch["id"]
+
+            # 3) No archive_files row exists — create one so it can be queued.
+            #    This happens when extraction ran without prior content discovery.
+            if af_id is None:
+                try:
+                    output_path = os.path.join(ctx.get("output_dir", ""), output_name)
+                    out_size = os.path.getsize(output_path) if os.path.isfile(output_path) else 0
+                except OSError:
+                    out_size = 0
+                try:
+                    conn.execute(
+                        "INSERT INTO archive_files "
+                        "(archive_id, name, size, origin, download_status, parent_file_id) "
+                        "VALUES (?, ?, ?, 'archive_content', 'extracted', ?)",
+                        (archive_id, output_name, out_size, file_id),
+                    )
+                    conn.commit()
+                    af_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+                except Exception:
+                    # UNIQUE conflict — row exists under a different lookup path
+                    conn.rollback()
+                    continue
+
+            if af_id:
+                next_options = {**next_step.get("options", {}), "_pipeline_step": next_step_idx}
+                db.add_processing_queue_entries_batch(
+                    job_id,
+                    [(af_id, archive_id, profile_id, next_options)],
+                )
+                db.set_file_processing_status(af_id, "queued",
+                                              processor_type=next_step["processor_type"])
+                queued_count += 1
+                log.debug("worker", "Pipeline chain: queued %s (af_id=%d) for step %d (%s)",
+                          output_name, af_id, next_step_idx, next_step["processor_type"])
+
+    if queued_count == 0:
+        return
+
+    _broadcast("queue_changed", {
+        "queue_type": "processing",
+        "count": queued_count,
+        "archive_id": archive_id,
+    })
+    _wake_event.set()
 
 
 def _handle_cancellation(entry, ctx):

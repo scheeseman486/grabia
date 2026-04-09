@@ -1516,7 +1516,9 @@ class ExtractProcessor(BaseProcessor):
             if not extracted:
                 return {"skipped": True, "reason": "Archive is empty"}
 
-            # Output directly into the flat processed directory
+            # Output into the processed directory, preserving archive
+            # subdirectory structure so that multi-disc / multi-folder
+            # archives keep their layout intact.
             os.makedirs(download_dir, exist_ok=True)
 
             created = []
@@ -1537,21 +1539,24 @@ class ExtractProcessor(BaseProcessor):
                     log.warning("extract", "Skipping symlink in extraction: %s", rel)
                     continue
 
-                # Flatten into download_dir (use basename only to avoid
-                # recreating archive subdirectory structure)
-                dest_name = os.path.basename(rel)
-                dest = os.path.join(download_dir, dest_name)
+                # Preserve the relative path from the archive so that
+                # subdirectory structure (e.g. disc1/, disc2/) is maintained.
+                dest_rel = rel
+                dest = os.path.join(download_dir, dest_rel)
                 # Handle name collisions by appending a suffix
                 if os.path.exists(dest):
-                    stem, ext = os.path.splitext(dest_name)
+                    parent_dir = os.path.dirname(dest_rel)
+                    stem, ext = os.path.splitext(os.path.basename(dest_rel))
                     n = 1
                     while os.path.exists(dest):
-                        dest_name = f"{stem}_{n}{ext}"
-                        dest = os.path.join(download_dir, dest_name)
+                        collision_name = f"{stem}_{n}{ext}"
+                        dest_rel = os.path.join(parent_dir, collision_name) if parent_dir else collision_name
+                        dest = os.path.join(download_dir, dest_rel)
                         n += 1
+                os.makedirs(os.path.dirname(dest), exist_ok=True)
                 shutil.move(src, dest)
                 created.append(dest)
-                all_relative.append(dest_name)
+                all_relative.append(dest_rel)
 
             if not created:
                 return {"skipped": True, "reason": "No files extracted"}

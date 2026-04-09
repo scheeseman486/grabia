@@ -64,6 +64,7 @@
     // --- File Tree State ---
     let vsExpandedFolders = new Set();     // expanded folder paths (e.g. "DOOM WADs")
     let vsProcessedCache = {};             // file_id -> processed tree children (lazy loaded)
+    let vsContentsCache = {};              // file_id -> archive contents (contained files, lazy loaded)
     let vsRowDescriptorsCache = null;      // cached flattened row descriptors
 
     // --- Activity Log Virtual Scroll State ---
@@ -1977,6 +1978,7 @@
         vsExpandedIds.clear();
         vsExpandedFolders.clear();
         vsProcessedCache = {};
+        vsContentsCache = {};
         vsInvalidateDescriptors();
         $("#file-sort").value = "name";
         $("#file-search").value = "";
@@ -2398,12 +2400,28 @@
                 }
             }
             for (const f of node.files) {
-                // If this file is processed, mark it as expandable inline
-                if (f.has_processed) {
-                    const processedPath = "__processed__" + f.id;
-                    const expanded = vsExpandedFolders.has(processedPath);
-                    rows.push({ type: "file", file: f, depth, processedPath, processedExpanded: expanded });
-                    if (expanded && vsProcessedCache[f.id]) {
+                // Skip contained files at root level — they're shown under their parent
+                if (f.parent_file_id) continue;
+
+                const hasProcessed = f.has_processed;
+                const hasContents = f.has_contents;
+                const processedPath = hasProcessed ? "__processed__" + f.id : null;
+                const contentsPath = hasContents ? "__contents__" + f.id : null;
+
+                if (hasProcessed || hasContents) {
+                    const processedExpanded = hasProcessed && vsExpandedFolders.has(processedPath);
+                    const contentsExpanded = hasContents && vsExpandedFolders.has(contentsPath);
+                    rows.push({
+                        type: "file", file: f, depth,
+                        processedPath, processedExpanded,
+                        contentsPath, contentsExpanded,
+                    });
+                    // Show contained files when expanded
+                    if (contentsExpanded && vsContentsCache[f.id]) {
+                        flattenContainedFiles(vsContentsCache[f.id], depth + 1, rows);
+                    }
+                    // Show processed outputs when expanded
+                    if (processedExpanded && vsProcessedCache[f.id]) {
                         flattenProcessedTree(vsProcessedCache[f.id], depth + 1, rows);
                     }
                 } else {
@@ -2437,6 +2455,99 @@
                     type: "pfile", name: node.name, size: node.size,
                     mtime: node.mtime, ppath: node.path, depth,
                 });
+            }
+        }
+    }
+
+    /**
+     * Build a tree structure from flat contained files that may have
+     * path-based names (e.g. "disc1/game.cue").  Files without a "/"
+     * appear at the root level; files with paths are grouped under
+     * virtual folder nodes that are expand/collapsible.
+     */
+    function _buildContainedTree(contents) {
+        const root = { __children: [], __files: [] };
+        for (const cf of contents) {
+            const parts = cf.name.split("/");
+            if (parts.length === 1) {
+                // File at root level
+                root.__files.push(cf);
+            } else {
+                // Navigate/create folder nodes
+                let node = root;
+                for (let i = 0; i < parts.length - 1; i++) {
+                    const dir = parts[i];
+                    if (!node[dir]) {
+                        node[dir] = { __children: [], __files: [], __name: dir };
+                    }
+                    if (!node.__children.includes(dir)) {
+                        node.__children.push(dir);
+                    }
+                    node = node[dir];
+                }
+                node.__files.push(cf);
+            }
+        }
+        return root;
+    }
+
+    /**
+     * Flatten contained files (archive contents) into rows, grouping
+     * path-based names under expandable virtual folder nodes.
+     */
+    function flattenContainedFiles(contents, depth, rows) {
+        const tree = _buildContainedTree(contents);
+        _flattenContainedNode(tree, depth, rows, "");
+    }
+
+    function _flattenContainedNode(node, depth, rows, pathPrefix) {
+        // Emit folder children first (sorted), then files (sorted)
+        const sortedDirs = (node.__children || []).slice().sort();
+        for (const dirName of sortedDirs) {
+            const child = node[dirName];
+            const folderPath = pathPrefix ? pathPrefix + "/" + dirName : dirName;
+            const folderKey = "__cfolder__" + folderPath;
+            const expanded = vsExpandedFolders.has(folderKey);
+
+            // Virtual folder row
+            rows.push({
+                type: "cfile",
+                file: {
+                    name: dirName,
+                    size: 0,
+                    mtime: "",
+                    download_status: "",
+                    _is_virtual_folder: true,
+                },
+                depth,
+                contentsPath: folderKey,
+                contentsExpanded: expanded,
+            });
+            if (expanded) {
+                _flattenContainedNode(child, depth + 1, rows, folderPath);
+            }
+        }
+
+        // Emit files at this level
+        const sortedFiles = (node.__files || []).slice().sort((a, b) => {
+            const an = a.name.split("/").pop();
+            const bn = b.name.split("/").pop();
+            return an.localeCompare(bn);
+        });
+        for (const cf of sortedFiles) {
+            const hasContents = cf.has_contents || cf.children_count > 0;
+            const contentsPath = hasContents ? "__contents__" + cf.id : null;
+            const contentsExpanded = hasContents && vsExpandedFolders.has(contentsPath);
+            rows.push({
+                type: "cfile",
+                file: cf,
+                depth,
+                contentsPath,
+                contentsExpanded,
+            });
+            // Recursively show nested archive contents (zip-in-zip)
+            if (contentsExpanded && vsContentsCache[cf.id]) {
+                flattenContainedFiles(vsContentsCache[cf.id], depth + 1, rows);
             }
         }
     }
@@ -2539,6 +2650,86 @@
         return tr;
     }
 
+    /**
+     * Build a row for a contained file (archive_content origin).
+     * Shows the file name, size, status badge, and expand toggle if it's a nested archive.
+     */
+    function buildContainedFileRow(desc) {
+        const tr = document.createElement("tr");
+        tr.className = "cfile-row";
+        const f = desc.file;
+        const indent = desc.depth * 20;
+        const hasContents = desc.contentsPath;
+        const expanded = desc.contentsExpanded;
+        const isVirtualFolder = f._is_virtual_folder;
+
+        // Icon selection:
+        //  - virtual folder (directory inside archive): folder icon
+        //  - nested archive with contents: archive/folder icon
+        //  - plain file: file icon
+        const folderIcon = `<svg class="cfile-icon" viewBox="0 0 16 16" width="13" height="13"><path d="M1 3h5l2 2h7v9H1V3z" fill="none" stroke="currentColor" stroke-width="1.2"/></svg>`;
+        const fileIcon = `<svg class="cfile-icon" viewBox="0 0 16 16" width="13" height="13"><path d="M3 1h6l4 4v10H3V1zm6 0v4h4" fill="none" stroke="currentColor" stroke-width="1.2"/></svg>`;
+        const icon = (isVirtualFolder || hasContents) ? folderIcon : fileIcon;
+
+        const chevron = hasContents
+            ? `<span class="folder-toggle">${expanded ? "▼" : "▶"}</span>`
+            : "";
+
+        // Show only the last path segment as the display name
+        const nameHtml = escapeHtml(f.name.split("/").pop() || f.name);
+
+        // Status badge (not shown for virtual folders)
+        let statusHtml = "";
+        if (!isVirtualFolder) {
+            const status = f.download_status || "contained";
+            const statusClass = status === "contained" ? "contained"
+                : status === "contained_queued" ? "contained-queued"
+                : status === "extracted" ? "extracted"
+                : status;
+            const statusText = status === "contained" ? "contained"
+                : status === "contained_queued" ? "queued"
+                : status === "extracted" ? "extracted"
+                : status;
+            statusHtml = `<span class="file-status ${statusClass}">${statusText}</span>`;
+        }
+
+        let html = '<td class="col-queue"></td>';
+        html += `<td class="col-name"><div class="file-name-wrap" style="padding-left:${indent}px">` +
+            `${chevron}${icon}<span class="file-name cfile-name">${nameHtml}</span>` +
+            `</div></td>`;
+        html += `<td class="col-size" style="text-align:right">${f.size > 0 ? formatBytes(f.size) : ""}</td>`;
+        html += `<td class="col-modified">${f.mtime || ""}</td>`;
+        html += `<td class="col-status">${statusHtml}</td>`;
+        tr.innerHTML = html;
+
+        // Expand/collapse handler
+        if (hasContents) {
+            tr.style.cursor = "pointer";
+            tr.addEventListener("click", async () => {
+                if (expanded) {
+                    vsExpandedFolders.delete(desc.contentsPath);
+                } else {
+                    vsExpandedFolders.add(desc.contentsPath);
+                    // Virtual folders don't need an API fetch — their children
+                    // are already built from the flat file list.  Only real
+                    // nested archives (zip-in-zip) need a contents fetch.
+                    if (!isVirtualFolder && !vsContentsCache[f.id]) {
+                        try {
+                            const data = await api("GET", `/api/files/${f.id}/contents`);
+                            vsContentsCache[f.id] = data.contents || [];
+                        } catch (err) {
+                            vsContentsCache[f.id] = [];
+                        }
+                    }
+                }
+                vsInvalidateDescriptors();
+                vsRenderVisible();
+            });
+        }
+
+        return tr;
+    }
+
     // Build a single file <tr> element with all cells and event listeners.
     function buildFileRow(f, isPriority, queuedFiles, lastQueuedIdx, depth, desc) {
         const tr = document.createElement("tr");
@@ -2547,7 +2738,9 @@
 
         // Processed files get the processed-folder styling
         const hasProcessedFolder = desc && desc.processedPath;
+        const hasContentsFolder = desc && desc.contentsPath;
         if (hasProcessedFolder) tr.classList.add("folder-processed");
+        if (hasContentsFolder) tr.classList.add("folder-contents");
 
         if (f.change_status) tr.className += (tr.className ? " " : "") + "file-row-" + f.change_status;
 
@@ -2612,12 +2805,16 @@
         const indent = (depth || 0) * 20;
         // Show only leaf filename when tree view provides folder context
         const displayName = (depth != null && depth > 0) ? f.name.replace(/\\/g, "/").split("/").pop() : f.name;
-        // Processed files get a chevron + folder icon prefix
-        const procChevron = hasProcessedFolder
-            ? `<span class="folder-toggle">${desc.processedExpanded ? CHEVRON_DOWN : CHEVRON_RIGHT}</span>${FOLDER_ICON_PROCESSED}`
+        // Contents toggle (archive contents) and/or processed toggle
+        const contentsChevron = hasContentsFolder
+            ? `<span class="folder-toggle contents-toggle" title="Archive contents (${f.children_count || 0} files)">${desc.contentsExpanded ? CHEVRON_DOWN : CHEVRON_RIGHT}</span>`
             : "";
+        const procChevron = hasProcessedFolder
+            ? `<span class="folder-toggle proc-toggle">${desc.processedExpanded ? CHEVRON_DOWN : CHEVRON_RIGHT}</span>${FOLDER_ICON_PROCESSED}`
+            : "";
+        const togglePrefix = contentsChevron || procChevron;
         html += `<td class="col-name"><div class="file-name-wrap" style="padding-left:${indent}px">` +
-            unknownGrip + procChevron +
+            unknownGrip + togglePrefix +
             renderFileName(displayName, sourceDeleted ? "file-name-deleted" : f.downloaded ? "file-name-downloaded" : "") + changeIcon +
             `<span class="file-actions">` +
             renameBtn + processBtn + rescanBtn + deleteBtn +
@@ -2706,9 +2903,35 @@
         if (procStatus === "processed") {
             tr.classList.add("processed-expandable");
         }
+        // Contents toggle: single click expands archive contents
+        if (hasContentsFolder) {
+            const contentsToggle = tr.querySelector(".contents-toggle");
+            if (contentsToggle) {
+                contentsToggle.style.cursor = "pointer";
+                contentsToggle.addEventListener("click", async (e) => {
+                    e.stopPropagation();
+                    if (desc.contentsExpanded) {
+                        vsExpandedFolders.delete(desc.contentsPath);
+                    } else {
+                        vsExpandedFolders.add(desc.contentsPath);
+                        // Lazy-load archive contents
+                        if (!vsContentsCache[f.id]) {
+                            try {
+                                const data = await api("GET", `/api/files/${f.id}/contents`);
+                                vsContentsCache[f.id] = data.contents || [];
+                            } catch (err) {
+                                vsContentsCache[f.id] = [];
+                            }
+                        }
+                    }
+                    vsInvalidateDescriptors();
+                    vsRenderVisible();
+                });
+            }
+        }
         // Processed files: single click on chevron/toggle expands processed tree
-        if (hasProcessedFolder) {
-            const toggleEl = tr.querySelector(".folder-toggle");
+        if (hasProcessedFolder && !hasContentsFolder) {
+            const toggleEl = tr.querySelector(".proc-toggle");
             if (toggleEl) {
                 toggleEl.style.cursor = "pointer";
                 toggleEl.addEventListener("click", async (e) => {
@@ -2803,6 +3026,8 @@
                 fileListEl.appendChild(buildFolderRow(desc, isPriority));
             } else if (desc.type === "pfile") {
                 fileListEl.appendChild(buildProcessedFileRow(desc));
+            } else if (desc.type === "cfile") {
+                fileListEl.appendChild(buildContainedFileRow(desc));
             } else {
                 const tr = buildFileRow(desc.file, isPriority, queuedFiles, lastQueuedIdx, desc.depth, desc);
                 fileListEl.appendChild(tr);
@@ -2867,6 +3092,10 @@
     }
 
     function formatFileStatus(f) {
+        // Contained files have their own statuses
+        if (f.download_status === "contained") return "contained";
+        if (f.download_status === "contained_queued") return "queued";
+        if (f.download_status === "extracted") return "extracted";
         // Show processing queue status first — it takes priority over download status
         const pqs = f.process_queue_status || "";
         if (pqs === "processing") return "processing...";
@@ -4189,6 +4418,19 @@
 
     // --- Processing Profiles in Settings ---
 
+    function profileStepChainHtml(profile) {
+        const steps = profile.steps || [];
+        if (steps.length === 0) {
+            const label = (processorTypes[profile.processor_type] || {}).label || profile.processor_type;
+            return `<span class="profile-step-chain">${escapeHtml(label)}</span>`;
+        }
+        const parts = steps.map(s => {
+            const label = (processorTypes[s.processor_type] || {}).label || s.processor_type;
+            return escapeHtml(label);
+        });
+        return `<span class="profile-step-chain">${parts.join('<span class="step-sep">▸</span>')}</span>`;
+    }
+
     async function renderProfilesList() {
         await loadProcessorTypes();
         const profiles = await loadProcessingProfiles();
@@ -4201,11 +4443,10 @@
         for (const p of profiles) {
             const row = document.createElement("div");
             row.className = "profile-row";
-            const typeLabel = (processorTypes[p.processor_type] || {}).label || p.processor_type;
             row.innerHTML = `
                 <div class="profile-info">
                     <strong>${escapeHtml(p.name)}</strong>
-                    <small>${escapeHtml(typeLabel)}</small>
+                    ${profileStepChainHtml(p)}
                 </div>
                 <div class="profile-actions">
                     <button class="action-btn small" data-edit-profile="${p.id}">Edit</button>
@@ -4227,52 +4468,149 @@
     }
 
     let editingProfileId = null;
+    let pipelineSteps = []; // temp state for the step editor
+
+    function renderPipelineStepsList() {
+        const list = $("#pipeline-steps-list");
+        list.innerHTML = "";
+        pipelineSteps.forEach((step, idx) => {
+            // Arrow between steps
+            if (idx > 0) {
+                const arrow = document.createElement("div");
+                arrow.className = "pipeline-step-arrow";
+                arrow.textContent = "↓ outputs feed into next step";
+                list.appendChild(arrow);
+            }
+            const card = document.createElement("div");
+            card.className = "pipeline-step-card";
+            card.dataset.stepIdx = idx;
+
+            // Header: number + type dropdown + remove button
+            const header = document.createElement("div");
+            header.className = "pipeline-step-header";
+
+            const num = document.createElement("span");
+            num.className = "pipeline-step-num";
+            num.textContent = (idx + 1) + ".";
+
+            const typeWrap = document.createElement("div");
+            typeWrap.className = "pipeline-step-type";
+            const typeSelect = document.createElement("select");
+            typeSelect.dataset.stepIdx = idx;
+            for (const [tid, info] of Object.entries(processorTypes)) {
+                const o = document.createElement("option");
+                o.value = tid;
+                o.textContent = info.label;
+                if (tid === step.processor_type) o.selected = true;
+                typeSelect.appendChild(o);
+            }
+            typeSelect.addEventListener("change", () => {
+                pipelineSteps[idx].processor_type = typeSelect.value;
+                pipelineSteps[idx].options = {};
+                renderPipelineStepsList();
+            });
+            typeWrap.appendChild(typeSelect);
+
+            const removeBtn = document.createElement("button");
+            removeBtn.className = "pipeline-step-remove";
+            removeBtn.innerHTML = "×";
+            removeBtn.title = "Remove step";
+            removeBtn.addEventListener("click", () => {
+                pipelineSteps.splice(idx, 1);
+                renderPipelineStepsList();
+            });
+
+            header.appendChild(num);
+            header.appendChild(typeWrap);
+            header.appendChild(removeBtn);
+            card.appendChild(header);
+
+            // Options
+            const optionsDiv = document.createElement("div");
+            optionsDiv.className = "pipeline-step-options";
+            renderProfileOptions(optionsDiv, step.processor_type, step.options || {});
+            if (optionsDiv.children.length > 0) {
+                card.appendChild(optionsDiv);
+            }
+
+            list.appendChild(card);
+        });
+    }
 
     async function openEditProfile(profileId) {
         await loadProcessorTypes();
         editingProfileId = profileId || null;
         const modal = $("#modal-edit-profile");
         const nameInput = $("#edit-profile-name");
-        const typeSelect = $("#edit-profile-type");
-        const optionsDiv = $("#edit-profile-options");
 
         $("#edit-profile-title").textContent = editingProfileId ? "Edit Profile" : "Add Profile";
-
-        // Populate type dropdown
-        typeSelect.innerHTML = "";
-        for (const [tid, info] of Object.entries(processorTypes)) {
-            const o = document.createElement("option");
-            o.value = tid;
-            o.textContent = info.label;
-            typeSelect.appendChild(o);
-        }
 
         if (editingProfileId) {
             const profile = processingProfiles.find(p => p.id === editingProfileId);
             if (profile) {
                 nameInput.value = profile.name;
-                typeSelect.value = profile.processor_type;
-                renderProfileOptions(optionsDiv, profile.processor_type, profile.options);
+                // Load steps from profile
+                if (profile.steps && profile.steps.length > 0) {
+                    pipelineSteps = profile.steps.map(s => ({
+                        processor_type: s.processor_type,
+                        options: s.options || {},
+                    }));
+                } else {
+                    // Legacy single-step
+                    pipelineSteps = [{
+                        processor_type: profile.processor_type,
+                        options: profile.options || {},
+                    }];
+                }
             }
         } else {
             nameInput.value = "";
-            renderProfileOptions(optionsDiv, typeSelect.value, {});
+            // Default: single extract step
+            const firstType = Object.keys(processorTypes)[0] || "extract";
+            pipelineSteps = [{ processor_type: firstType, options: {} }];
         }
 
-        typeSelect.onchange = () => renderProfileOptions(optionsDiv, typeSelect.value, {});
+        renderPipelineStepsList();
+
+        // Add step button
+        const addBtn = $("#btn-add-pipeline-step");
+        addBtn.onclick = () => {
+            const firstType = Object.keys(processorTypes)[0] || "extract";
+            pipelineSteps.push({ processor_type: firstType, options: {} });
+            renderPipelineStepsList();
+        };
+
         modal.classList.add("open");
     }
 
     async function saveProfile() {
         const name = $("#edit-profile-name").value.trim();
-        const processorType = $("#edit-profile-type").value;
-        const options = collectOptions($("#edit-profile-options"));
         if (!name) return;
 
+        // Collect options from each step card
+        const steps = [];
+        const cards = document.querySelectorAll(".pipeline-step-card");
+        cards.forEach((card, idx) => {
+            const step = pipelineSteps[idx];
+            if (!step) return;
+            const optionsDiv = card.querySelector(".pipeline-step-options");
+            const options = optionsDiv ? collectOptions(optionsDiv) : {};
+            steps.push({
+                processor_type: step.processor_type,
+                options: options,
+            });
+        });
+
+        if (steps.length === 0) return;
+
+        // Legacy compat: set processor_type to first step's type
+        const processorType = steps[0].processor_type;
+        const options = steps[0].options;
+
         if (editingProfileId) {
-            await api("PUT", `/api/processing/profiles/${editingProfileId}`, { name, processor_type: processorType, options });
+            await api("PUT", `/api/processing/profiles/${editingProfileId}`, { name, processor_type: processorType, options, steps });
         } else {
-            await api("POST", "/api/processing/profiles", { name, processor_type: processorType, options });
+            await api("POST", "/api/processing/profiles", { name, processor_type: processorType, options, steps });
         }
         $("#modal-edit-profile").classList.remove("open");
         renderProfilesList();
