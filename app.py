@@ -436,6 +436,10 @@ def add_archive():
     return jsonify({"ok": True, "identifier": identifier, "status": "fetching"}), 202
 
 
+# Limit concurrent IA metadata requests to avoid 429 rate limiting
+_metadata_semaphore = threading.Semaphore(2)
+
+
 def _count_archive_extensions(files):
     """Count how many files in a metadata file list are compressed archives."""
     count = 0
@@ -462,6 +466,12 @@ def _meta_progress(identifier, archive_id, phase, message, pct=None):
 
 def _add_archive_bg(identifier, options):
     """Background worker: fetch IA metadata, create archive, broadcast progress."""
+    _meta_progress(identifier, None, "queued", f"Queued: {identifier}")
+    with _metadata_semaphore:
+        _add_archive_bg_inner(identifier, options)
+
+
+def _add_archive_bg_inner(identifier, options):
     import activity
 
     act_job_id = activity.start_job("metadata", archive_id=None)
@@ -638,6 +648,16 @@ def refresh_archive(archive_id):
 
 def _refresh_archive_bg(archive_id):
     """Background worker: refresh archive metadata and broadcast progress."""
+    archive = db.get_archive(archive_id)
+    if not archive:
+        return
+    _meta_progress(archive["identifier"], archive_id, "queued",
+                   f"Queued: {archive.get('title') or archive['identifier']}")
+    with _metadata_semaphore:
+        _refresh_archive_bg_inner(archive_id)
+
+
+def _refresh_archive_bg_inner(archive_id):
     import activity
 
     archive = db.get_archive(archive_id)

@@ -4910,7 +4910,8 @@
         // Metadata fetch/refresh rows (can have multiple concurrent)
         for (const meta of ongoingMetadata) {
             const label = meta.identifier || "archive";
-            const phaseLabel = meta.phase === "fetching" ? "Fetching metadata"
+            const phaseLabel = meta.phase === "queued" ? "Queued"
+                : meta.phase === "fetching" ? "Fetching metadata"
                 : meta.phase === "storing" ? "Storing files"
                 : meta.phase === "comparing" ? "Comparing files"
                 : meta.phase === "tagging" ? "Auto-tagging"
