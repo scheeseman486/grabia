@@ -5738,6 +5738,27 @@
             cpExpandedDirs = new Set();
             cpLastRange = null;
 
+            // Ensure every layout has at least one depth-1 bucket_header row
+            // so its edit/delete buttons are always reachable.
+            const presentLayoutIds = new Set();
+            for (const row of cpRows) {
+                if (row.type === "bucket_header" && row.depth === 1) {
+                    for (const lid of (row.layout_ids || [])) presentLayoutIds.add(lid);
+                }
+            }
+            for (const layout of currentCollectionLayouts) {
+                if (!presentLayoutIds.has(layout.id)) {
+                    cpRows.unshift({
+                        type: "bucket_header",
+                        depth: 1,
+                        name: layout.name || "Untitled",
+                        path: "__layout_" + layout.id,
+                        layout_ids: [layout.id],
+                        file_count: 0,
+                    });
+                }
+            }
+
             if (cpRows.length === 0) {
                 section.style.display = "none";
                 return;
@@ -6059,17 +6080,6 @@
             }
         } catch (e) {
             $("#layout-modal-error").textContent = e.message;
-        }
-    }
-
-    async function deleteLayout(layoutId) {
-        if (!currentCollectionId) return;
-        if (!confirm("Delete this layout?")) return;
-        try {
-            await api("DELETE", `/api/collections/${currentCollectionId}/layouts/${layoutId}`);
-            openCollectionDetail(currentCollectionId);
-        } catch (e) {
-            alert(e.message);
         }
     }
 
