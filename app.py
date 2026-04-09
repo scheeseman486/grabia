@@ -436,6 +436,30 @@ def add_archive():
     return jsonify({"ok": True, "identifier": identifier, "status": "fetching"}), 202
 
 
+def _count_archive_extensions(files):
+    """Count how many files in a metadata file list are compressed archives."""
+    count = 0
+    for f in files:
+        ext = os.path.splitext(f.get("name", ""))[1].lower()
+        if ext in ARCHIVE_EXTENSIONS:
+            count += 1
+    return count
+
+
+def _meta_progress(identifier, archive_id, phase, message, pct=None):
+    """Broadcast a metadata_progress SSE event."""
+    evt = {
+        "identifier": identifier,
+        "phase": phase,
+        "message": message,
+    }
+    if archive_id:
+        evt["archive_id"] = archive_id
+    if pct is not None:
+        evt["pct"] = round(pct, 1)
+    broadcast_sse("metadata_progress", evt)
+
+
 def _add_archive_bg(identifier, options):
     """Background worker: fetch IA metadata, create archive, broadcast progress."""
     import activity
@@ -445,11 +469,8 @@ def _add_archive_bg(identifier, options):
                  detail=identifier)
     activity.flush()
 
-    broadcast_sse("metadata_progress", {
-        "identifier": identifier,
-        "phase": "fetching",
-        "message": f"Fetching metadata for {identifier}...",
-    })
+    _meta_progress(identifier, None, "fetching",
+                   f"Fetching metadata for {identifier}...")
 
     try:
         ia_email = db.get_setting("ia_email", "")
@@ -457,22 +478,23 @@ def _add_archive_bg(identifier, options):
         use_http = db.get_setting("use_http", "0") == "1"
         meta = ia_client.fetch_metadata(identifier, ia_email, ia_password, use_http=use_http)
     except Exception as e:
-        broadcast_sse("metadata_progress", {
-            "identifier": identifier,
-            "phase": "error",
-            "message": f"Failed to fetch metadata: {e}",
-        })
+        _meta_progress(identifier, None, "error",
+                       f"Failed to fetch metadata: {e}")
         activity.log(act_job_id, "error", f"Failed to fetch metadata: {e}",
                      detail=identifier)
         activity.flush()
         activity.finish_job(act_job_id, "failed", summary=f"Failed: {e}")
         return
 
-    broadcast_sse("metadata_progress", {
-        "identifier": identifier,
-        "phase": "storing",
-        "message": f"Storing {meta['files_count']} files...",
-    })
+    # Now we know the full scope: files to store + archives to scan.
+    # Steps: fetch(done) + store + tag + N content fetches = 3 + N
+    n_archives = _count_archive_extensions(meta["files"])
+    total_steps = 3 + n_archives
+    step = 1  # fetch just completed
+
+    _meta_progress(identifier, None, "storing",
+                   f"Storing {meta['files_count']} files...",
+                   pct=(step / total_steps) * 100)
 
     archive_id = db.add_archive(
         identifier=meta["identifier"],
@@ -486,6 +508,7 @@ def _add_archive_bg(identifier, options):
         dir_path=meta["dir"],
     )
     db.add_archive_files(archive_id, meta["files"])
+    step += 1
 
     # Update the activity job now that we have an archive_id
     with db._db() as conn:
@@ -494,17 +517,15 @@ def _add_archive_bg(identifier, options):
         conn.commit()
 
     # Auto-tag based on filenames
-    broadcast_sse("metadata_progress", {
-        "identifier": identifier,
-        "archive_id": archive_id,
-        "phase": "tagging",
-        "message": "Auto-tagging files...",
-    })
+    _meta_progress(identifier, archive_id, "tagging",
+                   "Auto-tagging files...",
+                   pct=(step / total_steps) * 100)
     try:
         from auto_tagger import auto_tag_archive
         auto_tag_archive(archive_id)
     except Exception as e:
         log.warning("Auto-tag failed for archive %d: %s", archive_id, e)
+    step += 1
 
     # Apply options from the add modal
     if options.get("enable"):
@@ -518,15 +539,19 @@ def _add_archive_bg(identifier, options):
     broadcast_sse("archive_added", archive)
 
     # Fetch view_archive.php contents inline with progress
-    fetched, total_archives = _fetch_archive_contents_inline(
-        archive_id, identifier, act_job_id=act_job_id)
+    def _on_content_progress(current, total):
+        pct = ((step + current) / total_steps) * 100
+        _meta_progress(identifier, archive_id, "contents",
+                       f"Scanning archive contents ({current}/{total})...",
+                       pct=pct)
 
-    broadcast_sse("metadata_progress", {
-        "identifier": identifier,
-        "archive_id": archive_id,
-        "phase": "done",
-        "message": f"Added {meta['title'] or identifier} ({meta['files_count']} files)",
-    })
+    fetched, _ = _fetch_archive_contents_inline(
+        archive_id, identifier, act_job_id=act_job_id,
+        progress_cb=_on_content_progress)
+
+    _meta_progress(identifier, archive_id, "done",
+                   f"Added {meta['title'] or identifier} ({meta['files_count']} files)",
+                   pct=100)
 
     summary_parts = [f"{meta['files_count']} files"]
     if fetched:
@@ -626,12 +651,8 @@ def _refresh_archive_bg(archive_id):
                  archive_id=archive_id)
     activity.flush()
 
-    broadcast_sse("metadata_progress", {
-        "identifier": identifier,
-        "archive_id": archive_id,
-        "phase": "fetching",
-        "message": f"Refreshing metadata for {title}...",
-    })
+    _meta_progress(identifier, archive_id, "fetching",
+                   f"Refreshing metadata for {title}...")
 
     try:
         ia_email = db.get_setting("ia_email", "")
@@ -639,32 +660,38 @@ def _refresh_archive_bg(archive_id):
         use_http = db.get_setting("use_http", "0") == "1"
         meta = ia_client.fetch_metadata(identifier, ia_email, ia_password, use_http=use_http)
     except Exception as e:
-        broadcast_sse("metadata_progress", {
-            "identifier": identifier,
-            "archive_id": archive_id,
-            "phase": "error",
-            "message": f"Failed to fetch metadata: {e}",
-        })
+        _meta_progress(identifier, archive_id, "error",
+                       f"Failed to fetch metadata: {e}")
         activity.log(act_job_id, "error", f"Refresh failed: {e}",
                      archive_id=archive_id)
         activity.flush()
         activity.finish_job(act_job_id, "failed", summary=f"Failed: {e}")
         return
 
-    broadcast_sse("metadata_progress", {
-        "identifier": identifier,
-        "archive_id": archive_id,
-        "phase": "comparing",
-        "message": f"Comparing {len(meta['files'])} files...",
-    })
+    # Now we know the scope: compare + N content fetches = 2 + N
+    n_archives = _count_archive_extensions(meta["files"])
+    total_steps = 2 + n_archives
+    step = 1  # fetch done
+
+    _meta_progress(identifier, archive_id, "comparing",
+                   f"Comparing {len(meta['files'])} files...",
+                   pct=(step / total_steps) * 100)
 
     summary = db.refresh_archive_metadata(archive_id, meta["files"])
     updated = db.get_archive(archive_id)
     broadcast_sse("archive_updated", updated)
+    step += 1
 
     # Fetch view_archive.php contents inline with progress
+    def _on_content_progress(current, total):
+        pct = ((step + current) / total_steps) * 100
+        _meta_progress(identifier, archive_id, "contents",
+                       f"Scanning archive contents ({current}/{total})...",
+                       pct=pct)
+
     fetched, _ = _fetch_archive_contents_inline(
-        archive_id, identifier, act_job_id=act_job_id)
+        archive_id, identifier, act_job_id=act_job_id,
+        progress_cb=_on_content_progress)
 
     parts = []
     if summary.get("new", 0) > 0:
@@ -675,13 +702,9 @@ def _refresh_archive_bg(archive_id):
         parts.append(f"{summary['changed']} changed")
     changes_text = ", ".join(parts) if parts else "no changes"
 
-    broadcast_sse("metadata_progress", {
-        "identifier": identifier,
-        "archive_id": archive_id,
-        "phase": "done",
-        "message": f"Refreshed {title}: {changes_text}",
-        "summary": summary,
-    })
+    _meta_progress(identifier, archive_id, "done",
+                   f"Refreshed {title}: {changes_text}",
+                   pct=100)
 
     summary_msg = f"Refreshed {title}: {changes_text}"
     if fetched:
@@ -788,11 +811,17 @@ def queue_archive_contents_fetch(archive_id, file_id=None):
     return count
 
 
-def _fetch_archive_contents_inline(archive_id, identifier, act_job_id=None):
+def _fetch_archive_contents_inline(archive_id, identifier, act_job_id=None,
+                                    progress_cb=None):
     """Fetch view_archive.php contents for all compressed files in an archive,
     running inline (not via the queue worker) with progress broadcasting.
     Used by the metadata background workers so content discovery is part of
-    the same activity job.  Returns (fetched_count, total_count)."""
+    the same activity job.
+
+    progress_cb(current, total) is called after each file is processed so the
+    caller can broadcast an overall percentage.
+
+    Returns (fetched_count, total_count)."""
     import activity as _activity
 
     archive = db.get_archive(archive_id)
@@ -817,19 +846,15 @@ def _fetch_archive_contents_inline(archive_id, identifier, act_job_id=None):
     total = len(targets)
     fetched = 0
 
-    broadcast_sse("metadata_progress", {
-        "identifier": identifier,
-        "archive_id": archive_id,
-        "phase": "contents",
-        "message": f"Fetching archive contents (0/{total})...",
-        "current": 0,
-        "total": total,
-    })
+    if progress_cb:
+        progress_cb(0, total)
 
     for i, f in enumerate(targets):
         # Hash-based staleness: skip if already fetched and hash exists
         if f.get("contents_fetched_at") and f.get("md5"):
             fetched += 1
+            if progress_cb:
+                progress_cb(i + 1, total)
             continue
 
         try:
@@ -846,6 +871,8 @@ def _fetch_archive_contents_inline(archive_id, identifier, act_job_id=None):
                 _activity.log(act_job_id, "warning",
                               f"Could not fetch contents for {f['name']}: {e}",
                               archive_id=archive_id, file_id=f["id"])
+            if progress_cb:
+                progress_cb(i + 1, total)
             continue
 
         if contents is not None:
@@ -861,14 +888,8 @@ def _fetch_archive_contents_inline(archive_id, identifier, act_job_id=None):
             # Check for nested archives
             _queue_nested_archive_inspection(archive_id, f["id"])
 
-        broadcast_sse("metadata_progress", {
-            "identifier": identifier,
-            "archive_id": archive_id,
-            "phase": "contents",
-            "message": f"Fetching archive contents ({i + 1}/{total})...",
-            "current": i + 1,
-            "total": total,
-        })
+        if progress_cb:
+            progress_cb(i + 1, total)
 
     if act_job_id:
         _activity.flush()
