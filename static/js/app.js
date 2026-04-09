@@ -4475,7 +4475,7 @@
     let collections = [];
     let currentCollectionId = null;
     let editingCollectionId = null;
-    let editingLayoutId = null;
+    // (editingLayoutId removed — layout creation is now direct, no modal)
 
     async function refreshCollections() {
         try {
@@ -6036,50 +6036,18 @@
 
     // --- Layout Modal ---
 
-    function openLayoutModal(name = "", flatten = true, useMediaUnits = true) {
-        const isEdit = !!editingLayoutId;
-        $("#modal-layout-title").textContent = isEdit ? "Edit Layout" : "Add Layout";
-        $("#layout-name-input").value = name;
-        $("#layout-flatten-input").checked = flatten;
-        $("#layout-media-units-input").checked = useMediaUnits;
-        $("#layout-modal-error").textContent = "";
-        $("#modal-add-layout").classList.add("open");
-        $("#layout-name-input").focus();
-    }
-
-    function closeLayoutModal() {
-        $("#modal-add-layout").classList.remove("open");
-        editingLayoutId = null;
-    }
-
-    async function saveLayout() {
+    async function addLayoutDirect() {
         if (!currentCollectionId) return;
-        const name = $("#layout-name-input").value.trim();
-        if (!name) {
-            $("#layout-modal-error").textContent = "Name is required.";
-            return;
-        }
-        const body = {
-            name,
-            flatten: $("#layout-flatten-input").checked ? 1 : 0,
-            use_media_units: $("#layout-media-units-input").checked ? 1 : 0,
-        };
         try {
-            let newLayout = null;
-            if (editingLayoutId) {
-                await api("PUT", `/api/collections/${currentCollectionId}/layouts/${editingLayoutId}`, body);
-            } else {
-                newLayout = await api("POST", `/api/collections/${currentCollectionId}/layouts`, body);
-            }
-            closeLayoutModal();
+            const nextNum = (currentCollectionLayouts.length || 0) + 1;
+            const newLayout = await api("POST", `/api/collections/${currentCollectionId}/layouts`, {
+                name: `Layout ${nextNum}`,
+            });
             await openCollectionDetail(currentCollectionId);
-            // Auto-open path builder for new layouts
-            if (newLayout) {
-                currentLayoutId = newLayout.id;
-                openPathBuilder(newLayout.id);
-            }
+            currentLayoutId = newLayout.id;
+            openPathBuilder(newLayout.id);
         } catch (e) {
-            $("#layout-modal-error").textContent = e.message;
+            alert("Failed to add layout: " + e.message);
         }
     }
 
@@ -6236,8 +6204,25 @@
         const layout = currentCollectionLayouts.find(l => l.id === layoutId);
         if (!layout) return;
         pbLayoutId = layoutId;
-        $("#path-builder-title").textContent = layout.name;
         $("#modal-path-builder").classList.add("open");
+
+        // Populate layout options
+        const flattenEl = $("#pb-flatten-input");
+        const mediaEl = $("#pb-media-units-input");
+        flattenEl.checked = layout.flatten !== 0;
+        mediaEl.checked = layout.use_media_units !== 0;
+
+        // Save on toggle
+        const saveOption = async () => {
+            if (!currentCollectionId) return;
+            await api("PUT", `/api/collections/${currentCollectionId}/layouts/${layoutId}`, {
+                flatten: flattenEl.checked ? 1 : 0,
+                use_media_units: mediaEl.checked ? 1 : 0,
+            });
+        };
+        flattenEl.onchange = saveOption;
+        mediaEl.onchange = saveOption;
+
         // Load available tags
         try { leAvailableTags = await api("GET", "/api/tags"); } catch (e) { leAvailableTags = []; }
         pbSetupAddBar();
@@ -6687,10 +6672,7 @@
             const coll = await api("GET", `/api/collections/${currentCollectionId}`);
             openCollectionModal(coll);
         });
-        $("#btn-add-layout").addEventListener("click", () => { editingLayoutId = null; openLayoutModal(); });
-        $("#btn-layout-modal-cancel").addEventListener("click", closeLayoutModal);
-        $("#btn-layout-modal-save").addEventListener("click", saveLayout);
-        $("#layout-name-input").addEventListener("keydown", (e) => { if (e.key === "Enter") saveLayout(); });
+        $("#btn-add-layout").addEventListener("click", addLayoutDirect);
         $("#btn-delete-collection").addEventListener("click", deleteCurrentCollection);
         // Layout editor (legacy)
         $("#btn-layout-editor-close").addEventListener("click", () => {

@@ -2552,6 +2552,11 @@ details[open] > .collection-archives-summary::before {
 .path-segment-card.seg-alphabetical .seg-label { color: #9b59b6; }
 .path-segment-card.seg-literal .seg-label { color: var(--text-primary); }
 
+.path-builder-options {
+    display: flex; gap: 18px; padding: 8px 0 4px; flex-wrap: wrap;
+}
+.path-builder-options .checkbox-label { font-size: 13px; }
+
 .path-builder-segments { display: flex; flex-direction: column; gap: 6px; }
 .path-segment-detail {
     display: flex; align-items: center; gap: 8px; padding: 6px 10px;

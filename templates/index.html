@@ -310,13 +310,24 @@
             <!-- Path Builder (new segment-based layout editor) -->
             <div class="modal-overlay" id="modal-path-builder">
                 <div class="modal modal-wide">
-                    <h3>Edit Layout: <span id="path-builder-title"></span></h3>
+                    <h3>Edit Layout</h3>
                     <div class="path-builder">
                         <!-- Visual path display -->
                         <div class="path-builder-visual" id="path-builder-visual">
                             <span class="path-segment-root">/</span>
                             <!-- Segment cards are injected here -->
                             <span class="path-segment-wildcard">*</span>
+                        </div>
+                        <!-- Layout options -->
+                        <div class="path-builder-options">
+                            <label class="checkbox-label">
+                                <input type="checkbox" id="pb-flatten-input" checked>
+                                Flatten filenames <span class="label-hint">(strip subdirectory prefixes from symlinks)</span>
+                            </label>
+                            <label class="checkbox-label">
+                                <input type="checkbox" id="pb-media-units-input" checked>
+                                Group media units <span class="label-hint">(symlink multi-file media as directories)</span>
+                            </label>
                         </div>
                         <!-- Segment list -->
                         <div class="path-builder-segments" id="path-builder-segments"></div>
@@ -576,27 +587,6 @@
     </div>
 
     <!-- Add Layout Modal -->
-    <div class="modal-overlay" id="modal-add-layout">
-        <div class="modal">
-            <h3 id="modal-layout-title">Add Layout</h3>
-            <label>Name
-                <input type="text" id="layout-name-input" placeholder="e.g. All, A-Z, By Archive…">
-            </label>
-            <label class="checkbox-label">
-                <input type="checkbox" id="layout-flatten-input" checked>
-                Flatten filenames <span class="label-hint">(strip subdirectory prefixes from symlinks)</span>
-            </label>
-            <label class="checkbox-label">
-                <input type="checkbox" id="layout-media-units-input" checked>
-                Group media units <span class="label-hint">(symlink multi-file media as directories)</span>
-            </label>
-            <div class="modal-error" id="layout-modal-error"></div>
-            <div class="modal-actions">
-                <button class="action-btn" id="btn-layout-modal-cancel">Cancel</button>
-                <button class="action-btn primary" id="btn-layout-modal-save">Save</button>
-            </div>
-        </div>
-    </div>
 
     <!-- Add Archive Modal -->
     <div class="modal-overlay" id="modal-add">
