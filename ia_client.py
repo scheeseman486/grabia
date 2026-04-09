@@ -142,7 +142,10 @@ def fetch_archive_contents(identifier, filename, server=None, dir_path=None,
 
     # Prefer direct URL via server/dir (avoids redirect)
     if server and dir_path:
-        url = f"{scheme}://{server}/view_archive.php?archive={dir_path}/{filename}"
+        # URL-encode the archive path so characters like & aren't treated as
+        # query parameter separators.
+        archive_path = f"{dir_path}/{filename}"
+        url = f"{scheme}://{server}/view_archive.php?archive={requests.utils.quote(archive_path, safe='/')}"
     else:
         # Canonical URL with trailing slash triggers redirect to view_archive.php
         url = f"{scheme}://archive.org/download/{identifier}/{requests.utils.quote(filename)}/"
