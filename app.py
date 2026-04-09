@@ -786,8 +786,16 @@ def _queue_nested_archive_inspection(archive_id, parent_file_id):
     wake_content_fetch_worker()
 
 
-_content_fetch_thread = threading.Thread(target=_content_fetch_worker, daemon=True)
-_content_fetch_thread.start()
+_content_fetch_thread = None
+
+def _start_content_fetch_worker():
+    """Start the content fetch background thread.  Called from create_app()
+    after the database has been initialised."""
+    global _content_fetch_thread
+    if _content_fetch_thread is not None:
+        return
+    _content_fetch_thread = threading.Thread(target=_content_fetch_worker, daemon=True)
+    _content_fetch_thread.start()
 
 
 def _run_single_file_scan(entry):
@@ -3053,6 +3061,8 @@ def create_app():
     # Start processing worker
     from processing_worker import init_processing_worker
     init_processing_worker(broadcast_sse)
+    # Start content fetch worker (must be after init_db so tables exist)
+    _start_content_fetch_worker()
     # Load saved bandwidth limit (-1 = unlimited, 0 = paused, >0 = throttle)
     # One-time migration: old "0 = unlimited" → new "-1 = unlimited"
     if not db.get_setting("bw_migrated", ""):

@@ -423,10 +423,12 @@ def init_db():
     conn.execute("CREATE INDEX IF NOT EXISTS idx_af_processing_status ON archive_files(processing_status)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_af_download_status ON archive_files(download_status)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_af_archive_id ON archive_files(archive_id)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_af_parent ON archive_files(parent_file_id)")
 
     # --- Schema migrations for existing databases ---
+    # Must run before creating indexes on columns that migrations add.
     _migrate_schema(conn)
+
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_af_parent ON archive_files(parent_file_id)")
 
     # Queue state settings
     conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('download_state', 'stopped')")
